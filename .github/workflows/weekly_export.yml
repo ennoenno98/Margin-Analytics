@@ -6,6 +6,9 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:  # Ermöglicht manuellen Start per Knopfdruck
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   export:
     runs-on: ubuntu-latest
