@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Abhängigkeiten installieren
-        run: pip install requests pandas openpyxl
+        run: pip install requests pandas openpyxl schedule
 
       - name: Export ausführen
         run: python novadata_weekly_export.py --once
