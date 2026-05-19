@@ -397,6 +397,39 @@ with tab_overview:
         sales_labels = {1: "High sales", 2: "Mid sales", 3: "Low sales"}
         margin_labels = {1: "High margin", 2: "Mid margin", 3: "Low margin"}
 
+        # Same color map as the Cluster cells in the main table.
+        cluster_bg = {
+            "1-1": ("#C6EFCE", True),   # Star — bold green
+            "1-2": ("#E2F0D9", False),
+            "1-3": ("#E2F0D9", False),
+            "2-1": ("#DEEBF7", False),
+            "2-2": ("#FFFFFF", False),
+            "2-3": ("#FFFFFF", False),
+            "3-1": ("#DEEBF7", False),
+            "3-2": ("#FFFFFF", False),
+            "3-3": ("#F8CBAD", False),  # Dog — orange
+        }
+
+        # CSS: paint each button by the container key (st.container(key=...) emits
+        # an 'st-key-<key>' class on the wrapping div in Streamlit ≥ 1.37).
+        css_rules = []
+        for code, (bg, bold) in cluster_bg.items():
+            cls = f"st-key-cell_{code.replace('-', '_')}"
+            weight = "font-weight:600;" if bold else ""
+            css_rules.append(
+                f".{cls} button {{ background:{bg} !important; color:#111 !important; "
+                f"border:1px solid #d6d8dc !important; {weight} height:64px !important; "
+                f"font-size:1rem !important; }}"
+            )
+        active_code = st.session_state["active_cluster_code"]
+        if active_code:
+            cls = f"st-key-cell_{active_code.replace('-', '_')}"
+            css_rules.append(
+                f".{cls} button {{ outline:3px solid #1f3864 !important; "
+                f"outline-offset:-3px; }}"
+            )
+        st.markdown(f"<style>{''.join(css_rules)}</style>", unsafe_allow_html=True)
+
         header_cols = st.columns([1.4, 2, 2, 2], gap="small")
         header_cols[0].markdown("&nbsp;", unsafe_allow_html=True)
         for i, v in enumerate([1, 2, 3]):
@@ -405,11 +438,10 @@ with tab_overview:
                 unsafe_allow_html=True,
             )
 
-        active_code = st.session_state["active_cluster_code"]
         for m in [1, 2, 3]:
             row_cols = st.columns([1.4, 2, 2, 2], gap="small")
             row_cols[0].markdown(
-                f"<div style='font-weight:600; padding:14px 0;'>{margin_labels[m]}</div>",
+                f"<div style='font-weight:600; padding:22px 0;'>{margin_labels[m]}</div>",
                 unsafe_allow_html=True,
             )
             for i, v in enumerate([1, 2, 3]):
@@ -417,17 +449,16 @@ with tab_overview:
                 count = int(cluster_grid.loc[m, v])
                 badge = " ⭐" if (m == 1 and v == 1) else (" ⚠️" if (m == 3 and v == 3) else "")
                 is_active = (active_code == code)
-                label = f"{'● ' if is_active else ''}{count} SKUs{badge}"
-                btype = "primary" if is_active else "secondary"
-                if row_cols[i + 1].button(
-                    label,
-                    key=f"cluster_btn_{code}",
-                    use_container_width=True,
-                    type=btype,
-                    help=cluster_name(code),
-                ):
-                    st.session_state["active_cluster_code"] = None if is_active else code
-                    st.rerun()
+                label = f"{count} SKUs{badge}"
+                with row_cols[i + 1].container(key=f"cell_{m}_{v}"):
+                    if st.button(
+                        label,
+                        key=f"cluster_btn_{code}",
+                        use_container_width=True,
+                        help=cluster_name(code) + (" — active filter" if is_active else ""),
+                    ):
+                        st.session_state["active_cluster_code"] = None if is_active else code
+                        st.rerun()
 
     clicked_cluster = st.session_state.get("active_cluster_code")
 
