@@ -276,29 +276,107 @@ with tab_overview:
         .size()
         .reset_index(name="SKUs")
     )
+    clicked_cluster = None
     if not grid.empty:
-        grid["Margin Tier"] = grid["Margin Tier"].astype(int)
-        grid["Volume Tier"] = grid["Volume Tier"].astype(int)
-        cluster_fig = px.density_heatmap(
-            grid,
-            x="Volume Tier",
-            y="Margin Tier",
-            z="SKUs",
-            text_auto=True,
-            color_continuous_scale="Blues",
-            title=None,
+        cluster_grid = (
+            tier_base.groupby(["Margin Tier", "Volume Tier"], observed=True)
+            .size()
+            .unstack(fill_value=0)
+            .reindex(index=[1, 2, 3], columns=[1, 2, 3], fill_value=0)
         )
-        cluster_fig.update_xaxes(
-            tickmode="array", tickvals=[1, 2, 3],
-            ticktext=["1 — high volume", "2 — mid", "3 — low volume"],
+        cluster_fig = go.Figure(
+            data=go.Heatmap(
+                z=cluster_grid.values,
+                x=["1 (high)", "2 (mid)", "3 (low)"],
+                y=["1 (high)", "2 (mid)", "3 (low)"],
+                text=cluster_grid.values,
+                texttemplate="%{text}",
+                textfont=dict(size=18, color="#111"),
+                colorscale="Blues",
+                showscale=False,
+                hovertemplate="Margin Tier %{y}<br>Volume Tier %{x}<br><b>%{z} SKUs</b><extra></extra>",
+                xgap=3, ygap=3,
+            )
         )
-        cluster_fig.update_yaxes(
-            autorange="reversed",
-            tickmode="array", tickvals=[1, 2, 3],
-            ticktext=["1 — high margin", "2 — mid", "3 — low margin"],
+        cluster_fig.update_layout(
+            xaxis=dict(title="Volume Tier (sales)", side="bottom"),
+            yaxis=dict(title="Margin Tier (CM3%)", autorange="reversed"),
+            height=340,
+            margin=dict(t=10, b=10, l=10, r=10),
         )
-        cluster_fig.update_layout(height=320, margin=dict(t=20, b=10, l=10, r=10))
-        st.plotly_chart(cluster_fig, use_container_width=True)
+        st.caption("Click any cell to see the products in that cluster.")
+        event = st.plotly_chart(
+            cluster_fig,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="points",
+            key="cluster_heatmap",
+        )
+        sel = getattr(event, "selection", None) if event is not None else None
+        points = []
+        if sel is not None:
+            points = sel.get("points", []) if isinstance(sel, dict) else (getattr(sel, "points", []) or [])
+        if points:
+            pt = points[0]
+            try:
+                sel_v = int(str(pt.get("x"))[0])
+                sel_m = int(str(pt.get("y"))[0])
+                clicked_cluster = f"{sel_m}-{sel_v}"
+            except (TypeError, ValueError):
+                clicked_cluster = None
+
+    # ----- Drill-in panel for the clicked cluster -----
+    if clicked_cluster:
+        drill = filtered[filtered["Cluster"] == clicked_cluster].copy()
+        # Fall back to the tier base if the cluster was filtered out upstream.
+        if drill.empty:
+            drill = tier_base[tier_base["Cluster"] == clicked_cluster].copy()
+            drill["MoM Rev %"] = drill["SKU"].map(mom)
+        drill = drill.sort_values("Product Sales", ascending=False, na_position="last")
+
+        with st.container(border=True):
+            margin_label = {"1": "high margin", "2": "mid margin", "3": "low margin"}[clicked_cluster[0]]
+            volume_label = {"1": "high volume", "2": "mid volume", "3": "low volume"}[clicked_cluster[-1]]
+            st.markdown(
+                f"### Cluster `{clicked_cluster}` — {margin_label}, {volume_label}"
+            )
+            d1, d2, d3, d4, d5 = st.columns(5)
+            d1.metric("SKUs", f"{len(drill):,}")
+            d2.metric("Total sales (€)", f"{drill['Product Sales'].sum():,.0f}")
+            d3.metric("Avg CM3 %", f"{drill['CM3%'].mean():.1f}" if pd.notna(drill['CM3%'].mean()) else "—")
+            d4.metric("Total units", f"{drill['Units'].sum():,.0f}")
+            avg_mom = drill["MoM Rev %"].mean() if "MoM Rev %" in drill.columns else None
+            d5.metric("Avg MoM Rev %", f"{avg_mom:+.1f}%" if pd.notna(avg_mom) else "—")
+
+            drill_cols = [
+                "SKU", "Product", "Product Sales", "Units", "Orders",
+                "CM3%", "MoM Rev %", "ROAS", "Sponsored Spend",
+                "Days of Supply", "Sales Velocity",
+            ]
+            drill_cols = [c for c in drill_cols if c in drill.columns]
+            drill_styled = drill[drill_cols].style.format(
+                {
+                    "Product Sales": "€{:,.0f}",
+                    "Sponsored Spend": "€{:,.0f}",
+                    "CM3%": "{:.1f}%",
+                    "MoM Rev %": "{:+.1f}%",
+                    "ROAS": "{:.2f}",
+                    "Days of Supply": "{:,.0f}",
+                    "Sales Velocity": "{:,.1f}",
+                    "Orders": "{:,.0f}",
+                    "Units": "{:,.0f}",
+                },
+                na_rep="—",
+            )
+            st.dataframe(drill_styled, use_container_width=True, hide_index=True, height=320)
+
+            st.download_button(
+                f"Download cluster {clicked_cluster} (CSV)",
+                data=drill[drill_cols].to_csv(index=False).encode("utf-8"),
+                file_name=f"cluster_{clicked_cluster}_{marketplace}_{pd.Timestamp(period):%Y%m%d}.csv",
+                mime="text/csv",
+                key="dl_cluster",
+            )
 
     # ----- Cluster filter -----
     cluster_options = sorted(
