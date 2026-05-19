@@ -13,6 +13,7 @@ Run locally:
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -134,6 +135,61 @@ def tier_1_to_3(values: pd.Series) -> pd.Series:
     return tiers.astype("Int64")
 
 
+COMMENTS_PATH = REPO_ROOT / "comments.json"
+
+
+def load_comments() -> dict[str, str]:
+    if not COMMENTS_PATH.exists():
+        return {}
+    try:
+        return {str(k): str(v) for k, v in json.loads(COMMENTS_PATH.read_text()).items()}
+    except Exception:
+        return {}
+
+
+def save_comments(comments: dict[str, str]) -> None:
+    clean = {k: v for k, v in comments.items() if v and v.strip()}
+    COMMENTS_PATH.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
+
+
+SUM_COLS = ["Orders", "Units", "Product Sales", "Sponsored Spend"]
+WAVG_COLS = ["CM1%", "CM2%", "CM3%", "ROAS", "CTR"]
+FIRST_COLS = ["Product", "Child ASIN", "Marketplace Name",
+              "DE filters", "UK filters", "FR filters", "ES filters", "IT filters"]
+
+
+def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Roll a multi-week slice up to one row per SKU.
+
+    - Sum: Orders, Units, Product Sales, Sponsored Spend.
+    - Weighted average (weight = Product Sales): margins, ROAS, CTR.
+    - First non-null: descriptive columns (Product, Child ASIN, …).
+    """
+    if df_in.empty:
+        return df_in.copy()
+    sum_cols = [c for c in SUM_COLS if c in df_in.columns]
+    first_cols = [c for c in FIRST_COLS if c in df_in.columns]
+    wavg_cols = [c for c in WAVG_COLS if c in df_in.columns]
+
+    base = (
+        df_in.groupby("SKU", as_index=False, sort=False)
+        .agg({**{c: "first" for c in first_cols}, **{c: "sum" for c in sum_cols}})
+    )
+    for c in wavg_cols:
+        weights = pd.to_numeric(df_in["Product Sales"], errors="coerce")
+        values = pd.to_numeric(df_in[c], errors="coerce")
+        valid = values.notna() & weights.notna() & (weights > 0)
+        tmp = pd.DataFrame({
+            "SKU": df_in["SKU"],
+            "_v": (values * weights).where(valid),
+            "_w": weights.where(valid),
+        })
+        agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
+        agg[c] = agg["num"] / agg["den"].replace(0, pd.NA)
+        base = base.merge(agg[[c]], left_on="SKU", right_index=True, how="left")
+    return base
+
+
 def monthly_revenue(history: pd.DataFrame) -> pd.DataFrame:
     """Aggregate Product Sales by calendar month for one SKU's history."""
     if history.empty or "Period" not in history.columns:
@@ -192,18 +248,27 @@ with st.container(border=True):
         iso = ts.isocalendar()
         return f"KW {iso.week:02d} · {iso.year}"
 
-    period = c2.selectbox(
-        "Calendar week",
+    selected_periods = c2.multiselect(
+        "Calendar week(s)",
         periods,
+        default=[periods[0]] if periods else [],
         format_func=_fmt_week,
+        help="Pick one week, or several to aggregate (sum sales/units, weighted-avg margins).",
     )
+    if not selected_periods:
+        selected_periods = [periods[0]]
+    period = max(selected_periods)  # 'reference' week for comparisons + captions
 
     sku_query = c3.text_input("SKU or Product contains", "")
     top_only = c4.toggle("Top sellers only", value=False)
 
-# Marketplace + period base slice
+# Marketplace base slice (all weeks for this marketplace)
 mp_slice = df[df["Marketplace Name"] == marketplace].copy()
-filtered = mp_slice[mp_slice["Period"] == period].copy()
+
+# Current view: aggregate across the selected weeks (sum + weighted avg).
+raw_slice = mp_slice[mp_slice["Period"].isin(selected_periods)].copy()
+filtered = aggregate_periods(raw_slice) if len(selected_periods) > 1 else raw_slice.copy()
+is_multi_period = len(selected_periods) > 1
 
 if sku_query.strip():
     q = sku_query.strip().lower()
@@ -234,21 +299,34 @@ tab_overview, tab_trend, tab_compare = st.tabs(["Overview", "Trend", "Compare"])
 # Overview tab — table + Δ vs previous period
 # =========================================================================
 with tab_overview:
-    # ----- Δ CM3% vs previous period (same marketplace) -----
-    prior_periods = [p for p in periods if p < period]
-    prior_period = prior_periods[0] if prior_periods else None
-    if prior_period is not None:
-        prior = mp_slice[mp_slice["Period"] == prior_period].set_index("SKU")["CM3%"]
+    # ----- Δ CM3% vs the equivalent prior set (shift the selection back 1 week) -----
+    # In single-week mode this is just the previous week; in multi-week mode we
+    # shift every selected week back by 1 week, aggregate, and compare.
+    def _equivalent_prior_set(selected, week_offset):
+        target_dates = [pd.Timestamp(p) - pd.Timedelta(days=7 * week_offset) for p in selected]
+        matched = []
+        for tgt in target_dates:
+            cand = [p for p in periods if abs((pd.Timestamp(p) - tgt).days) <= 3]
+            if cand:
+                matched.append(max(cand))
+        return sorted(set(matched))
+
+    prior_set = _equivalent_prior_set(selected_periods, 1)
+    if prior_set:
+        prior_raw = mp_slice[mp_slice["Period"].isin(prior_set)]
+        prior_agg = aggregate_periods(prior_raw) if len(prior_set) > 1 else prior_raw
+        prior = prior_agg.set_index("SKU")["CM3%"]
         filtered["Δ CM3 vs prior"] = filtered["CM3%"] - filtered["SKU"].map(prior)
-        delta_caption = f"Δ CM3% column compares to {_fmt_week(prior_period)}."
+        delta_caption = (
+            f"Δ CM3% compares to the same number of weeks ending "
+            f"{_fmt_week(max(prior_set))}."
+        )
     else:
         filtered["Δ CM3 vs prior"] = pd.NA
-        delta_caption = "No prior period available for Δ CM3%."
+        delta_caption = "No equivalent prior weeks available for Δ CM3%."
 
-    # ----- Cluster tiers: computed on rows that have BOTH CM3% and Product Sales
-    # in the current marketplace+period, so both tiers are tertiles over the
-    # same population (otherwise the 3x3 grid is lopsided).
-    mp_period = mp_slice[mp_slice["Period"] == period].copy()
+    # ----- Cluster tiers: computed on the aggregated marketplace slice -----
+    mp_period = aggregate_periods(raw_slice) if is_multi_period else raw_slice.copy()
     tier_base = mp_period.dropna(subset=["CM3%", "Product Sales"]).copy()
     tier_base["Margin Tier"] = tier_1_to_3(tier_base["CM3%"])
     tier_base["Volume Tier"] = tier_1_to_3(tier_base["Product Sales"])
@@ -280,25 +358,24 @@ with tab_overview:
         f"snapshot ({_fmt_week(latest_mp_period)}), regardless of the selected week."
     )
 
-    # ----- Revenue growth: same calendar week one month earlier (≈ 4 weeks back) -----
-    period_ts = pd.Timestamp(period)
-    target_prior = period_ts - pd.Timedelta(days=28)
-    prior_4w_candidates = [
-        p for p in periods if abs((pd.Timestamp(p) - target_prior).days) <= 3
-    ]
-    prior_4w = max(prior_4w_candidates) if prior_4w_candidates else None
-    if prior_4w is not None:
-        cur_rev = mp_slice[mp_slice["Period"] == period].set_index("SKU")["Product Sales"]
-        prev_rev = mp_slice[mp_slice["Period"] == prior_4w].set_index("SKU")["Product Sales"]
-        wow4 = ((cur_rev - prev_rev) / prev_rev.replace(0, pd.NA)) * 100
+    # ----- Revenue growth: same calendar weeks one month earlier (shift back 4) -----
+    prior_4w_set = _equivalent_prior_set(selected_periods, 4)
+    if prior_4w_set:
+        cur_rev = filtered.set_index("SKU")["Product Sales"]
+        prior_4w_raw = mp_slice[mp_slice["Period"].isin(prior_4w_set)]
+        prior_4w_agg = aggregate_periods(prior_4w_raw) if len(prior_4w_set) > 1 else prior_4w_raw
+        prev_rev = prior_4w_agg.set_index("SKU")["Product Sales"]
+        # Align by SKU; some current SKUs may not appear in the prior set.
+        wow4 = ((cur_rev - prev_rev.reindex(cur_rev.index))
+                / prev_rev.reindex(cur_rev.index).replace(0, pd.NA)) * 100
         filtered["Rev Δ 4w %"] = filtered["SKU"].map(wow4)
         growth_caption = (
-            f"Rev Δ 4w % compares {_fmt_week(period)} revenue to "
-            f"{_fmt_week(prior_4w)} (the same calendar week one month earlier)."
+            f"Rev Δ 4w % compares the selected week(s) to the equivalent set "
+            f"4 weeks earlier (ending {_fmt_week(max(prior_4w_set))})."
         )
     else:
         filtered["Rev Δ 4w %"] = pd.NA
-        growth_caption = "No week 4 weeks back available, so Rev Δ 4w % is empty."
+        growth_caption = "No equivalent set 4 weeks back, so Rev Δ 4w % is empty."
 
     # ----- Cluster matrix (clickable 3x3 button grid) -----
     st.markdown(
@@ -404,88 +481,96 @@ with tab_overview:
     if below_target_only:
         filtered = filtered[filtered["CM3%"] < target_cm3]
 
+    # ----- Per-SKU comments (loaded from comments.json) -----
+    if "comments" not in st.session_state:
+        st.session_state["comments"] = load_comments()
+    filtered["Comments"] = filtered["SKU"].map(st.session_state["comments"]).fillna("")
+
     display_cols = [
         "SKU", "Product", "Cluster", "Margin Tier", "Volume Tier",
         "Orders", "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior",
         "Sponsored Spend", "ROAS", "CTR",
         "FBA Available", "Days of Supply", "Sales Velocity",
-        "Child ASIN",
+        "Comments", "Child ASIN",
     ]
     display_cols = [c for c in display_cols if c in filtered.columns]
     table = filtered[display_cols].sort_values(
         "Product Sales", ascending=False, na_position="last"
     )
 
-    def _style(df_: pd.DataFrame):
-        styled = df_.style.format(
-            {
-                "Product Sales": "€{:,.0f}",
-                "Sponsored Spend": "€{:,.0f}",
-                "CM1%": "{:.1f}%",
-                "CM2%": "{:.1f}%",
-                "CM3%": "{:.1f}%",
-                "Δ CM3 vs prior": "{:+.1f} pp",
-                "Rev Δ 4w %": "{:+.1f}%",
-                "ROAS": "{:.2f}",
-                "CTR": "{:.2f}%",
-                "FBA Available": "{:,.0f}",
-                "Days of Supply": "{:,.0f}",
-                "Sales Velocity": "{:,.1f}",
-                "Orders": "{:,.0f}",
-                "Units": "{:,.0f}",
-            },
-            na_rep="—",
-        )
-        if "CM3%" in df_.columns:
-            styled = styled.map(
-                lambda v: "background-color: #F8CBAD" if pd.notna(v) and v < target_cm3
-                else ("background-color: #C6EFCE" if pd.notna(v) else ""),
-                subset=["CM3%"],
-            )
-        if "Δ CM3 vs prior" in df_.columns:
-            styled = styled.map(
-                lambda v: "color: #B71C1C" if pd.notna(v) and v < 0
-                else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
-                subset=["Δ CM3 vs prior"],
-            )
-        if "Rev Δ 4w %" in df_.columns:
-            styled = styled.map(
-                lambda v: "color: #B71C1C" if pd.notna(v) and v < 0
-                else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
-                subset=["Rev Δ 4w %"],
-            )
-        if "Cluster" in df_.columns and "Margin Tier" in df_.columns and "Volume Tier" in df_.columns:
-            def _cluster_bg(row):
-                m, vol = row["Margin Tier"], row["Volume Tier"]
-                if pd.isna(m) or pd.isna(vol):
-                    return [""] * len(row)
-                bg = ""
-                if m == 1 and vol == 1:
-                    bg = "background-color: #C6EFCE; font-weight: 600"
-                elif m == 3 and vol == 3:
-                    bg = "background-color: #F8CBAD"
-                elif m == 1:
-                    bg = "background-color: #E2F0D9"
-                elif vol == 1:
-                    bg = "background-color: #DEEBF7"
-                return [bg if c == "Cluster" else "" for c in row.index]
-            styled = styled.apply(_cluster_bg, axis=1)
-        if "Days of Supply" in df_.columns:
-            styled = styled.map(
-                lambda v: "background-color: #F8CBAD" if pd.notna(v) and v < min_dos else "",
-                subset=["Days of Supply"],
-            )
-        return styled
-
     st.caption(delta_caption + " · " + growth_caption + " · " + inventory_caption)
-    st.dataframe(_style(table), use_container_width=True, hide_index=True, height=560)
 
-    st.download_button(
+    # Read-only columns with sensible formatting; Comments is the only editable cell.
+    euro_cols = {"Product Sales", "Sponsored Spend"}
+    pct_cols = {"CM1%", "CM2%", "CM3%", "Rev Δ 4w %", "CTR"}
+    pp_cols = {"Δ CM3 vs prior"}
+    int_cols = {"Orders", "Units", "FBA Available", "Days of Supply"}
+    float1_cols = {"Sales Velocity", "ROAS"}
+
+    editable_cfg: dict = {}
+    for col in table.columns:
+        if col == "Comments":
+            continue
+        if col in euro_cols:
+            editable_cfg[col] = st.column_config.NumberColumn(col, format="€%.0f", disabled=True)
+        elif col in pct_cols:
+            editable_cfg[col] = st.column_config.NumberColumn(col, format="%.1f%%", disabled=True)
+        elif col in pp_cols:
+            editable_cfg[col] = st.column_config.NumberColumn(col, format="%+.1f pp", disabled=True)
+        elif col in int_cols:
+            editable_cfg[col] = st.column_config.NumberColumn(col, format="%d", disabled=True)
+        elif col in float1_cols:
+            editable_cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
+        else:
+            editable_cfg[col] = st.column_config.Column(col, disabled=True)
+    editable_cfg["Comments"] = st.column_config.TextColumn(
+        "Comments",
+        help="Free-text note per SKU. Saved to comments.json on the server.",
+        width="medium",
+    )
+
+    edited = st.data_editor(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        height=560,
+        column_config=editable_cfg,
+        key="overview_editor",
+    )
+
+    # Persist any comment changes.
+    new_comments = dict(st.session_state["comments"])
+    changed = False
+    for sku, comment in zip(edited["SKU"], edited["Comments"]):
+        comment_str = (comment or "").strip()
+        prev = new_comments.get(sku, "")
+        if comment_str != prev:
+            if comment_str:
+                new_comments[sku] = comment_str
+            elif sku in new_comments:
+                del new_comments[sku]
+            changed = True
+    if changed:
+        st.session_state["comments"] = new_comments
+        try:
+            save_comments(new_comments)
+        except Exception as exc:
+            st.warning(f"Couldn't write comments.json ({exc}); kept in session only.")
+
+    dl_col1, dl_col2 = st.columns([1, 1])
+    dl_col1.download_button(
         "Download filtered rows (CSV)",
-        data=table.to_csv(index=False).encode("utf-8"),
+        data=edited.to_csv(index=False).encode("utf-8"),
         file_name=f"margin_{marketplace}_{pd.Timestamp(period):%Y%m%d}.csv",
         mime="text/csv",
+    )
+    dl_col2.download_button(
+        "Download comments (JSON)",
+        data=json.dumps(st.session_state["comments"], indent=2, ensure_ascii=False).encode("utf-8"),
+        file_name="comments.json",
+        mime="application/json",
+        help="Comments persist on the server but reset on each redeploy. Commit this file to keep them permanently.",
     )
 
 # =========================================================================
