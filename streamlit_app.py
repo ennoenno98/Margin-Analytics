@@ -349,71 +349,50 @@ with tab_overview:
             if sel_m and sel_v:
                 clicked_cluster = f"{sel_m}-{sel_v}"
 
-    # ----- Drill-in panel for the clicked cluster -----
-    if clicked_cluster:
-        cluster_label = cluster_name(clicked_cluster)
-        drill = filtered[filtered["Cluster Code"] == clicked_cluster].copy() if "Cluster Code" in filtered.columns else filtered.iloc[0:0]
-        # Fall back to the tier base if upstream filters hid this cluster.
-        if drill.empty:
-            drill = tier_base[tier_base["Cluster Code"] == clicked_cluster].copy()
-            drill["MoM Rev %"] = drill["SKU"].map(mom)
-        drill = drill.sort_values("Product Sales", ascending=False, na_position="last")
-
-        with st.container(border=True):
-            st.markdown(f"### {cluster_label}  *(tier {clicked_cluster})*")
-            d1, d2, d3, d4, d5 = st.columns(5)
-            d1.metric("SKUs", f"{len(drill):,}")
-            d2.metric("Total sales (€)", f"{drill['Product Sales'].sum():,.0f}")
-            d3.metric("Avg CM3 %", f"{drill['CM3%'].mean():.1f}" if pd.notna(drill['CM3%'].mean()) else "—")
-            d4.metric("Total units", f"{drill['Units'].sum():,.0f}")
-            avg_mom = drill["MoM Rev %"].mean() if "MoM Rev %" in drill.columns else None
-            d5.metric("Avg MoM Rev %", f"{avg_mom:+.1f}%" if pd.notna(avg_mom) else "—")
-
-            drill_cols = [
-                "SKU", "Product", "Product Sales", "Units", "Orders",
-                "CM3%", "MoM Rev %", "ROAS", "Sponsored Spend",
-                "Days of Supply", "Sales Velocity",
-            ]
-            drill_cols = [c for c in drill_cols if c in drill.columns]
-            drill_styled = drill[drill_cols].style.format(
-                {
-                    "Product Sales": "€{:,.0f}",
-                    "Sponsored Spend": "€{:,.0f}",
-                    "CM3%": "{:.1f}%",
-                    "MoM Rev %": "{:+.1f}%",
-                    "ROAS": "{:.2f}",
-                    "Days of Supply": "{:,.0f}",
-                    "Sales Velocity": "{:,.1f}",
-                    "Orders": "{:,.0f}",
-                    "Units": "{:,.0f}",
-                },
-                na_rep="—",
-            )
-            st.dataframe(drill_styled, use_container_width=True, hide_index=True, height=320)
-
-            st.download_button(
-                f"Download cluster {clicked_cluster} (CSV)",
-                data=drill[drill_cols].to_csv(index=False).encode("utf-8"),
-                file_name=f"cluster_{clicked_cluster}_{marketplace}_{pd.Timestamp(period):%Y%m%d}.csv",
-                mime="text/csv",
-                key="dl_cluster",
-            )
-
-    # ----- Cluster filter -----
+    # ----- Active cluster filter (drives the main table below) -----
+    # Click on the heatmap takes precedence; the multiselect is the alternate
+    # entry point.
     available_codes = [
         c for c in mp_period.get("Cluster Code", pd.Series(dtype="string")).dropna().unique()
         if c and "<NA>" not in c
     ]
     cluster_options = [c for c in CLUSTER_NAMES if c in available_codes]
-    cluster_pick = st.multiselect(
-        "Filter by cluster",
-        options=cluster_options,
-        default=[],
-        format_func=lambda c: f"{cluster_name(c)}  ({c})",
-        help="High margin · High sales = top-third in both. Low margin · Low sales = bottom-third in both.",
-    )
-    if cluster_pick:
-        filtered = filtered[filtered["Cluster Code"].isin(cluster_pick)]
+
+    if clicked_cluster:
+        active_clusters = [clicked_cluster]
+    else:
+        cluster_pick = st.multiselect(
+            "Filter by cluster (or click a cell above)",
+            options=cluster_options,
+            default=[],
+            format_func=lambda c: f"{cluster_name(c)}  ({c})",
+            help="High margin · High sales = top-third in both. Low margin · Low sales = bottom-third in both.",
+        )
+        active_clusters = cluster_pick
+
+    if active_clusters:
+        # Active-filter badge with a clear-button when a cell was clicked.
+        labels = ", ".join(f"**{cluster_name(c)}** ({c})" for c in active_clusters)
+        if clicked_cluster:
+            bcol, ccol = st.columns([6, 1])
+            bcol.info(f"Filtering by: {labels} — main table below is filtered to these SKUs.")
+            if ccol.button("Clear", key="clear_cluster_filter"):
+                # Reset the heatmap's selection state and rerun.
+                st.session_state.pop("cluster_heatmap", None)
+                st.rerun()
+        else:
+            st.info(f"Filtering by: {labels}")
+        filtered = filtered[filtered["Cluster Code"].isin(active_clusters)]
+
+        # Quick KPI tiles for the active cluster set.
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("SKUs in cluster", f"{len(filtered):,}")
+        d2.metric("Total sales (€)", f"{filtered['Product Sales'].sum():,.0f}")
+        avg_cm3_c = filtered["CM3%"].mean()
+        d3.metric("Avg CM3 %", f"{avg_cm3_c:.1f}" if pd.notna(avg_cm3_c) else "—")
+        d4.metric("Total units", f"{filtered['Units'].sum():,.0f}")
+        avg_mom_c = filtered["MoM Rev %"].mean() if "MoM Rev %" in filtered.columns else pd.NA
+        d5.metric("Avg MoM Rev %", f"{avg_mom_c:+.1f}%" if pd.notna(avg_mom_c) else "—")
 
     below_target_only = st.checkbox(
         f"Show only SKUs with CM3% below {target_cm3:.1f}%", value=False
