@@ -99,6 +99,24 @@ TOP_SELLER_COL = {
     "amazon.it": "IT filters",
 }
 
+CLUSTER_NAMES = {
+    "1-1": "High margin · High sales",
+    "1-2": "High margin · Mid sales",
+    "1-3": "High margin · Low sales",
+    "2-1": "Mid margin · High sales",
+    "2-2": "Mid margin · Mid sales",
+    "2-3": "Mid margin · Low sales",
+    "3-1": "Low margin · High sales",
+    "3-2": "Low margin · Mid sales",
+    "3-3": "Low margin · Low sales",
+}
+
+
+def cluster_name(code) -> str:
+    if not isinstance(code, str):
+        return ""
+    return CLUSTER_NAMES.get(code, code)
+
 
 def tier_1_to_3(values: pd.Series) -> pd.Series:
     """Bucket a numeric series into tiers 1 (highest) → 3 (lowest).
@@ -230,10 +248,11 @@ with tab_overview:
     tier_base = mp_period.dropna(subset=["CM3%", "Product Sales"]).copy()
     tier_base["Margin Tier"] = tier_1_to_3(tier_base["CM3%"])
     tier_base["Volume Tier"] = tier_1_to_3(tier_base["Product Sales"])
-    tier_base["Cluster"] = (
+    tier_base["Cluster Code"] = (
         tier_base["Margin Tier"].astype("string") + "-" + tier_base["Volume Tier"].astype("string")
     )
-    tier_lookup = tier_base.set_index("SKU")[["Margin Tier", "Volume Tier", "Cluster"]]
+    tier_base["Cluster"] = tier_base["Cluster Code"].map(cluster_name)
+    tier_lookup = tier_base.set_index("SKU")[["Margin Tier", "Volume Tier", "Cluster Code", "Cluster"]]
     filtered = filtered.join(tier_lookup, on="SKU")
     mp_period = mp_period.merge(
         tier_lookup, left_on="SKU", right_index=True, how="left"
@@ -284,17 +303,22 @@ with tab_overview:
             .unstack(fill_value=0)
             .reindex(index=[1, 2, 3], columns=[1, 2, 3], fill_value=0)
         )
+        # Build hover labels with the descriptive name per cell
+        name_grid = [
+            [cluster_name(f"{m}-{v}") for v in [1, 2, 3]] for m in [1, 2, 3]
+        ]
         cluster_fig = go.Figure(
             data=go.Heatmap(
                 z=cluster_grid.values,
-                x=["1 (high)", "2 (mid)", "3 (low)"],
-                y=["1 (high)", "2 (mid)", "3 (low)"],
+                x=["High sales", "Mid sales", "Low sales"],
+                y=["High margin", "Mid margin", "Low margin"],
                 text=cluster_grid.values,
+                customdata=name_grid,
                 texttemplate="%{text}",
                 textfont=dict(size=18, color="#111"),
                 colorscale="Blues",
                 showscale=False,
-                hovertemplate="Margin Tier %{y}<br>Volume Tier %{x}<br><b>%{z} SKUs</b><extra></extra>",
+                hovertemplate="<b>%{customdata}</b><br>%{z} SKUs<extra></extra>",
                 xgap=3, ygap=3,
             )
         )
@@ -316,30 +340,27 @@ with tab_overview:
         points = []
         if sel is not None:
             points = sel.get("points", []) if isinstance(sel, dict) else (getattr(sel, "points", []) or [])
+        label_to_tier = {"High sales": 1, "Mid sales": 2, "Low sales": 3,
+                         "High margin": 1, "Mid margin": 2, "Low margin": 3}
         if points:
             pt = points[0]
-            try:
-                sel_v = int(str(pt.get("x"))[0])
-                sel_m = int(str(pt.get("y"))[0])
+            sel_v = label_to_tier.get(pt.get("x"))
+            sel_m = label_to_tier.get(pt.get("y"))
+            if sel_m and sel_v:
                 clicked_cluster = f"{sel_m}-{sel_v}"
-            except (TypeError, ValueError):
-                clicked_cluster = None
 
     # ----- Drill-in panel for the clicked cluster -----
     if clicked_cluster:
-        drill = filtered[filtered["Cluster"] == clicked_cluster].copy()
-        # Fall back to the tier base if the cluster was filtered out upstream.
+        cluster_label = cluster_name(clicked_cluster)
+        drill = filtered[filtered["Cluster Code"] == clicked_cluster].copy() if "Cluster Code" in filtered.columns else filtered.iloc[0:0]
+        # Fall back to the tier base if upstream filters hid this cluster.
         if drill.empty:
-            drill = tier_base[tier_base["Cluster"] == clicked_cluster].copy()
+            drill = tier_base[tier_base["Cluster Code"] == clicked_cluster].copy()
             drill["MoM Rev %"] = drill["SKU"].map(mom)
         drill = drill.sort_values("Product Sales", ascending=False, na_position="last")
 
         with st.container(border=True):
-            margin_label = {"1": "high margin", "2": "mid margin", "3": "low margin"}[clicked_cluster[0]]
-            volume_label = {"1": "high volume", "2": "mid volume", "3": "low volume"}[clicked_cluster[-1]]
-            st.markdown(
-                f"### Cluster `{clicked_cluster}` — {margin_label}, {volume_label}"
-            )
+            st.markdown(f"### {cluster_label}  *(tier {clicked_cluster})*")
             d1, d2, d3, d4, d5 = st.columns(5)
             d1.metric("SKUs", f"{len(drill):,}")
             d2.metric("Total sales (€)", f"{drill['Product Sales'].sum():,.0f}")
@@ -379,17 +400,20 @@ with tab_overview:
             )
 
     # ----- Cluster filter -----
-    cluster_options = sorted(
-        [c for c in mp_period["Cluster"].dropna().unique() if c and "<NA>" not in c]
-    )
+    available_codes = [
+        c for c in mp_period.get("Cluster Code", pd.Series(dtype="string")).dropna().unique()
+        if c and "<NA>" not in c
+    ]
+    cluster_options = [c for c in CLUSTER_NAMES if c in available_codes]
     cluster_pick = st.multiselect(
-        "Filter by cluster (margin tier – volume tier)",
+        "Filter by cluster",
         options=cluster_options,
         default=[],
-        help="1-1 = top-third margin AND top-third sales. 3-3 = bottom-third in both.",
+        format_func=lambda c: f"{cluster_name(c)}  ({c})",
+        help="High margin · High sales = top-third in both. Low margin · Low sales = bottom-third in both.",
     )
     if cluster_pick:
-        filtered = filtered[filtered["Cluster"].isin(cluster_pick)]
+        filtered = filtered[filtered["Cluster Code"].isin(cluster_pick)]
 
     below_target_only = st.checkbox(
         f"Show only SKUs with CM3% below {target_cm3:.1f}%", value=False
@@ -448,22 +472,22 @@ with tab_overview:
                 else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
                 subset=["MoM Rev %"],
             )
-        if "Cluster" in df_.columns:
-            def _cluster_bg(v):
-                if not isinstance(v, str) or "-" not in v or "NA" in v:
-                    return ""
-                m, vol = v.split("-")
-                # Star (high margin + high volume) → green. Dog (3-3) → red.
-                if m == "1" and vol == "1":
-                    return "background-color: #C6EFCE; font-weight: 600"
-                if m == "3" and vol == "3":
-                    return "background-color: #F8CBAD"
-                if m == "1":
-                    return "background-color: #E2F0D9"
-                if vol == "1":
-                    return "background-color: #DEEBF7"
-                return ""
-            styled = styled.map(_cluster_bg, subset=["Cluster"])
+        if "Cluster" in df_.columns and "Margin Tier" in df_.columns and "Volume Tier" in df_.columns:
+            def _cluster_bg(row):
+                m, vol = row["Margin Tier"], row["Volume Tier"]
+                if pd.isna(m) or pd.isna(vol):
+                    return [""] * len(row)
+                bg = ""
+                if m == 1 and vol == 1:
+                    bg = "background-color: #C6EFCE; font-weight: 600"
+                elif m == 3 and vol == 3:
+                    bg = "background-color: #F8CBAD"
+                elif m == 1:
+                    bg = "background-color: #E2F0D9"
+                elif vol == 1:
+                    bg = "background-color: #DEEBF7"
+                return [bg if c == "Cluster" else "" for c in row.index]
+            styled = styled.apply(_cluster_bg, axis=1)
         if "Days of Supply" in df_.columns:
             styled = styled.map(
                 lambda v: "background-color: #F8CBAD" if pd.notna(v) and v < min_dos else "",
