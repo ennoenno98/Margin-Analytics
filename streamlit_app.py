@@ -186,10 +186,16 @@ with st.container(border=True):
     marketplace = c1.selectbox("Marketplace", marketplaces, index=marketplaces.index(default_mp))
 
     periods = sorted(df["Period"].dropna().unique(), reverse=True)
+
+    def _fmt_week(d):
+        ts = pd.Timestamp(d)
+        iso = ts.isocalendar()
+        return f"KW {iso.week:02d} · {iso.year}"
+
     period = c2.selectbox(
-        "Period",
+        "Calendar week",
         periods,
-        format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"),
+        format_func=_fmt_week,
     )
 
     sku_query = c3.text_input("SKU or Product contains", "")
@@ -234,9 +240,7 @@ with tab_overview:
     if prior_period is not None:
         prior = mp_slice[mp_slice["Period"] == prior_period].set_index("SKU")["CM3%"]
         filtered["Δ CM3 vs prior"] = filtered["CM3%"] - filtered["SKU"].map(prior)
-        delta_caption = (
-            f"Δ CM3% column compares to {pd.Timestamp(prior_period):%Y-%m-%d}."
-        )
+        delta_caption = f"Δ CM3% column compares to {_fmt_week(prior_period)}."
     else:
         filtered["Δ CM3 vs prior"] = pd.NA
         delta_caption = "No prior period available for Δ CM3%."
@@ -258,96 +262,97 @@ with tab_overview:
         tier_lookup, left_on="SKU", right_index=True, how="left"
     )
 
-    # ----- MoM Revenue %: current calendar month vs previous calendar month -----
-    sku_monthly = (
-        mp_slice.dropna(subset=["Period"])
-        .assign(Month=lambda d: d["Period"].dt.to_period("M"))
-        .groupby(["SKU", "Month"], as_index=False)["Product Sales"]
-        .sum()
+    # ----- Inventory columns: always use the LATEST period's values -----
+    # FBA Available, Days of Supply, Sales Velocity represent current-state
+    # inventory health; old snapshots are not useful when reviewing prior
+    # periods, so we overwrite them with the latest values per SKU.
+    inventory_cols = [c for c in ["FBA Available", "Days of Supply", "Sales Velocity"]
+                      if c in mp_slice.columns]
+    latest_mp_period = max(mp_slice["Period"].dropna().unique())
+    inventory_latest = (
+        mp_slice[mp_slice["Period"] == latest_mp_period]
+        .set_index("SKU")[inventory_cols]
     )
-    current_month = pd.Timestamp(period).to_period("M")
-    previous_month = current_month - 1
-    cur = sku_monthly[sku_monthly["Month"] == current_month].set_index("SKU")["Product Sales"]
-    prev = sku_monthly[sku_monthly["Month"] == previous_month].set_index("SKU")["Product Sales"]
-    mom = ((cur - prev) / prev.replace(0, pd.NA)) * 100
-    filtered["MoM Rev %"] = filtered["SKU"].map(mom)
-    weeks_in_current = (
-        mp_slice.dropna(subset=["Period"])
-        .loc[lambda d: d["Period"].dt.to_period("M") == current_month, "Period"]
-        .nunique()
-    )
-    partial_note = (
-        f" Note: {current_month.strftime('%b %Y')} contains only {weeks_in_current} "
-        f"week(s) of data so far — current month is partial."
-        if weeks_in_current < 4 else ""
-    )
-    mom_caption = (
-        f"MoM Rev % compares {current_month.strftime('%b %Y')} revenue to "
-        f"{previous_month.strftime('%b %Y')} (calendar months, same SKU, same marketplace)."
-        + partial_note
+    for col in inventory_cols:
+        filtered[col] = filtered["SKU"].map(inventory_latest[col])
+    inventory_caption = (
+        f"Inventory columns ({', '.join(inventory_cols)}) always show the latest "
+        f"snapshot ({_fmt_week(latest_mp_period)}), regardless of the selected week."
     )
 
-    # ----- Cluster distribution chart -----
-    st.markdown("**Margin × Volume clusters** (Tier 1 = top third, Tier 3 = bottom third)")
-    grid = (
-        mp_period.dropna(subset=["Margin Tier", "Volume Tier"])
-        .groupby(["Margin Tier", "Volume Tier"], observed=True)
-        .size()
-        .reset_index(name="SKUs")
+    # ----- Revenue growth: same calendar week one month earlier (≈ 4 weeks back) -----
+    period_ts = pd.Timestamp(period)
+    target_prior = period_ts - pd.Timedelta(days=28)
+    prior_4w_candidates = [
+        p for p in periods if abs((pd.Timestamp(p) - target_prior).days) <= 3
+    ]
+    prior_4w = max(prior_4w_candidates) if prior_4w_candidates else None
+    if prior_4w is not None:
+        cur_rev = mp_slice[mp_slice["Period"] == period].set_index("SKU")["Product Sales"]
+        prev_rev = mp_slice[mp_slice["Period"] == prior_4w].set_index("SKU")["Product Sales"]
+        wow4 = ((cur_rev - prev_rev) / prev_rev.replace(0, pd.NA)) * 100
+        filtered["Rev Δ 4w %"] = filtered["SKU"].map(wow4)
+        growth_caption = (
+            f"Rev Δ 4w % compares {_fmt_week(period)} revenue to "
+            f"{_fmt_week(prior_4w)} (the same calendar week one month earlier)."
+        )
+    else:
+        filtered["Rev Δ 4w %"] = pd.NA
+        growth_caption = "No week 4 weeks back available, so Rev Δ 4w % is empty."
+
+    # ----- Cluster matrix (clickable 3x3 button grid) -----
+    st.markdown(
+        "**Margin × Volume clusters** — Tier 1 = top third, Tier 3 = bottom third. "
+        "*Click a cell to filter the table below.*"
     )
-    clicked_cluster = None
-    if not grid.empty:
-        cluster_grid = (
-            tier_base.groupby(["Margin Tier", "Volume Tier"], observed=True)
-            .size()
-            .unstack(fill_value=0)
-            .reindex(index=[1, 2, 3], columns=[1, 2, 3], fill_value=0)
-        )
-        # Build hover labels with the descriptive name per cell
-        name_grid = [
-            [cluster_name(f"{m}-{v}") for v in [1, 2, 3]] for m in [1, 2, 3]
-        ]
-        cluster_fig = go.Figure(
-            data=go.Heatmap(
-                z=cluster_grid.values,
-                x=["High sales", "Mid sales", "Low sales"],
-                y=["High margin", "Mid margin", "Low margin"],
-                text=cluster_grid.values,
-                customdata=name_grid,
-                texttemplate="%{text}",
-                textfont=dict(size=18, color="#111"),
-                colorscale="Blues",
-                showscale=False,
-                hovertemplate="<b>%{customdata}</b><br>%{z} SKUs<extra></extra>",
-                xgap=3, ygap=3,
+
+    cluster_grid = (
+        tier_base.groupby(["Margin Tier", "Volume Tier"], observed=True)
+        .size()
+        .unstack(fill_value=0)
+        .reindex(index=[1, 2, 3], columns=[1, 2, 3], fill_value=0)
+    )
+
+    if "active_cluster_code" not in st.session_state:
+        st.session_state["active_cluster_code"] = None
+
+    if cluster_grid.values.sum() > 0:
+        sales_labels = {1: "High sales", 2: "Mid sales", 3: "Low sales"}
+        margin_labels = {1: "High margin", 2: "Mid margin", 3: "Low margin"}
+
+        header_cols = st.columns([1.4, 2, 2, 2], gap="small")
+        header_cols[0].markdown("&nbsp;", unsafe_allow_html=True)
+        for i, v in enumerate([1, 2, 3]):
+            header_cols[i + 1].markdown(
+                f"<div style='text-align:center; font-weight:600; padding:6px 0;'>{sales_labels[v]}</div>",
+                unsafe_allow_html=True,
             )
-        )
-        cluster_fig.update_layout(
-            xaxis=dict(title="Volume Tier (sales)", side="bottom"),
-            yaxis=dict(title="Margin Tier (CM3%)", autorange="reversed"),
-            height=340,
-            margin=dict(t=10, b=10, l=10, r=10),
-        )
-        st.caption("Click any cell to see the products in that cluster.")
-        event = st.plotly_chart(
-            cluster_fig,
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="points",
-            key="cluster_heatmap",
-        )
-        sel = getattr(event, "selection", None) if event is not None else None
-        points = []
-        if sel is not None:
-            points = sel.get("points", []) if isinstance(sel, dict) else (getattr(sel, "points", []) or [])
-        label_to_tier = {"High sales": 1, "Mid sales": 2, "Low sales": 3,
-                         "High margin": 1, "Mid margin": 2, "Low margin": 3}
-        if points:
-            pt = points[0]
-            sel_v = label_to_tier.get(pt.get("x"))
-            sel_m = label_to_tier.get(pt.get("y"))
-            if sel_m and sel_v:
-                clicked_cluster = f"{sel_m}-{sel_v}"
+
+        active_code = st.session_state["active_cluster_code"]
+        for m in [1, 2, 3]:
+            row_cols = st.columns([1.4, 2, 2, 2], gap="small")
+            row_cols[0].markdown(
+                f"<div style='font-weight:600; padding:14px 0;'>{margin_labels[m]}</div>",
+                unsafe_allow_html=True,
+            )
+            for i, v in enumerate([1, 2, 3]):
+                code = f"{m}-{v}"
+                count = int(cluster_grid.loc[m, v])
+                badge = " ⭐" if (m == 1 and v == 1) else (" ⚠️" if (m == 3 and v == 3) else "")
+                is_active = (active_code == code)
+                label = f"{'● ' if is_active else ''}{count} SKUs{badge}"
+                btype = "primary" if is_active else "secondary"
+                if row_cols[i + 1].button(
+                    label,
+                    key=f"cluster_btn_{code}",
+                    use_container_width=True,
+                    type=btype,
+                    help=cluster_name(code),
+                ):
+                    st.session_state["active_cluster_code"] = None if is_active else code
+                    st.rerun()
+
+    clicked_cluster = st.session_state.get("active_cluster_code")
 
     # ----- Active cluster filter (drives the main table below) -----
     # Click on the heatmap takes precedence; the multiselect is the alternate
@@ -377,8 +382,7 @@ with tab_overview:
             bcol, ccol = st.columns([6, 1])
             bcol.info(f"Filtering by: {labels} — main table below is filtered to these SKUs.")
             if ccol.button("Clear", key="clear_cluster_filter"):
-                # Reset the heatmap's selection state and rerun.
-                st.session_state.pop("cluster_heatmap", None)
+                st.session_state["active_cluster_code"] = None
                 st.rerun()
         else:
             st.info(f"Filtering by: {labels}")
@@ -391,8 +395,8 @@ with tab_overview:
         avg_cm3_c = filtered["CM3%"].mean()
         d3.metric("Avg CM3 %", f"{avg_cm3_c:.1f}" if pd.notna(avg_cm3_c) else "—")
         d4.metric("Total units", f"{filtered['Units'].sum():,.0f}")
-        avg_mom_c = filtered["MoM Rev %"].mean() if "MoM Rev %" in filtered.columns else pd.NA
-        d5.metric("Avg MoM Rev %", f"{avg_mom_c:+.1f}%" if pd.notna(avg_mom_c) else "—")
+        avg_mom_c = filtered["Rev Δ 4w %"].mean() if "Rev Δ 4w %" in filtered.columns else pd.NA
+        d5.metric("Avg Rev Δ 4w %", f"{avg_mom_c:+.1f}%" if pd.notna(avg_mom_c) else "—")
 
     below_target_only = st.checkbox(
         f"Show only SKUs with CM3% below {target_cm3:.1f}%", value=False
@@ -402,7 +406,7 @@ with tab_overview:
 
     display_cols = [
         "SKU", "Product", "Cluster", "Margin Tier", "Volume Tier",
-        "Orders", "Units", "Product Sales", "MoM Rev %",
+        "Orders", "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior",
         "Sponsored Spend", "ROAS", "CTR",
         "FBA Available", "Days of Supply", "Sales Velocity",
@@ -422,7 +426,7 @@ with tab_overview:
                 "CM2%": "{:.1f}%",
                 "CM3%": "{:.1f}%",
                 "Δ CM3 vs prior": "{:+.1f} pp",
-                "MoM Rev %": "{:+.1f}%",
+                "Rev Δ 4w %": "{:+.1f}%",
                 "ROAS": "{:.2f}",
                 "CTR": "{:.2f}%",
                 "FBA Available": "{:,.0f}",
@@ -445,11 +449,11 @@ with tab_overview:
                 else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
                 subset=["Δ CM3 vs prior"],
             )
-        if "MoM Rev %" in df_.columns:
+        if "Rev Δ 4w %" in df_.columns:
             styled = styled.map(
                 lambda v: "color: #B71C1C" if pd.notna(v) and v < 0
                 else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
-                subset=["MoM Rev %"],
+                subset=["Rev Δ 4w %"],
             )
         if "Cluster" in df_.columns and "Margin Tier" in df_.columns and "Volume Tier" in df_.columns:
             def _cluster_bg(row):
@@ -474,7 +478,7 @@ with tab_overview:
             )
         return styled
 
-    st.caption(delta_caption + " · " + mom_caption)
+    st.caption(delta_caption + " · " + growth_caption + " · " + inventory_caption)
     st.dataframe(_style(table), use_container_width=True, hide_index=True, height=560)
 
     st.download_button(
@@ -563,39 +567,44 @@ with tab_trend:
             )
             st.plotly_chart(sales_fig, use_container_width=True)
 
-            # Monthly revenue + MoM growth
-            monthly = monthly_revenue(sku_hist)
-            if len(monthly) >= 1:
-                mom_fig = go.Figure()
-                mom_fig.add_bar(
-                    x=monthly["Month"],
-                    y=monthly["Product Sales"],
-                    name="Revenue (€)",
-                    marker_color="#1f3864",
-                    yaxis="y1",
-                )
-                mom_fig.add_scatter(
-                    x=monthly["Month"],
-                    y=monthly["MoM %"],
-                    name="MoM growth (%)",
-                    mode="lines+markers+text",
-                    text=[f"{v:+.1f}%" if pd.notna(v) else "" for v in monthly["MoM %"]],
-                    textposition="top center",
-                    line=dict(color="#d32f2f", width=2),
-                    marker=dict(size=8),
-                    yaxis="y2",
-                )
-                mom_fig.update_layout(
-                    title="Monthly revenue + MoM growth",
-                    xaxis=dict(title="Month", tickformat="%b %Y"),
-                    yaxis=dict(title="Revenue (€)", side="left"),
-                    yaxis2=dict(
-                        title="MoM %", overlaying="y", side="right",
-                        ticksuffix="%", zeroline=True, zerolinecolor="#bbb",
-                    ),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                )
-                st.plotly_chart(mom_fig, use_container_width=True)
+            # Weekly revenue + 4-week-ago growth (same calendar week, one month earlier)
+            week_hist = sku_hist.sort_values("Period").copy()
+            week_hist["Rev 4w ago"] = week_hist["Product Sales"].shift(4)
+            week_hist["Δ 4w %"] = (
+                (week_hist["Product Sales"] - week_hist["Rev 4w ago"])
+                / week_hist["Rev 4w ago"].replace(0, pd.NA)
+            ) * 100
+            week_hist["KW"] = week_hist["Period"].apply(lambda d: _fmt_week(d))
+            growth_fig = go.Figure()
+            growth_fig.add_bar(
+                x=week_hist["KW"],
+                y=week_hist["Product Sales"],
+                name="Revenue (€)",
+                marker_color="#1f3864",
+                yaxis="y1",
+            )
+            growth_fig.add_scatter(
+                x=week_hist["KW"],
+                y=week_hist["Δ 4w %"],
+                name="Δ vs 4 weeks ago (%)",
+                mode="lines+markers+text",
+                text=[f"{v:+.0f}%" if pd.notna(v) else "" for v in week_hist["Δ 4w %"]],
+                textposition="top center",
+                line=dict(color="#d32f2f", width=2),
+                marker=dict(size=7),
+                yaxis="y2",
+            )
+            growth_fig.update_layout(
+                title="Weekly revenue + Δ vs same week 4 weeks earlier",
+                xaxis=dict(title="Calendar week"),
+                yaxis=dict(title="Revenue (€)", side="left"),
+                yaxis2=dict(
+                    title="Δ 4w %", overlaying="y", side="right",
+                    ticksuffix="%", zeroline=True, zerolinecolor="#bbb",
+                ),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(growth_fig, use_container_width=True)
 
             with st.expander("Raw history rows"):
                 st.dataframe(
