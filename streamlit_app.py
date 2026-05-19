@@ -9,7 +9,7 @@ Run locally:
     pip install -r requirements.txt
     python novadata_weekly_export.py --once   # populate novadata_exports/
     export DASHBOARD_PASSWORD="choose-a-password"
-    streamlit run app/streamlit_app.py
+    streamlit run streamlit_app.py
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent
 EXPORTS_DIR = REPO_ROOT / "novadata_exports"
 
 st.set_page_config(
