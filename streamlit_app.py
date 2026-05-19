@@ -501,42 +501,88 @@ with tab_overview:
 
     st.caption(delta_caption + " · " + growth_caption + " · " + inventory_caption)
 
-    # Read-only columns with sensible formatting; Comments is the only editable cell.
-    euro_cols = {"Product Sales", "Sponsored Spend"}
-    pct_cols = {"CM1%", "CM2%", "CM3%", "Rev Δ 4w %", "CTR"}
-    pp_cols = {"Δ CM3 vs prior"}
-    int_cols = {"Orders", "Units", "FBA Available", "Days of Supply"}
-    float1_cols = {"Sales Velocity", "ROAS"}
+    # --- Main table: read-only with color highlights ---
+    def _style(df_: pd.DataFrame):
+        styled = df_.style.format(
+            {
+                "Product Sales": "€{:,.0f}",
+                "Sponsored Spend": "€{:,.0f}",
+                "CM1%": "{:.1f}%",
+                "CM2%": "{:.1f}%",
+                "CM3%": "{:.1f}%",
+                "Δ CM3 vs prior": "{:+.1f} pp",
+                "Rev Δ 4w %": "{:+.1f}%",
+                "ROAS": "{:.2f}",
+                "CTR": "{:.2f}%",
+                "FBA Available": "{:,.0f}",
+                "Days of Supply": "{:,.0f}",
+                "Sales Velocity": "{:,.1f}",
+                "Orders": "{:,.0f}",
+                "Units": "{:,.0f}",
+            },
+            na_rep="—",
+        )
+        if "CM3%" in df_.columns:
+            styled = styled.map(
+                lambda v: "background-color: #F8CBAD" if pd.notna(v) and v < target_cm3
+                else ("background-color: #C6EFCE" if pd.notna(v) else ""),
+                subset=["CM3%"],
+            )
+        if "Δ CM3 vs prior" in df_.columns:
+            styled = styled.map(
+                lambda v: "color: #B71C1C" if pd.notna(v) and v < 0
+                else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
+                subset=["Δ CM3 vs prior"],
+            )
+        if "Rev Δ 4w %" in df_.columns:
+            styled = styled.map(
+                lambda v: "color: #B71C1C" if pd.notna(v) and v < 0
+                else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
+                subset=["Rev Δ 4w %"],
+            )
+        if "Cluster" in df_.columns and "Margin Tier" in df_.columns and "Volume Tier" in df_.columns:
+            def _cluster_bg(row):
+                m, vol = row.get("Margin Tier"), row.get("Volume Tier")
+                if pd.isna(m) or pd.isna(vol):
+                    return [""] * len(row)
+                bg = ""
+                if m == 1 and vol == 1:
+                    bg = "background-color: #C6EFCE; font-weight: 600"
+                elif m == 3 and vol == 3:
+                    bg = "background-color: #F8CBAD"
+                elif m == 1:
+                    bg = "background-color: #E2F0D9"
+                elif vol == 1:
+                    bg = "background-color: #DEEBF7"
+                return [bg if c == "Cluster" else "" for c in row.index]
+            styled = styled.apply(_cluster_bg, axis=1)
+        if "Days of Supply" in df_.columns:
+            styled = styled.map(
+                lambda v: "background-color: #F8CBAD" if pd.notna(v) and v < min_dos else "",
+                subset=["Days of Supply"],
+            )
+        return styled
 
-    editable_cfg: dict = {}
-    for col in table.columns:
-        if col == "Comments":
-            continue
-        if col in euro_cols:
-            editable_cfg[col] = st.column_config.NumberColumn(col, format="€%.0f", disabled=True)
-        elif col in pct_cols:
-            editable_cfg[col] = st.column_config.NumberColumn(col, format="%.1f%%", disabled=True)
-        elif col in pp_cols:
-            editable_cfg[col] = st.column_config.NumberColumn(col, format="%+.1f pp", disabled=True)
-        elif col in int_cols:
-            editable_cfg[col] = st.column_config.NumberColumn(col, format="%d", disabled=True)
-        elif col in float1_cols:
-            editable_cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
-        else:
-            editable_cfg[col] = st.column_config.Column(col, disabled=True)
-    editable_cfg["Comments"] = st.column_config.TextColumn(
-        "Comments",
-        help="Free-text note per SKU. Saved to comments.json on the server.",
-        width="medium",
-    )
+    st.dataframe(_style(table), use_container_width=True, hide_index=True, height=560)
 
+    # --- Compact comments editor below the main table ---
+    st.markdown("**Edit comments** — only the Comments column is editable here. Saved to `comments.json` on the server.")
+    comment_cols = [c for c in ["SKU", "Product", "Cluster", "Product Sales", "CM3%", "Comments"] if c in table.columns]
+    comment_view = table[comment_cols].copy()
     edited = st.data_editor(
-        table,
+        comment_view,
         use_container_width=True,
         hide_index=True,
-        height=560,
-        column_config=editable_cfg,
-        key="overview_editor",
+        height=320,
+        column_config={
+            "SKU": st.column_config.TextColumn("SKU", disabled=True),
+            "Product": st.column_config.TextColumn("Product", disabled=True, width="large"),
+            "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
+            "Product Sales": st.column_config.NumberColumn("Sales (€)", format="€%.0f", disabled=True),
+            "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
+            "Comments": st.column_config.TextColumn("Comments", width="medium"),
+        },
+        key="comments_editor",
     )
 
     # Persist any comment changes.
@@ -561,7 +607,7 @@ with tab_overview:
     dl_col1, dl_col2 = st.columns([1, 1])
     dl_col1.download_button(
         "Download filtered rows (CSV)",
-        data=edited.to_csv(index=False).encode("utf-8"),
+        data=table.to_csv(index=False).encode("utf-8"),
         file_name=f"margin_{marketplace}_{pd.Timestamp(period):%Y%m%d}.csv",
         mime="text/csv",
     )
