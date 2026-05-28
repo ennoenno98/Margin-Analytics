@@ -753,103 +753,115 @@ with tab_overview:
 
     st.caption(delta_caption + " · " + growth_caption + " · " + inventory_caption)
 
-    # --- Main table: read-only with color highlights ---
-    def _style(df_: pd.DataFrame):
-        styled = df_.style.format(
-            {
-                "Product Sales": "€{:,.0f}",
-                "P&L Impact": "€{:,.0f}",
-                "Sponsored Spend": "€{:,.0f}",
-                "CM1%": "{:.1f}%",
-                "CM2%": "{:.1f}%",
-                "CM3%": "{:.1f}%",
-                "Δ CM3 vs prior": "{:+.1f} pp",
-                "Rev Δ 4w %": "{:+.1f}%",
-                "ROAS": "{:.2f}",
-                "CTR": "{:.2f}%",
-                "FBA Available": "{:,.0f}",
-                "Days of Supply": "{:,.0f}",
-                "Sales Velocity": "{:,.1f}",
-                "Orders": "{:,.0f}",
-                "Units": "{:,.0f}",
-            },
-            na_rep="—",
-        )
-        if "CM3%" in df_.columns:
-            styled = styled.map(
-                lambda v: "background-color: #F8CBAD" if pd.notna(v) and v < target_cm3
-                else ("background-color: #C6EFCE" if pd.notna(v) else ""),
-                subset=["CM3%"],
-            )
-        if "Δ CM3 vs prior" in df_.columns:
-            styled = styled.map(
-                lambda v: "color: #B71C1C" if pd.notna(v) and v < 0
-                else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
-                subset=["Δ CM3 vs prior"],
-            )
-        if "Rev Δ 4w %" in df_.columns:
-            styled = styled.map(
-                lambda v: "color: #B71C1C" if pd.notna(v) and v < 0
-                else ("color: #1B5E20" if pd.notna(v) and v > 0 else ""),
-                subset=["Rev Δ 4w %"],
-            )
-        if "Cluster" in df_.columns and "Margin Tier" in df_.columns and "Volume Tier" in df_.columns:
-            def _cluster_bg(row):
-                m, vol = row.get("Margin Tier"), row.get("Volume Tier")
-                if pd.isna(m) or pd.isna(vol):
-                    return [""] * len(row)
-                bg = ""
-                if m == 1 and vol == 1:
-                    bg = "background-color: #C6EFCE; font-weight: 600"
-                elif m == 3 and vol == 3:
-                    bg = "background-color: #F8CBAD"
-                elif m == 1:
-                    bg = "background-color: #E2F0D9"
-                elif vol == 1:
-                    bg = "background-color: #DEEBF7"
-                return [bg if c == "Cluster" else "" for c in row.index]
-            styled = styled.apply(_cluster_bg, axis=1)
-        if "Days of Supply" in df_.columns:
-            styled = styled.map(
-                lambda v: "background-color: #F8CBAD" if pd.notna(v) and v < min_dos else "",
-                subset=["Days of Supply"],
-            )
-        return styled
+    # --- Unified editable table with conditional cell formatting via AgGrid ---
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode
 
-    st.dataframe(_style(table), use_container_width=True, hide_index=True, height=560)
+    fmt_euro = JsCode("function(p){return p.value==null?'—':'€'+Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
+    fmt_int = JsCode("function(p){return p.value==null?'—':Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
+    fmt_pct = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(1)+'%';}")
+    fmt_pct_signed = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(1)+'%';}")
+    fmt_pp = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(1)+' pp';}")
+    fmt_float2 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(2);}")
+    fmt_float1 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(1);}")
 
-    # --- Compact comments editor below the main table ---
-    st.markdown("**Edit comments** — only the Comments column is editable here. Saved to `comments.json` on the server.")
-    comment_cols = [c for c in ["SKU", "Product", "Cluster", "Product Sales", "CM3%", "Comments"] if c in table.columns]
-    comment_view = table[comment_cols].copy()
-    edited = st.data_editor(
-        comment_view,
-        use_container_width=True,
-        hide_index=True,
-        height=320,
-        column_config={
-            "SKU": st.column_config.TextColumn("SKU", disabled=True),
-            "Product": st.column_config.TextColumn("Product", disabled=True, width="large"),
-            "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
-            "Product Sales": st.column_config.NumberColumn("Sales (€)", format="€%.0f", disabled=True),
-            "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
-            "Comments": st.column_config.TextColumn("Comments", width="medium"),
-        },
-        key="comments_editor",
+    style_cm3 = JsCode(
+        f"function(p){{if(p.value==null)return null;"
+        f"if(p.value<{target_cm3})return{{'backgroundColor':'#F8CBAD','color':'#111'}};"
+        f"return{{'backgroundColor':'#C6EFCE','color':'#111'}};}}"
+    )
+    style_delta_text = JsCode(
+        "function(p){if(p.value==null)return null;"
+        "if(p.value<0)return{'color':'#B71C1C','fontWeight':'600'};"
+        "if(p.value>0)return{'color':'#1B5E20','fontWeight':'600'};return null;}"
+    )
+    style_dos = JsCode(
+        f"function(p){{if(p.value==null)return null;"
+        f"if(p.value<{min_dos})return{{'backgroundColor':'#F8CBAD','color':'#111'}};return null;}}"
+    )
+    style_cluster = JsCode(
+        "function(p){var c=p.data && p.data['Cluster Code'];"
+        "if(!c||c.indexOf('NA')>-1)return null;"
+        "var parts=c.split('-');var m=parts[0],v=parts[1];"
+        "if(m=='1'&&v=='1')return{'backgroundColor':'#C6EFCE','fontWeight':'600','color':'#111'};"
+        "if(m=='3'&&v=='3')return{'backgroundColor':'#F8CBAD','color':'#111'};"
+        "if(m=='1')return{'backgroundColor':'#E2F0D9','color':'#111'};"
+        "if(v=='1')return{'backgroundColor':'#DEEBF7','color':'#111'};"
+        "return null;}"
     )
 
-    # Persist any comment changes.
+    # Pass Cluster Code through so the cluster styler can read it (hidden column).
+    table_for_grid = table.copy()
+    if "Cluster Code" in filtered.columns and "Cluster Code" not in table_for_grid.columns:
+        table_for_grid["Cluster Code"] = filtered.set_index("SKU")["Cluster Code"].reindex(
+            table_for_grid["SKU"].values
+        ).values
+
+    gb = GridOptionsBuilder.from_dataframe(table_for_grid)
+    gb.configure_default_column(
+        editable=False, resizable=True, sortable=True, filter=True,
+        cellStyle={"color": "#111"},
+    )
+
+    # Per-column formatting + conditional styling
+    column_specs = {
+        "SKU": dict(width=120, pinned="left"),
+        "Product": dict(width=260, pinned="left", tooltipField="Product"),
+        "Comments": dict(editable=True, width=220,
+                         headerName="Comments ✏",
+                         cellStyle={"backgroundColor": "#FFFDE7", "color": "#111"}),
+        "Cluster": dict(width=170, cellStyle=style_cluster),
+        "Cluster Code": dict(hide=True),
+        "Margin Tier": dict(width=70, type=["numericColumn"]),
+        "Volume Tier": dict(width=70, type=["numericColumn"]),
+        "Orders": dict(width=80, type=["numericColumn"], valueFormatter=fmt_int),
+        "Units": dict(width=80, type=["numericColumn"], valueFormatter=fmt_int),
+        "Product Sales": dict(width=110, type=["numericColumn"], valueFormatter=fmt_euro),
+        "Rev Δ 4w %": dict(width=110, type=["numericColumn"], valueFormatter=fmt_pct_signed, cellStyle=style_delta_text),
+        "CM1%": dict(width=80, type=["numericColumn"], valueFormatter=fmt_pct),
+        "CM2%": dict(width=80, type=["numericColumn"], valueFormatter=fmt_pct),
+        "CM3%": dict(width=80, type=["numericColumn"], valueFormatter=fmt_pct, cellStyle=style_cm3),
+        "Δ CM3 vs prior": dict(width=110, type=["numericColumn"], valueFormatter=fmt_pp, cellStyle=style_delta_text),
+        "P&L Impact": dict(width=110, type=["numericColumn"], valueFormatter=fmt_euro),
+        "Sponsored Spend": dict(width=110, type=["numericColumn"], valueFormatter=fmt_euro),
+        "ROAS": dict(width=80, type=["numericColumn"], valueFormatter=fmt_float2),
+        "CTR": dict(width=80, type=["numericColumn"], valueFormatter=fmt_float2),
+        "FBA Available": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int),
+        "Days of Supply": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, cellStyle=style_dos),
+        "Sales Velocity": dict(width=110, type=["numericColumn"], valueFormatter=fmt_float1),
+        "Child ASIN": dict(width=120),
+    }
+    for col, spec in column_specs.items():
+        if col in table_for_grid.columns:
+            gb.configure_column(col, **spec)
+
+    grid_options = gb.build()
+    grid_response = AgGrid(
+        table_for_grid,
+        gridOptions=grid_options,
+        allow_unsafe_jscode=True,
+        update_mode=GridUpdateMode.VALUE_CHANGED,
+        fit_columns_on_grid_load=False,
+        height=600,
+        theme="streamlit",
+        reload_data=False,
+        key=f"main_grid_{marketplace}_{period}_{granularity}",
+    )
+
+    edited = pd.DataFrame(grid_response["data"]) if grid_response and "data" in grid_response else table_for_grid
+
+    # Persist any comment changes back to comments.json / session.
     new_comments = dict(st.session_state["comments"])
     changed = False
-    for sku, comment in zip(edited["SKU"], edited["Comments"]):
-        comment_str = (comment or "").strip()
-        prev = new_comments.get(sku, "")
-        if comment_str != prev:
-            if comment_str:
-                new_comments[sku] = comment_str
-            elif sku in new_comments:
-                del new_comments[sku]
-            changed = True
+    if "Comments" in edited.columns and "SKU" in edited.columns:
+        for sku, comment in zip(edited["SKU"], edited["Comments"]):
+            comment_str = (str(comment) if comment is not None else "").strip()
+            prev = new_comments.get(sku, "")
+            if comment_str != prev:
+                if comment_str:
+                    new_comments[sku] = comment_str
+                elif sku in new_comments:
+                    del new_comments[sku]
+                changed = True
     if changed:
         st.session_state["comments"] = new_comments
         try:
