@@ -1,0 +1,51 @@
+name: Novadata Products & FBA Export
+
+on:
+  schedule:
+    # Täglich um 06:30 UTC (30 min nach dem Margin-Run)
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements-export.txt
+
+      - name: Export ausführen
+        run: python novadata_products_export.py --once
+
+      - name: Exportdatei als Artifact speichern
+        uses: actions/upload-artifact@v4
+        with:
+          name: products-export-${{ github.run_id }}
+          path: novadata_exports/products_export_*.csv.gz
+          retention-days: 30
+
+      - name: Export in Repo committen (für das Streamlit-Dashboard)
+        run: |
+          if [[ -n "$(git status --porcelain novadata_exports/)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add novadata_exports/
+            git commit -m "data: daily products + FBA refresh"
+            git push
+          else
+            echo "Keine neuen Daten."
+          fi
