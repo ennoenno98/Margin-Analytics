@@ -796,8 +796,15 @@ with tab_overview:
         avg_mom_c = filtered["Rev Δ 4w %"].mean() if "Rev Δ 4w %" in filtered.columns else pd.NA
         d5.metric("Avg Rev Δ 4w %", f"{avg_mom_c:+.1f}%" if pd.notna(avg_mom_c) else "—")
 
-    below_target_only = st.checkbox(
+    toggle_col1, toggle_col2 = st.columns(2)
+    below_target_only = toggle_col1.checkbox(
         f"Show only SKUs with CM3% below {target_cm3:.1f}%", value=False
+    )
+    show_inventory = toggle_col2.toggle(
+        "Show inventory columns",
+        value=True,
+        help="Hide FBA Available / Incoming / Reserved / Total, Days of Supply, "
+             "Sales Velocity and Units (30d) to focus on margin & sales.",
     )
     if below_target_only:
         filtered = filtered[filtered["CM3%"] < target_cm3]
@@ -806,6 +813,12 @@ with tab_overview:
     if "comments" not in st.session_state:
         st.session_state["comments"] = load_comments()
     filtered["Comments"] = filtered["SKU"].map(st.session_state["comments"]).fillna("")
+
+    INVENTORY_COLS = {
+        "FBA Available", "FBA Incoming", "AFN Reserved Quantity",
+        "FBA Total Inventory", "Days of Supply", "Sales Velocity",
+        "Units Sold (30d)",
+    }
 
     display_cols = [
         "SKU", "Product", "Comments", "Cluster", "Margin Tier", "Volume Tier",
@@ -818,6 +831,8 @@ with tab_overview:
         "Child ASIN",
     ]
     display_cols = [c for c in display_cols if c in filtered.columns]
+    if not show_inventory:
+        display_cols = [c for c in display_cols if c not in INVENTORY_COLS]
     table = filtered[display_cols].sort_values(
         "Product Sales", ascending=False, na_position="last"
     )
