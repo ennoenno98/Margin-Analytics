@@ -301,11 +301,11 @@ st.caption(
 )
 
 # ----- Sidebar thresholds (shared across tabs) -----
-target_cm3 = st.sidebar.number_input("Target CM3 %", value=19.7, step=0.5)
-target_cm2 = st.sidebar.number_input("Target CM2 %", value=33.2, step=0.5)
-target_cm1 = st.sidebar.number_input("Target CM1 %", value=71.0, step=0.5)
-min_dos = st.sidebar.number_input("Min Days of Supply", value=30, step=5)
-st.sidebar.caption("Targets affect color highlights and reference lines.")
+# ----- Conditional-format thresholds -----
+# Edit these in code if you need different breakpoints; the previous sidebar
+# controls were rarely changed and added visual noise.
+target_cm3 = 19.7
+min_dos = 30
 
 # ----- Top filters (shared by Overview + Compare) -----
 with st.container(border=True):
@@ -821,7 +821,7 @@ with tab_overview:
     }
 
     display_cols = [
-        "SKU", "Product", "Comments", "Cluster", "Margin Tier", "Volume Tier",
+        "SKU", "Product", "Comments", "Cluster",
         "Orders", "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior", "P&L Impact",
         "Sponsored Spend", "ROAS", "CTR",
