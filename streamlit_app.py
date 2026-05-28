@@ -385,9 +385,12 @@ k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("SKUs in view", f"{len(filtered):,}")
 total_sales_kpi = filtered["Product Sales"].sum()
 k2.metric("Total sales (€)", f"{total_sales_kpi:,.0f}")
-pnl_kpi = ((pd.to_numeric(filtered["CM3%"], errors="coerce") / 100)
-           * pd.to_numeric(filtered["Product Sales"], errors="coerce")).sum()
-k3.metric("P&L Impact (€)", f"{pnl_kpi:,.0f}", help="Σ CM3% × Product Sales — absolute contribution margin in the current view.")
+if "CM3" in filtered.columns:
+    pnl_kpi = pd.to_numeric(filtered["CM3"], errors="coerce").sum()
+else:
+    pnl_kpi = ((pd.to_numeric(filtered["CM3%"], errors="coerce") / 100)
+               * pd.to_numeric(filtered["Product Sales"], errors="coerce")).sum()
+k3.metric("P&L Impact (€)", f"{pnl_kpi:,.0f}", help="Σ Contribution Margin 3 — absolute € contribution in the current view.")
 avg_cm3 = filtered["CM3%"].mean()
 k4.metric("Avg CM3 %", f"{avg_cm3:,.1f}" if pd.notna(avg_cm3) else "—")
 below = int((filtered["CM3%"] < target_cm3).sum())
@@ -509,10 +512,15 @@ with tab_overview:
         filtered["Rev Δ 4w %"] = pd.NA
         growth_caption = "No equivalent set 4 weeks back, so Rev Δ 4w % is empty."
 
-    # ----- P&L Impact = CM3% × Product Sales (absolute € contribution) -----
-    cm3_frac = pd.to_numeric(filtered.get("CM3%"), errors="coerce") / 100
-    sales = pd.to_numeric(filtered.get("Product Sales"), errors="coerce")
-    filtered["P&L Impact"] = cm3_frac * sales
+    # ----- P&L Impact = total CM3 (absolute € contribution) -----
+    # Daily export carries CM3 in € directly; weekly legacy schema only has the
+    # percentage, so fall back to CM3% × Sales there.
+    if "CM3" in filtered.columns:
+        filtered["P&L Impact"] = pd.to_numeric(filtered["CM3"], errors="coerce")
+    else:
+        cm3_frac = pd.to_numeric(filtered.get("CM3%"), errors="coerce") / 100
+        sales = pd.to_numeric(filtered.get("Product Sales"), errors="coerce")
+        filtered["P&L Impact"] = cm3_frac * sales
 
     # ----- Per-country breakdown (only shown in 'All countries' mode) -----
     if is_all_countries:
@@ -528,23 +536,23 @@ with tab_overview:
             agg = aggregate_periods(mp_rows) if len(selected_periods) > 1 else mp_rows
             sales_sum = pd.to_numeric(agg["Product Sales"], errors="coerce").sum()
             units_sum = pd.to_numeric(agg["Units"], errors="coerce").sum()
-            spend_sum = pd.to_numeric(agg["Sponsored Spend"], errors="coerce").sum()
-            cm3_series = pd.to_numeric(agg["CM3%"], errors="coerce")
-            sales_series = pd.to_numeric(agg["Product Sales"], errors="coerce")
-            valid = cm3_series.notna() & sales_series.notna() & (sales_series > 0)
-            if valid.any():
-                cm3_w = ((cm3_series * sales_series).where(valid).sum()
-                         / sales_series.where(valid).sum())
+            spend_sum = pd.to_numeric(agg["Sponsored Spend"], errors="coerce").sum() if "Sponsored Spend" in agg.columns else 0.0
+            # Country-level margin: total CM3 € / total Sales € — NOT a per-SKU average.
+            if "CM3" in agg.columns:
+                cm3_sum = pd.to_numeric(agg["CM3"], errors="coerce").sum()
             else:
-                cm3_w = pd.NA
-            pnl_mp = (cm3_series.where(valid) / 100 * sales_series.where(valid)).sum()
+                # Legacy: derive from CM3% × Sales row-by-row.
+                cm3_pct = pd.to_numeric(agg["CM3%"], errors="coerce")
+                sales_series = pd.to_numeric(agg["Product Sales"], errors="coerce")
+                cm3_sum = ((cm3_pct / 100) * sales_series).sum()
+            country_cm3_pct = (cm3_sum / sales_sum * 100) if sales_sum else pd.NA
             breakdown.append({
                 "Marketplace": mp_name,
                 "SKUs": int(agg["SKU"].nunique()),
                 "Sales (€)": sales_sum,
                 "Units": units_sum,
-                "Avg CM3 %": cm3_w,
-                "P&L Impact (€)": pnl_mp,
+                "Country CM3 %": country_cm3_pct,
+                "P&L Impact (€)": cm3_sum,
                 "Ad spend (€)": spend_sum,
             })
         breakdown_df = pd.DataFrame(breakdown).sort_values("Sales (€)", ascending=False)
@@ -554,22 +562,21 @@ with tab_overview:
                 "SKUs": breakdown_df["SKUs"].sum(),
                 "Sales (€)": breakdown_df["Sales (€)"].sum(),
                 "Units": breakdown_df["Units"].sum(),
-                "Avg CM3 %": (
-                    (breakdown_df["Avg CM3 %"] * breakdown_df["Sales (€)"]).sum()
-                    / breakdown_df["Sales (€)"].sum()
+                "Country CM3 %": (
+                    breakdown_df["P&L Impact (€)"].sum() / breakdown_df["Sales (€)"].sum() * 100
                 ) if breakdown_df["Sales (€)"].sum() else pd.NA,
                 "P&L Impact (€)": breakdown_df["P&L Impact (€)"].sum(),
                 "Ad spend (€)": breakdown_df["Ad spend (€)"].sum(),
             }])
             breakdown_df = pd.concat([breakdown_df, tot], ignore_index=True)
 
-            st.markdown("**Per-country breakdown**")
+            st.markdown("**Per-country breakdown** — Country CM3 % = total CM3 € / total Sales € for that marketplace.")
             st.dataframe(
                 breakdown_df.style.format({
                     "Sales (€)": "€{:,.0f}",
                     "P&L Impact (€)": "€{:,.0f}",
                     "Ad spend (€)": "€{:,.0f}",
-                    "Avg CM3 %": "{:.1f}%",
+                    "Country CM3 %": "{:.1f}%",
                     "Units": "{:,.0f}",
                     "SKUs": "{:,.0f}",
                 }, na_rep="—").apply(
