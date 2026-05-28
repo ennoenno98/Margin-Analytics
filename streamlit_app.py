@@ -190,21 +190,6 @@ def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
     return base
 
 
-def monthly_revenue(history: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate Product Sales by calendar month for one SKU's history."""
-    if history.empty or "Period" not in history.columns:
-        return pd.DataFrame(columns=["Month", "Product Sales", "MoM %"])
-    monthly = (
-        history.dropna(subset=["Period"])
-        .assign(Month=lambda d: d["Period"].dt.to_period("M").dt.to_timestamp())
-        .groupby("Month", as_index=False)["Product Sales"]
-        .sum()
-        .sort_values("Month")
-    )
-    monthly["MoM %"] = monthly["Product Sales"].pct_change() * 100
-    return monthly
-
-
 # ---------- App ----------
 require_login()
 
@@ -342,7 +327,7 @@ k4.metric("Avg CM3 %", f"{avg_cm3:,.1f}" if pd.notna(avg_cm3) else "—")
 below = int((filtered["CM3%"] < target_cm3).sum())
 k5.metric(f"SKUs below {target_cm3:.0f}% CM3", f"{below:,}")
 
-tab_overview, tab_trend, tab_compare = st.tabs(["Overview", "Trend", "Compare"])
+tab_overview, tab_compare = st.tabs(["Overview", "Compare"])
 
 # =========================================================================
 # Overview tab — table + Δ vs previous period
@@ -817,136 +802,6 @@ with tab_overview:
         mime="application/json",
         help="Comments persist on the server but reset on each redeploy. Commit this file to keep them permanently.",
     )
-
-# =========================================================================
-# Trend tab — single SKU, all periods
-# =========================================================================
-with tab_trend:
-    sku_pool = (
-        mp_slice.dropna(subset=["SKU"])
-        .sort_values("Product Sales", ascending=False)["SKU"]
-        .drop_duplicates()
-        .tolist()
-    )
-    if not sku_pool:
-        st.info("No SKUs found for this marketplace.")
-    else:
-        default_sku = filtered["SKU"].iloc[0] if len(filtered) else sku_pool[0]
-        default_idx = sku_pool.index(default_sku) if default_sku in sku_pool else 0
-        sku = st.selectbox("SKU", sku_pool, index=default_idx, key="trend_sku")
-
-        sku_hist = (
-            mp_slice[mp_slice["SKU"] == sku]
-            .sort_values("Period")
-            .copy()
-        )
-        if sku_hist.empty:
-            st.info("No history for this SKU.")
-        else:
-            product_name = sku_hist["Product"].dropna().iloc[-1] if sku_hist["Product"].notna().any() else ""
-            st.markdown(f"**{sku}** — {product_name}")
-
-            latest = sku_hist.iloc[-1]
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Latest CM3 %", f"{latest['CM3%']:.1f}" if pd.notna(latest["CM3%"]) else "—")
-            m2.metric("Latest sales (€)", f"{latest['Product Sales']:,.0f}" if pd.notna(latest["Product Sales"]) else "—")
-            m3.metric("Latest units", f"{latest['Units']:,.0f}" if pd.notna(latest["Units"]) else "—")
-            m4.metric("Days of supply", f"{latest['Days of Supply']:,.0f}" if pd.notna(latest["Days of Supply"]) else "—")
-
-            # Margin trend
-            margin_long = sku_hist.melt(
-                id_vars=["Period"],
-                value_vars=["CM1%", "CM2%", "CM3%"],
-                var_name="Margin",
-                value_name="Value",
-            )
-            fig = px.line(
-                margin_long,
-                x="Period",
-                y="Value",
-                color="Margin",
-                markers=True,
-                title="Margin % over time",
-            )
-            fig.update_yaxes(title="%", ticksuffix="%")
-            fig.add_hline(y=target_cm3, line_dash="dot", line_color="#888",
-                          annotation_text=f"Target CM3 {target_cm3:.1f}%",
-                          annotation_position="top right")
-            fig.add_hline(y=target_cm2, line_dash="dot", line_color="#bbb",
-                          annotation_text=f"Target CM2 {target_cm2:.1f}%",
-                          annotation_position="top right")
-            fig.add_hline(y=target_cm1, line_dash="dot", line_color="#ddd",
-                          annotation_text=f"Target CM1 {target_cm1:.1f}%",
-                          annotation_position="top right")
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Sales + spend (weekly)
-            sales_fig = go.Figure()
-            sales_fig.add_bar(
-                x=sku_hist["Period"], y=sku_hist["Product Sales"], name="Sales (€)",
-                marker_color="#1f3864",
-            )
-            sales_fig.add_bar(
-                x=sku_hist["Period"], y=sku_hist["Sponsored Spend"], name="Ad spend (€)",
-                marker_color="#f59e0b",
-            )
-            sales_fig.update_layout(
-                barmode="group",
-                title="Sales vs ad spend (weekly)",
-                yaxis_title="€",
-            )
-            st.plotly_chart(sales_fig, use_container_width=True)
-
-            # Weekly revenue + 4-week-ago growth (same calendar week, one month earlier)
-            week_hist = sku_hist.sort_values("Period").copy()
-            week_hist["Rev 4w ago"] = week_hist["Product Sales"].shift(4)
-            week_hist["Δ 4w %"] = (
-                (week_hist["Product Sales"] - week_hist["Rev 4w ago"])
-                / week_hist["Rev 4w ago"].replace(0, pd.NA)
-            ) * 100
-            week_hist["KW"] = week_hist["Period"].apply(lambda d: _fmt_week(d))
-            growth_fig = go.Figure()
-            growth_fig.add_bar(
-                x=week_hist["KW"],
-                y=week_hist["Product Sales"],
-                name="Revenue (€)",
-                marker_color="#1f3864",
-                yaxis="y1",
-            )
-            growth_fig.add_scatter(
-                x=week_hist["KW"],
-                y=week_hist["Δ 4w %"],
-                name="Δ vs 4 weeks ago (%)",
-                mode="lines+markers+text",
-                text=[f"{v:+.0f}%" if pd.notna(v) else "" for v in week_hist["Δ 4w %"]],
-                textposition="top center",
-                line=dict(color="#d32f2f", width=2),
-                marker=dict(size=7),
-                yaxis="y2",
-            )
-            growth_fig.update_layout(
-                title="Weekly revenue + Δ vs same week 4 weeks earlier",
-                xaxis=dict(title="Calendar week"),
-                yaxis=dict(title="Revenue (€)", side="left"),
-                yaxis2=dict(
-                    title="Δ 4w %", overlaying="y", side="right",
-                    ticksuffix="%", zeroline=True, zerolinecolor="#bbb",
-                ),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
-            st.plotly_chart(growth_fig, use_container_width=True)
-
-            with st.expander("Raw history rows"):
-                st.dataframe(
-                    sku_hist[[
-                        "Period", "Orders", "Units", "Product Sales",
-                        "CM1%", "CM2%", "CM3%",
-                        "Sponsored Spend", "ROAS", "CTR",
-                        "FBA Available", "Days of Supply", "Sales Velocity",
-                    ]],
-                    hide_index=True,
-                    use_container_width=True,
-                )
 
 # =========================================================================
 # Compare tab — bubble chart for the selected period
