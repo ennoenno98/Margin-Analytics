@@ -685,12 +685,12 @@ with tab_overview:
     filtered["Comments"] = filtered["SKU"].map(st.session_state["comments"]).fillna("")
 
     display_cols = [
-        "SKU", "Product", "Cluster", "Margin Tier", "Volume Tier",
+        "SKU", "Product", "Comments", "Cluster", "Margin Tier", "Volume Tier",
         "Orders", "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior", "P&L Impact",
         "Sponsored Spend", "ROAS", "CTR",
         "FBA Available", "Days of Supply", "Sales Velocity",
-        "Comments", "Child ASIN",
+        "Child ASIN",
     ]
     display_cols = [c for c in display_cols if c in filtered.columns]
     table = filtered[display_cols].sort_values(
