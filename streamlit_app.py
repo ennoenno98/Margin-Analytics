@@ -359,10 +359,39 @@ with tab_overview:
     inventory_cols = [c for c in ["FBA Available", "Days of Supply", "Sales Velocity"]
                       if c in mp_slice.columns]
     latest_mp_period = max(mp_slice["Period"].dropna().unique())
-    inventory_latest = (
-        mp_slice[mp_slice["Period"] == latest_mp_period]
-        .set_index("SKU")[inventory_cols]
-    )
+    latest_rows = mp_slice[mp_slice["Period"] == latest_mp_period].copy()
+    # In 'All countries' mode the same SKU appears in several marketplaces, so
+    # we must aggregate per SKU first. Sum FBA Available and Sales Velocity
+    # (additive across warehouses); weighted-avg Days of Supply by FBA stock
+    # so a near-empty warehouse doesn't drag the figure down.
+    for col in ["FBA Available", "Sales Velocity"]:
+        if col in latest_rows.columns:
+            latest_rows[col] = pd.to_numeric(latest_rows[col], errors="coerce")
+    inventory_latest = pd.DataFrame(index=latest_rows["SKU"].drop_duplicates())
+    if "FBA Available" in inventory_cols:
+        inventory_latest["FBA Available"] = (
+            latest_rows.groupby("SKU")["FBA Available"].sum(min_count=1)
+        )
+    if "Sales Velocity" in inventory_cols:
+        inventory_latest["Sales Velocity"] = (
+            latest_rows.groupby("SKU")["Sales Velocity"].sum(min_count=1)
+        )
+    if "Days of Supply" in inventory_cols:
+        dos_v = pd.to_numeric(latest_rows["Days of Supply"], errors="coerce")
+        weights = pd.to_numeric(latest_rows.get("FBA Available"), errors="coerce")
+        if weights is None or weights.isna().all():
+            inventory_latest["Days of Supply"] = (
+                latest_rows.groupby("SKU")["Days of Supply"].mean()
+            )
+        else:
+            valid = dos_v.notna() & weights.notna() & (weights > 0)
+            tmp = pd.DataFrame({
+                "SKU": latest_rows["SKU"],
+                "_v": (dos_v * weights).where(valid),
+                "_w": weights.where(valid),
+            })
+            agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
+            inventory_latest["Days of Supply"] = agg["num"] / agg["den"].replace(0, pd.NA)
     for col in inventory_cols:
         filtered[col] = filtered["SKU"].map(inventory_latest[col])
     inventory_caption = (
