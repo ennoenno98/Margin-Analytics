@@ -82,6 +82,45 @@ def latest_export(exports_dir: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def latest_products_export(exports_dir: Path) -> Path | None:
+    if not exports_dir.exists():
+        return None
+    candidates = sorted(
+        list(exports_dir.glob("products_export_*.csv"))
+        + list(exports_dir.glob("products_export_*.csv.gz"))
+    )
+    return candidates[-1] if candidates else None
+
+
+@st.cache_data(show_spinner=False)
+def load_products(path: Path) -> pd.DataFrame:
+    """Latest-snapshot lookup of FBA inventory from the daily products feed.
+
+    Returns one row per (SKU, Marketplace Name) — the most recent non-null
+    values across the file's period range. Columns: FBA Available, FBA
+    Incoming, AFN Reserved Quantity, FBA Total Inventory, Sales Velocity,
+    Units Sold (30d), Days of Supply.
+    """
+    p = pd.read_csv(path)
+    p["Period"] = pd.to_datetime(p["Period"], errors="coerce")
+    inventory_cols = [
+        "FBA Available", "FBA Incoming", "AFN Reserved Quantity",
+        "FBA Total Inventory", "Sales Velocity", "Units Sold (30d)",
+        "Days of Supply",
+    ]
+    for c in inventory_cols:
+        if c in p.columns:
+            p[c] = pd.to_numeric(p[c], errors="coerce")
+    # Take the latest non-null value per (SKU, marketplace) per column.
+    p = p.sort_values("Period")
+    keys = ["SKU", "Marketplace Name"]
+    present_cols = [c for c in inventory_cols if c in p.columns]
+    for c in present_cols:
+        p[c] = p.groupby(keys)[c].ffill()
+    latest = p.groupby(keys, as_index=False)[present_cols].last()
+    return latest
+
+
 @st.cache_data(show_spinner=False)
 def load_data(path: Path) -> pd.DataFrame:
     # pd.read_csv handles .gz transparently when the suffix is .csv.gz.
@@ -446,37 +485,31 @@ with tab_overview:
         tier_lookup, left_on="SKU", right_index=True, how="left"
     )
 
-    # ----- Inventory columns: always use the LATEST period's values -----
-    # FBA Available, Days of Supply, Sales Velocity represent current-state
-    # inventory health; old snapshots are not useful when reviewing prior
-    # periods, so we overwrite them with the latest values per SKU.
-    inventory_cols = [c for c in ["FBA Available", "Days of Supply", "Sales Velocity"]
-                      if c in mp_slice.columns]
+    # ----- Inventory columns: always use the LATEST snapshot's values -----
+    # Two data sources:
+    #   - Margin feed (always available): FBA Available, Days of Supply,
+    #     Sales Velocity — pulled from the latest daily row per SKU.
+    #   - Products feed (if present): adds FBA Incoming, AFN Reserved
+    #     Quantity, FBA Total Inventory, Units Sold (30d). Falls through
+    #     cleanly if the file is missing or fields are all NaN.
     latest_mp_period = max(mp_slice["Period"].dropna().unique())
     latest_rows = mp_slice[mp_slice["Period"] == latest_mp_period].copy()
-    # In 'All countries' mode the same SKU appears in several marketplaces, so
-    # we must aggregate per SKU first. Sum FBA Available and Sales Velocity
-    # (additive across warehouses); weighted-avg Days of Supply by FBA stock
-    # so a near-empty warehouse doesn't drag the figure down.
-    for col in ["FBA Available", "Sales Velocity"]:
-        if col in latest_rows.columns:
-            latest_rows[col] = pd.to_numeric(latest_rows[col], errors="coerce")
+    margin_inv_cols = [c for c in ["FBA Available", "Days of Supply", "Sales Velocity"]
+                       if c in latest_rows.columns]
+    for col in margin_inv_cols:
+        latest_rows[col] = pd.to_numeric(latest_rows[col], errors="coerce")
+
     inventory_latest = pd.DataFrame(index=latest_rows["SKU"].drop_duplicates())
-    if "FBA Available" in inventory_cols:
-        inventory_latest["FBA Available"] = (
-            latest_rows.groupby("SKU")["FBA Available"].sum(min_count=1)
-        )
-    if "Sales Velocity" in inventory_cols:
-        inventory_latest["Sales Velocity"] = (
-            latest_rows.groupby("SKU")["Sales Velocity"].sum(min_count=1)
-        )
-    if "Days of Supply" in inventory_cols:
+    # Additive across marketplaces in 'All countries' mode.
+    if "FBA Available" in margin_inv_cols:
+        inventory_latest["FBA Available"] = latest_rows.groupby("SKU")["FBA Available"].sum(min_count=1)
+    if "Sales Velocity" in margin_inv_cols:
+        inventory_latest["Sales Velocity"] = latest_rows.groupby("SKU")["Sales Velocity"].sum(min_count=1)
+    if "Days of Supply" in margin_inv_cols:
         dos_v = pd.to_numeric(latest_rows["Days of Supply"], errors="coerce")
         weights = pd.to_numeric(latest_rows.get("FBA Available"), errors="coerce")
         if weights is None or weights.isna().all():
-            inventory_latest["Days of Supply"] = (
-                latest_rows.groupby("SKU")["Days of Supply"].mean()
-            )
+            inventory_latest["Days of Supply"] = latest_rows.groupby("SKU")["Days of Supply"].mean()
         else:
             valid = dos_v.notna() & weights.notna() & (weights > 0)
             tmp = pd.DataFrame({
@@ -484,13 +517,42 @@ with tab_overview:
                 "_v": (dos_v * weights).where(valid),
                 "_w": weights.where(valid),
             })
-            agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
-            inventory_latest["Days of Supply"] = agg["num"] / agg["den"].replace(0, pd.NA)
-    for col in inventory_cols:
+            dos_agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
+            inventory_latest["Days of Supply"] = dos_agg["num"] / dos_agg["den"].replace(0, pd.NA)
+
+    # Augment with products-feed-only columns if available.
+    extra_inv_cols = ["FBA Incoming", "AFN Reserved Quantity",
+                      "FBA Total Inventory", "Units Sold (30d)"]
+    products_path = latest_products_export(EXPORTS_DIR)
+    products_caption = ""
+    if products_path is not None:
+        products_lookup = load_products(products_path)
+        # Filter to the marketplace(s) in view.
+        if is_all_countries:
+            p_rows = products_lookup
+        else:
+            p_rows = products_lookup[products_lookup["Marketplace Name"] == marketplace]
+        for col in extra_inv_cols:
+            if col in p_rows.columns:
+                inventory_latest[col] = p_rows.groupby("SKU")[col].sum(min_count=1)
+        # Note if the products feed is currently empty.
+        has_any = any(
+            col in p_rows.columns and p_rows[col].notna().any()
+            for col in extra_inv_cols
+        )
+        if not has_any:
+            products_caption = (
+                f" Products feed `{products_path.name}` has no inventory values yet — "
+                f"FBA Incoming / AFN Reserved / FBA Total / Units (30d) will populate "
+                f"once Novadata starts emitting those fields."
+            )
+
+    for col in inventory_latest.columns:
         filtered[col] = filtered["SKU"].map(inventory_latest[col])
     inventory_caption = (
-        f"Inventory columns ({', '.join(inventory_cols)}) always show the latest "
-        f"snapshot ({_fmt_day(latest_mp_period)}), regardless of the selected period."
+        f"Inventory columns always show the latest snapshot "
+        f"({_fmt_day(latest_mp_period)}), regardless of the selected period."
+        + products_caption
     )
 
     # ----- Revenue growth: same calendar weeks one month earlier (shift back 4) -----
@@ -750,7 +812,9 @@ with tab_overview:
         "Orders", "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior", "P&L Impact",
         "Sponsored Spend", "ROAS", "CTR",
-        "FBA Available", "Days of Supply", "Sales Velocity",
+        "FBA Available", "FBA Incoming", "AFN Reserved Quantity",
+        "FBA Total Inventory", "Days of Supply", "Sales Velocity",
+        "Units Sold (30d)",
         "Child ASIN",
     ]
     display_cols = [c for c in display_cols if c in filtered.columns]
@@ -833,8 +897,12 @@ with tab_overview:
         "ROAS": dict(width=80, type=["numericColumn"], valueFormatter=fmt_float2),
         "CTR": dict(width=80, type=["numericColumn"], valueFormatter=fmt_float2),
         "FBA Available": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int),
+        "FBA Incoming": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int),
+        "AFN Reserved Quantity": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, headerName="AFN Reserved"),
+        "FBA Total Inventory": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, headerName="FBA Total"),
         "Days of Supply": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, cellStyle=style_dos),
         "Sales Velocity": dict(width=110, type=["numericColumn"], valueFormatter=fmt_float1),
+        "Units Sold (30d)": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, headerName="Units (30d)"),
         "Child ASIN": dict(width=120),
     }
     for col, spec in column_specs.items():
