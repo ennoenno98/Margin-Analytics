@@ -822,9 +822,9 @@ with tab_overview:
 
     display_cols = [
         "SKU", "Product", "Comments", "Cluster",
-        "Orders", "Units", "Product Sales", "Rev Δ 4w %",
+        "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior", "P&L Impact",
-        "Sponsored Spend", "ROAS", "CTR",
+        "Sponsored Spend",
         "FBA Available", "FBA Incoming", "AFN Reserved Quantity",
         "FBA Total Inventory", "Days of Supply", "Sales Velocity",
         "Units Sold (30d)",
@@ -883,55 +883,106 @@ with tab_overview:
         ).values
 
     gb = GridOptionsBuilder.from_dataframe(table_for_grid)
+    base_cell_style = {
+        "color": "#111",
+        "fontSize": "14px",
+        "lineHeight": "40px",
+        "paddingLeft": "10px",
+        "paddingRight": "10px",
+    }
     gb.configure_default_column(
         editable=False, resizable=True, sortable=True, filter=True,
-        cellStyle={"color": "#111"},
+        cellStyle=base_cell_style,
+        wrapHeaderText=True, autoHeaderHeight=True,
+        headerClass="big-header",
     )
 
-    # Per-column formatting + conditional styling
+    def _style(extra):
+        merged = dict(base_cell_style)
+        if isinstance(extra, dict):
+            merged.update(extra)
+        return merged
+
+    # All conditional styles need the base padding/font merged in, plus their colors.
+    style_cm3_full = JsCode(
+        f"function(p){{var b={{color:'#111',fontSize:'14px',lineHeight:'40px',paddingLeft:'10px',paddingRight:'10px'}};"
+        f"if(p.value==null)return b;"
+        f"if(p.value<{target_cm3}){{b.backgroundColor='#F8CBAD';return b;}}"
+        f"b.backgroundColor='#C6EFCE';return b;}}"
+    )
+    style_delta_text_full = JsCode(
+        "function(p){var b={color:'#111',fontSize:'14px',lineHeight:'40px',paddingLeft:'10px',paddingRight:'10px'};"
+        "if(p.value==null)return b;"
+        "if(p.value<0){b.color='#B71C1C';b.fontWeight='600';return b;}"
+        "if(p.value>0){b.color='#1B5E20';b.fontWeight='600';return b;}return b;}"
+    )
+    style_dos_full = JsCode(
+        f"function(p){{var b={{color:'#111',fontSize:'14px',lineHeight:'40px',paddingLeft:'10px',paddingRight:'10px'}};"
+        f"if(p.value==null)return b;if(p.value<{min_dos}){{b.backgroundColor='#F8CBAD';return b;}}return b;}}"
+    )
+    style_cluster_full = JsCode(
+        "function(p){var b={color:'#111',fontSize:'14px',lineHeight:'40px',paddingLeft:'10px',paddingRight:'10px'};"
+        "var c=p.data && p.data['Cluster Code'];"
+        "if(!c||c.indexOf('NA')>-1)return b;"
+        "var parts=c.split('-');var m=parts[0],v=parts[1];"
+        "if(m=='1'&&v=='1'){b.backgroundColor='#C6EFCE';b.fontWeight='600';return b;}"
+        "if(m=='3'&&v=='3'){b.backgroundColor='#F8CBAD';return b;}"
+        "if(m=='1'){b.backgroundColor='#E2F0D9';return b;}"
+        "if(v=='1'){b.backgroundColor='#DEEBF7';return b;}return b;}"
+    )
+
+    # Per-column formatting + conditional styling. Wider defaults: text columns
+    # ≥140 px, currency ≥130 px, percent ≥100 px so headers don't truncate.
     column_specs = {
-        "SKU": dict(width=120, pinned="left"),
-        "Product": dict(width=260, pinned="left", tooltipField="Product"),
-        "Comments": dict(editable=True, width=220,
+        "SKU": dict(width=140, pinned="left"),
+        "Product": dict(width=320, pinned="left", tooltipField="Product"),
+        "Comments": dict(editable=True, width=260,
                          headerName="Comments ✏",
-                         cellStyle={"backgroundColor": "#FFFDE7", "color": "#111"}),
-        "Cluster": dict(width=170, cellStyle=style_cluster),
+                         cellStyle=_style({"backgroundColor": "#FFFDE7"})),
+        "Cluster": dict(width=200, cellStyle=style_cluster_full),
         "Cluster Code": dict(hide=True),
-        "Margin Tier": dict(width=70, type=["numericColumn"]),
-        "Volume Tier": dict(width=70, type=["numericColumn"]),
-        "Orders": dict(width=80, type=["numericColumn"], valueFormatter=fmt_int),
-        "Units": dict(width=80, type=["numericColumn"], valueFormatter=fmt_int),
-        "Product Sales": dict(width=110, type=["numericColumn"], valueFormatter=fmt_euro),
-        "Rev Δ 4w %": dict(width=110, type=["numericColumn"], valueFormatter=fmt_pct_signed, cellStyle=style_delta_text),
-        "CM1%": dict(width=80, type=["numericColumn"], valueFormatter=fmt_pct),
-        "CM2%": dict(width=80, type=["numericColumn"], valueFormatter=fmt_pct),
-        "CM3%": dict(width=80, type=["numericColumn"], valueFormatter=fmt_pct, cellStyle=style_cm3),
-        "Δ CM3 vs prior": dict(width=110, type=["numericColumn"], valueFormatter=fmt_pp, cellStyle=style_delta_text),
-        "P&L Impact": dict(width=110, type=["numericColumn"], valueFormatter=fmt_euro),
-        "Sponsored Spend": dict(width=110, type=["numericColumn"], valueFormatter=fmt_euro),
-        "ROAS": dict(width=80, type=["numericColumn"], valueFormatter=fmt_float2),
-        "CTR": dict(width=80, type=["numericColumn"], valueFormatter=fmt_float2),
-        "FBA Available": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int),
-        "FBA Incoming": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int),
-        "AFN Reserved Quantity": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, headerName="AFN Reserved"),
-        "FBA Total Inventory": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, headerName="FBA Total"),
-        "Days of Supply": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, cellStyle=style_dos),
-        "Sales Velocity": dict(width=110, type=["numericColumn"], valueFormatter=fmt_float1),
-        "Units Sold (30d)": dict(width=110, type=["numericColumn"], valueFormatter=fmt_int, headerName="Units (30d)"),
-        "Child ASIN": dict(width=120),
+        "Margin Tier": dict(hide=True),
+        "Volume Tier": dict(hide=True),
+        "Units": dict(width=100, type=["numericColumn"], valueFormatter=fmt_int),
+        "Product Sales": dict(width=140, headerName="Sales (€)", type=["numericColumn"], valueFormatter=fmt_euro),
+        "Rev Δ 4w %": dict(width=130, headerName="Rev Δ 4 w", type=["numericColumn"], valueFormatter=fmt_pct_signed, cellStyle=style_delta_text_full),
+        "CM1%": dict(width=100, type=["numericColumn"], valueFormatter=fmt_pct),
+        "CM2%": dict(width=100, type=["numericColumn"], valueFormatter=fmt_pct),
+        "CM3%": dict(width=100, type=["numericColumn"], valueFormatter=fmt_pct, cellStyle=style_cm3_full),
+        "Δ CM3 vs prior": dict(width=140, headerName="Δ CM3", type=["numericColumn"], valueFormatter=fmt_pp, cellStyle=style_delta_text_full),
+        "P&L Impact": dict(width=140, headerName="P&L (€)", type=["numericColumn"], valueFormatter=fmt_euro),
+        "Sponsored Spend": dict(width=140, headerName="Ad spend (€)", type=["numericColumn"], valueFormatter=fmt_euro),
+        "FBA Available": dict(width=130, headerName="FBA Avail.", type=["numericColumn"], valueFormatter=fmt_int),
+        "FBA Incoming": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int),
+        "AFN Reserved Quantity": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int, headerName="AFN Reserved"),
+        "FBA Total Inventory": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int, headerName="FBA Total"),
+        "Days of Supply": dict(width=130, headerName="Days of Supply", type=["numericColumn"], valueFormatter=fmt_int, cellStyle=style_dos_full),
+        "Sales Velocity": dict(width=130, headerName="Velocity / d", type=["numericColumn"], valueFormatter=fmt_float1),
+        "Units Sold (30d)": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int, headerName="Units (30 d)"),
+        "Child ASIN": dict(width=140),
     }
     for col, spec in column_specs.items():
         if col in table_for_grid.columns:
             gb.configure_column(col, **spec)
 
     grid_options = gb.build()
+    grid_options["rowHeight"] = 40
+    grid_options["headerHeight"] = 48
+    # Slightly larger header text so the column names don't visually collide.
+    st.markdown(
+        """<style>
+        .ag-theme-streamlit .ag-header-cell-label { font-weight: 600 !important; font-size: 13px !important; }
+        .ag-theme-streamlit .ag-cell { font-size: 14px !important; }
+        </style>""",
+        unsafe_allow_html=True,
+    )
     grid_response = AgGrid(
         table_for_grid,
         gridOptions=grid_options,
         allow_unsafe_jscode=True,
         update_mode=GridUpdateMode.VALUE_CHANGED,
         fit_columns_on_grid_load=False,
-        height=600,
+        height=640,
         theme="streamlit",
         reload_data=False,
         key=f"main_grid_{marketplace}_{period}_{granularity}",
