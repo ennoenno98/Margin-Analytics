@@ -237,9 +237,12 @@ st.sidebar.caption("Targets affect color highlights and reference lines.")
 # ----- Top filters (shared by Overview + Compare) -----
 with st.container(border=True):
     c1, c2, c3, c4 = st.columns([1.2, 1.2, 2, 1])
-    marketplaces = sorted(df["Marketplace Name"].dropna().unique().tolist())
-    default_mp = "amazon.de" if "amazon.de" in marketplaces else marketplaces[0]
+    real_marketplaces = sorted(df["Marketplace Name"].dropna().unique().tolist())
+    ALL_OPTION = "🌍 All countries"
+    marketplaces = [ALL_OPTION] + real_marketplaces
+    default_mp = "amazon.de" if "amazon.de" in real_marketplaces else real_marketplaces[0]
     marketplace = c1.selectbox("Marketplace", marketplaces, index=marketplaces.index(default_mp))
+    is_all_countries = (marketplace == ALL_OPTION)
 
     periods = sorted(df["Period"].dropna().unique(), reverse=True)
 
@@ -263,11 +266,14 @@ with st.container(border=True):
     top_only = c4.toggle("Top sellers only", value=False)
 
 # Marketplace base slice (all weeks for this marketplace)
-mp_slice = df[df["Marketplace Name"] == marketplace].copy()
+mp_slice = df.copy() if is_all_countries else df[df["Marketplace Name"] == marketplace].copy()
 
 # Current view: aggregate across the selected weeks (sum + weighted avg).
 raw_slice = mp_slice[mp_slice["Period"].isin(selected_periods)].copy()
-filtered = aggregate_periods(raw_slice) if len(selected_periods) > 1 else raw_slice.copy()
+# Aggregate when multiple weeks are picked, or when 'All countries' is on (the
+# same SKU appears in several marketplaces and must be rolled up).
+needs_aggregation = (len(selected_periods) > 1) or is_all_countries
+filtered = aggregate_periods(raw_slice) if needs_aggregation else raw_slice.copy()
 is_multi_period = len(selected_periods) > 1
 
 if sku_query.strip():
@@ -277,21 +283,27 @@ if sku_query.strip():
         | filtered["Product"].astype(str).str.lower().str.contains(q, na=False)
     ]
 
-top_col = TOP_SELLER_COL.get(marketplace)
+top_col = TOP_SELLER_COL.get(marketplace) if not is_all_countries else None
 if top_only:
     if top_col and top_col in filtered.columns:
         filtered = filtered[filtered[top_col] == "Top Seller"]
+    elif is_all_countries:
+        st.info("Top-seller filter is per-marketplace; pick a single country to use it.")
     else:
         st.info(f"No top-seller flag column for {marketplace}; ignoring filter.")
 
 # ----- KPIs -----
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("SKUs in view", f"{len(filtered):,}")
-k2.metric("Total sales (€)", f"{filtered['Product Sales'].sum():,.0f}")
+total_sales_kpi = filtered["Product Sales"].sum()
+k2.metric("Total sales (€)", f"{total_sales_kpi:,.0f}")
+pnl_kpi = ((pd.to_numeric(filtered["CM3%"], errors="coerce") / 100)
+           * pd.to_numeric(filtered["Product Sales"], errors="coerce")).sum()
+k3.metric("P&L Impact (€)", f"{pnl_kpi:,.0f}", help="Σ CM3% × Product Sales — absolute contribution margin in the current view.")
 avg_cm3 = filtered["CM3%"].mean()
-k3.metric("Avg CM3 %", f"{avg_cm3:,.1f}" if pd.notna(avg_cm3) else "—")
+k4.metric("Avg CM3 %", f"{avg_cm3:,.1f}" if pd.notna(avg_cm3) else "—")
 below = int((filtered["CM3%"] < target_cm3).sum())
-k4.metric(f"SKUs below {target_cm3:.0f}% CM3", f"{below:,}")
+k5.metric(f"SKUs below {target_cm3:.0f}% CM3", f"{below:,}")
 
 tab_overview, tab_trend, tab_compare = st.tabs(["Overview", "Trend", "Compare"])
 
@@ -326,7 +338,7 @@ with tab_overview:
         delta_caption = "No equivalent prior weeks available for Δ CM3%."
 
     # ----- Cluster tiers: computed on the aggregated marketplace slice -----
-    mp_period = aggregate_periods(raw_slice) if is_multi_period else raw_slice.copy()
+    mp_period = aggregate_periods(raw_slice) if needs_aggregation else raw_slice.copy()
     tier_base = mp_period.dropna(subset=["CM3%", "Product Sales"]).copy()
     tier_base["Margin Tier"] = tier_1_to_3(tier_base["CM3%"])
     tier_base["Volume Tier"] = tier_1_to_3(tier_base["Product Sales"])
@@ -376,6 +388,95 @@ with tab_overview:
     else:
         filtered["Rev Δ 4w %"] = pd.NA
         growth_caption = "No equivalent set 4 weeks back, so Rev Δ 4w % is empty."
+
+    # ----- P&L Impact = CM3% × Product Sales (absolute € contribution) -----
+    cm3_frac = pd.to_numeric(filtered.get("CM3%"), errors="coerce") / 100
+    sales = pd.to_numeric(filtered.get("Product Sales"), errors="coerce")
+    filtered["P&L Impact"] = cm3_frac * sales
+
+    # ----- Per-country breakdown (only shown in 'All countries' mode) -----
+    if is_all_countries:
+        # Aggregate the selected weeks per marketplace.
+        breakdown = []
+        for mp_name in real_marketplaces:
+            mp_rows = df[
+                (df["Marketplace Name"] == mp_name)
+                & (df["Period"].isin(selected_periods))
+            ]
+            if mp_rows.empty:
+                continue
+            agg = aggregate_periods(mp_rows) if len(selected_periods) > 1 else mp_rows
+            sales_sum = pd.to_numeric(agg["Product Sales"], errors="coerce").sum()
+            units_sum = pd.to_numeric(agg["Units"], errors="coerce").sum()
+            spend_sum = pd.to_numeric(agg["Sponsored Spend"], errors="coerce").sum()
+            cm3_series = pd.to_numeric(agg["CM3%"], errors="coerce")
+            sales_series = pd.to_numeric(agg["Product Sales"], errors="coerce")
+            valid = cm3_series.notna() & sales_series.notna() & (sales_series > 0)
+            if valid.any():
+                cm3_w = ((cm3_series * sales_series).where(valid).sum()
+                         / sales_series.where(valid).sum())
+            else:
+                cm3_w = pd.NA
+            pnl_mp = (cm3_series.where(valid) / 100 * sales_series.where(valid)).sum()
+            breakdown.append({
+                "Marketplace": mp_name,
+                "SKUs": int(agg["SKU"].nunique()),
+                "Sales (€)": sales_sum,
+                "Units": units_sum,
+                "Avg CM3 %": cm3_w,
+                "P&L Impact (€)": pnl_mp,
+                "Ad spend (€)": spend_sum,
+            })
+        breakdown_df = pd.DataFrame(breakdown).sort_values("Sales (€)", ascending=False)
+        if not breakdown_df.empty:
+            tot = pd.DataFrame([{
+                "Marketplace": "Total",
+                "SKUs": breakdown_df["SKUs"].sum(),
+                "Sales (€)": breakdown_df["Sales (€)"].sum(),
+                "Units": breakdown_df["Units"].sum(),
+                "Avg CM3 %": (
+                    (breakdown_df["Avg CM3 %"] * breakdown_df["Sales (€)"]).sum()
+                    / breakdown_df["Sales (€)"].sum()
+                ) if breakdown_df["Sales (€)"].sum() else pd.NA,
+                "P&L Impact (€)": breakdown_df["P&L Impact (€)"].sum(),
+                "Ad spend (€)": breakdown_df["Ad spend (€)"].sum(),
+            }])
+            breakdown_df = pd.concat([breakdown_df, tot], ignore_index=True)
+
+            st.markdown("**Per-country breakdown**")
+            st.dataframe(
+                breakdown_df.style.format({
+                    "Sales (€)": "€{:,.0f}",
+                    "P&L Impact (€)": "€{:,.0f}",
+                    "Ad spend (€)": "€{:,.0f}",
+                    "Avg CM3 %": "{:.1f}%",
+                    "Units": "{:,.0f}",
+                    "SKUs": "{:,.0f}",
+                }, na_rep="—").apply(
+                    lambda row: ["font-weight:600; background:#F2F4F8" if row["Marketplace"] == "Total" else ""] * len(row),
+                    axis=1,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Stacked bar: sales + P&L impact side by side per country (Total row excluded)
+            chart_df = breakdown_df[breakdown_df["Marketplace"] != "Total"].copy()
+            country_fig = go.Figure()
+            country_fig.add_bar(
+                x=chart_df["Marketplace"], y=chart_df["Sales (€)"], name="Sales (€)",
+                marker_color="#1f3864",
+            )
+            country_fig.add_bar(
+                x=chart_df["Marketplace"], y=chart_df["P&L Impact (€)"], name="P&L Impact (€)",
+                marker_color="#74AC2A",
+            )
+            country_fig.update_layout(
+                barmode="group", title="Sales vs P&L Impact per country",
+                yaxis_title="€", height=320, margin=dict(t=40, b=20, l=10, r=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(country_fig, use_container_width=True)
 
     # ----- Cluster matrix (clickable 3x3 button grid) -----
     st.markdown(
@@ -520,7 +621,7 @@ with tab_overview:
     display_cols = [
         "SKU", "Product", "Cluster", "Margin Tier", "Volume Tier",
         "Orders", "Units", "Product Sales", "Rev Δ 4w %",
-        "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior",
+        "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior", "P&L Impact",
         "Sponsored Spend", "ROAS", "CTR",
         "FBA Available", "Days of Supply", "Sales Velocity",
         "Comments", "Child ASIN",
@@ -537,6 +638,7 @@ with tab_overview:
         styled = df_.style.format(
             {
                 "Product Sales": "€{:,.0f}",
+                "P&L Impact": "€{:,.0f}",
                 "Sponsored Spend": "€{:,.0f}",
                 "CM1%": "{:.1f}%",
                 "CM2%": "{:.1f}%",
