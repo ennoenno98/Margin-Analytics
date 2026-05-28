@@ -236,7 +236,7 @@ st.sidebar.caption("Targets affect color highlights and reference lines.")
 
 # ----- Top filters (shared by Overview + Compare) -----
 with st.container(border=True):
-    c1, c2, c3, c4 = st.columns([1.2, 1.2, 2, 1])
+    c1, c2, c3, c4, c5 = st.columns([1.2, 0.9, 1.6, 1.8, 1])
     real_marketplaces = sorted(df["Marketplace Name"].dropna().unique().tolist())
     ALL_OPTION = "🌍 All countries"
     marketplaces = [ALL_OPTION] + real_marketplaces
@@ -251,19 +251,56 @@ with st.container(border=True):
         iso = ts.isocalendar()
         return f"KW {iso.week:02d} · {iso.year}"
 
-    selected_periods = c2.multiselect(
-        "Calendar week(s)",
-        periods,
-        default=[periods[0]] if periods else [],
-        format_func=_fmt_week,
-        help="Pick one week, or several to aggregate (sum sales/units, weighted-avg margins).",
+    granularity = c2.radio(
+        "Granularity",
+        ["Week", "Month", "Quarter"],
+        horizontal=False,
+        key="granularity",
     )
-    if not selected_periods:
-        selected_periods = [periods[0]]
-    period = max(selected_periods)  # 'reference' week for comparisons + captions
 
-    sku_query = c3.text_input("SKU or Product contains", "")
-    top_only = c4.toggle("Top sellers only", value=False)
+    # Build bucket options for the multiselect based on granularity. Each bucket
+    # maps to one or more underlying weeks; `selected_periods` always stays as a
+    # list of week timestamps so all downstream code keeps working.
+    if granularity == "Week":
+        bucket_options = list(periods)
+        bucket_fmt = _fmt_week
+        def _bucket_to_weeks(b):
+            return [pd.Timestamp(b)]
+        bucket_label = "Calendar week(s)"
+    elif granularity == "Month":
+        months = sorted({pd.Timestamp(p).to_period("M") for p in periods}, reverse=True)
+        bucket_options = months
+        bucket_fmt = lambda m: m.strftime("%b %Y")
+        def _bucket_to_weeks(b):
+            return [p for p in periods if pd.Timestamp(p).to_period("M") == b]
+        bucket_label = "Month(s)"
+    else:  # Quarter
+        quarters = sorted({pd.Timestamp(p).to_period("Q") for p in periods}, reverse=True)
+        bucket_options = quarters
+        bucket_fmt = lambda q: f"Q{q.quarter} {q.year}"
+        def _bucket_to_weeks(b):
+            return [p for p in periods if pd.Timestamp(p).to_period("Q") == b]
+        bucket_label = "Quarter(s)"
+
+    selected_buckets = c3.multiselect(
+        bucket_label,
+        bucket_options,
+        default=[bucket_options[0]] if bucket_options else [],
+        format_func=bucket_fmt,
+        key=f"buckets_{granularity}",
+        help="Pick one or several. Month/Quarter selections expand to all weeks they contain.",
+    )
+    if not selected_buckets and bucket_options:
+        selected_buckets = [bucket_options[0]]
+
+    expanded = []
+    for b in selected_buckets:
+        expanded.extend(_bucket_to_weeks(b))
+    selected_periods = sorted(set(expanded), reverse=True) or [periods[0]]
+    period = max(selected_periods)
+
+    sku_query = c4.text_input("SKU or Product contains", "")
+    top_only = c5.toggle("Top sellers only", value=False)
 
 # Marketplace base slice (all weeks for this marketplace)
 mp_slice = df.copy() if is_all_countries else df[df["Marketplace Name"] == marketplace].copy()
@@ -326,7 +363,7 @@ with tab_overview:
     prior_set = _equivalent_prior_set(selected_periods, 1)
     if prior_set:
         prior_raw = mp_slice[mp_slice["Period"].isin(prior_set)]
-        prior_agg = aggregate_periods(prior_raw) if len(prior_set) > 1 else prior_raw
+        prior_agg = aggregate_periods(prior_raw)
         prior = prior_agg.set_index("SKU")["CM3%"]
         filtered["Δ CM3 vs prior"] = filtered["CM3%"] - filtered["SKU"].map(prior)
         delta_caption = (
@@ -404,7 +441,7 @@ with tab_overview:
     if prior_4w_set:
         cur_rev = filtered.set_index("SKU")["Product Sales"]
         prior_4w_raw = mp_slice[mp_slice["Period"].isin(prior_4w_set)]
-        prior_4w_agg = aggregate_periods(prior_4w_raw) if len(prior_4w_set) > 1 else prior_4w_raw
+        prior_4w_agg = aggregate_periods(prior_4w_raw)
         prev_rev = prior_4w_agg.set_index("SKU")["Product Sales"]
         # Align by SKU; some current SKUs may not appear in the prior set.
         wow4 = ((cur_rev - prev_rev.reindex(cur_rev.index))
