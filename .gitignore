@@ -5,3 +5,5 @@ venv/
 .env
 .streamlit/secrets.toml
 .DS_Store
+novadata_export.log
+novadata_exports/_raw_*.csv
