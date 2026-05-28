@@ -73,22 +73,58 @@ def require_login() -> None:
 def latest_export(exports_dir: Path) -> Path | None:
     if not exports_dir.exists():
         return None
-    candidates = sorted(exports_dir.glob("margin_export_*.csv"))
+    # Match .csv and .csv.gz; sort takes lexical order, which works for the
+    # date-stamped filenames we use.
+    candidates = sorted(
+        list(exports_dir.glob("margin_export_*.csv"))
+        + list(exports_dir.glob("margin_export_*.csv.gz"))
+    )
     return candidates[-1] if candidates else None
 
 
 @st.cache_data(show_spinner=False)
 def load_data(path: Path) -> pd.DataFrame:
+    # pd.read_csv handles .gz transparently when the suffix is .csv.gz.
     df = pd.read_csv(path)
     df["Period"] = pd.to_datetime(df["Period"], errors="coerce")
+
+    # Schema variants:
+    # - Daily (current): Contribution Margin 1/2/3 (€ absolute), Advertising Costs.
+    # - Weekly (legacy): CM1%/CM2%/CM3%, Sponsored Spend.
+    cm_abs = {
+        "Contribution Margin 1": "CM1",
+        "Contribution Margin 2": "CM2",
+        "Contribution Margin 3": "CM3",
+    }
+    for src, short in cm_abs.items():
+        if src in df.columns:
+            df[short] = pd.to_numeric(df[src], errors="coerce")
+
+    if "Advertising Costs" in df.columns:
+        df["Sponsored Spend"] = pd.to_numeric(df["Advertising Costs"], errors="coerce")
+
     numeric_cols = [
         "CM1%", "CM2%", "CM3%", "Sponsored Spend", "ROAS", "CTR",
         "Orders", "Units", "Product Sales",
         "FBA Available", "Days of Supply", "Sales Velocity",
+        "CM1", "CM2", "CM3",
     ]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Derive CM%s from absolute amounts when only the daily schema is present.
+    sales = df.get("Product Sales")
+    if sales is not None:
+        for short in ["CM1", "CM2", "CM3"]:
+            pct_col = f"{short}%"
+            if short in df.columns and pct_col not in df.columns:
+                df[pct_col] = df[short] / sales.replace(0, pd.NA) * 100
+
+    # Derive Days of Supply if absent: stock / daily velocity.
+    if "Days of Supply" not in df.columns and "FBA Available" in df.columns and "Sales Velocity" in df.columns:
+        df["Days of Supply"] = df["FBA Available"] / df["Sales Velocity"].replace(0, pd.NA)
+
     return df
 
 
@@ -152,7 +188,10 @@ def save_comments(comments: dict[str, str]) -> None:
     COMMENTS_PATH.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
 
 
-SUM_COLS = ["Orders", "Units", "Product Sales", "Sponsored Spend"]
+SUM_COLS = [
+    "Orders", "Units", "Product Sales", "Sponsored Spend",
+    "CM1", "CM2", "CM3",  # absolute € margins from the daily export
+]
 WAVG_COLS = ["CM1%", "CM2%", "CM3%", "ROAS", "CTR"]
 FIRST_COLS = ["Product", "Child ASIN", "Marketplace Name",
               "DE filters", "UK filters", "FR filters", "ES filters", "IT filters"]
@@ -187,6 +226,16 @@ def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
         agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
         agg[c] = agg["num"] / agg["den"].replace(0, pd.NA)
         base = base.merge(agg[[c]], left_on="SKU", right_index=True, how="left")
+
+    # When absolute margins are present (daily schema), prefer the cleaner
+    # derivation: %CM = Σ(CM) / Σ(Sales) × 100. This overrides the weighted-avg
+    # values computed above where possible.
+    if "Product Sales" in base.columns:
+        sales_total = pd.to_numeric(base["Product Sales"], errors="coerce")
+        for short in ["CM1", "CM2", "CM3"]:
+            if short in base.columns:
+                cm_total = pd.to_numeric(base[short], errors="coerce")
+                base[f"{short}%"] = cm_total / sales_total.replace(0, pd.NA) * 100
     return base
 
 
@@ -236,21 +285,38 @@ with st.container(border=True):
         iso = ts.isocalendar()
         return f"KW {iso.week:02d} · {iso.year}"
 
+    _fmt_day = lambda d: pd.Timestamp(d).strftime("%a %d %b %Y")
+
+    # Default to Week so the multiselect isn't overwhelmed by 200+ daily options
+    # when the data is daily.
+    granularity_options = ["Day", "Week", "Month", "Quarter"]
     granularity = c2.radio(
         "Granularity",
-        ["Week", "Month", "Quarter"],
+        granularity_options,
+        index=granularity_options.index("Week"),
         horizontal=False,
         key="granularity",
     )
 
     # Build bucket options for the multiselect based on granularity. Each bucket
-    # maps to one or more underlying weeks; `selected_periods` always stays as a
-    # list of week timestamps so all downstream code keeps working.
-    if granularity == "Week":
+    # maps to one or more underlying period rows; `selected_periods` stays as a
+    # list of the data's native period timestamps so downstream code is unchanged.
+    if granularity == "Day":
         bucket_options = list(periods)
-        bucket_fmt = _fmt_week
+        bucket_fmt = _fmt_day
         def _bucket_to_weeks(b):
             return [pd.Timestamp(b)]
+        bucket_label = "Day(s)"
+    elif granularity == "Week":
+        weeks = sorted(
+            {pd.Timestamp(p).to_period("W-MON").start_time for p in periods},
+            reverse=True,
+        )
+        bucket_options = weeks
+        bucket_fmt = _fmt_week
+        def _bucket_to_weeks(b):
+            wp = pd.Timestamp(b).to_period("W-MON")
+            return [p for p in periods if pd.Timestamp(p).to_period("W-MON") == wp]
         bucket_label = "Calendar week(s)"
     elif granularity == "Month":
         months = sorted({pd.Timestamp(p).to_period("M") for p in periods}, reverse=True)
@@ -336,8 +402,11 @@ with tab_overview:
     # ----- Δ CM3% vs the equivalent prior set (shift the selection back 1 week) -----
     # In single-week mode this is just the previous week; in multi-week mode we
     # shift every selected week back by 1 week, aggregate, and compare.
-    def _equivalent_prior_set(selected, week_offset):
-        target_dates = [pd.Timestamp(p) - pd.Timedelta(days=7 * week_offset) for p in selected]
+    # Days-back per granularity bucket (used to define the "prior" comparison).
+    bucket_days = {"Day": 1, "Week": 7, "Month": 30, "Quarter": 90}.get(granularity, 7)
+
+    def _equivalent_prior_set(selected, days_offset):
+        target_dates = [pd.Timestamp(p) - pd.Timedelta(days=days_offset) for p in selected]
         matched = []
         for tgt in target_dates:
             cand = [p for p in periods if abs((pd.Timestamp(p) - tgt).days) <= 3]
@@ -345,19 +414,19 @@ with tab_overview:
                 matched.append(max(cand))
         return sorted(set(matched))
 
-    prior_set = _equivalent_prior_set(selected_periods, 1)
+    prior_set = _equivalent_prior_set(selected_periods, bucket_days)
     if prior_set:
         prior_raw = mp_slice[mp_slice["Period"].isin(prior_set)]
         prior_agg = aggregate_periods(prior_raw)
         prior = prior_agg.set_index("SKU")["CM3%"]
         filtered["Δ CM3 vs prior"] = filtered["CM3%"] - filtered["SKU"].map(prior)
         delta_caption = (
-            f"Δ CM3% compares to the same number of weeks ending "
-            f"{_fmt_week(max(prior_set))}."
+            f"Δ CM3% compares to the equivalent prior {granularity.lower()} "
+            f"(ending {_fmt_day(max(prior_set))})."
         )
     else:
         filtered["Δ CM3 vs prior"] = pd.NA
-        delta_caption = "No equivalent prior weeks available for Δ CM3%."
+        delta_caption = f"No equivalent prior {granularity.lower()} available for Δ CM3%."
 
     # ----- Cluster tiers: computed on the aggregated marketplace slice -----
     mp_period = aggregate_periods(raw_slice) if needs_aggregation else raw_slice.copy()
@@ -418,11 +487,11 @@ with tab_overview:
         filtered[col] = filtered["SKU"].map(inventory_latest[col])
     inventory_caption = (
         f"Inventory columns ({', '.join(inventory_cols)}) always show the latest "
-        f"snapshot ({_fmt_week(latest_mp_period)}), regardless of the selected week."
+        f"snapshot ({_fmt_day(latest_mp_period)}), regardless of the selected period."
     )
 
     # ----- Revenue growth: same calendar weeks one month earlier (shift back 4) -----
-    prior_4w_set = _equivalent_prior_set(selected_periods, 4)
+    prior_4w_set = _equivalent_prior_set(selected_periods, 28)
     if prior_4w_set:
         cur_rev = filtered.set_index("SKU")["Product Sales"]
         prior_4w_raw = mp_slice[mp_slice["Period"].isin(prior_4w_set)]
@@ -433,8 +502,8 @@ with tab_overview:
                 / prev_rev.reindex(cur_rev.index).replace(0, pd.NA)) * 100
         filtered["Rev Δ 4w %"] = filtered["SKU"].map(wow4)
         growth_caption = (
-            f"Rev Δ 4w % compares the selected week(s) to the equivalent set "
-            f"4 weeks earlier (ending {_fmt_week(max(prior_4w_set))})."
+            f"Rev Δ 4w % compares the selection to the same days 4 weeks earlier "
+            f"(ending {_fmt_day(max(prior_4w_set))})."
         )
     else:
         filtered["Rev Δ 4w %"] = pd.NA
