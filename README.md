@@ -25,6 +25,11 @@ monitoring, fed by a weekly Novadata export committed to this repo.
 4. Open **Advanced settings → Secrets** and paste:
    ```toml
    DASHBOARD_PASSWORD = "pick-something-strong"
+
+   # Optional but recommended — persist Comments column edits across
+   # container reboots. See "Persisting comments" below for setup.
+   # GITHUB_TOKEN     = "ghp_..."
+   # COMMENTS_GIST_ID = "abc123..."
    ```
 5. Click **Deploy**. First build takes ~2 minutes.
 
@@ -52,6 +57,31 @@ Actions runs it automatically. To trigger manually: **Actions → Novadata
 Weekly Export → Run workflow**. Each successful run commits a new
 `margin_export_YYYY-MM-DD.csv`, which Streamlit Community Cloud picks up on
 the next deploy.
+
+## Persisting comments
+
+Edits in the **Comments** column are written to `comments.json` on disk
+*and*, when configured, mirrored to a private GitHub Gist so they
+survive Streamlit Cloud's container reboots / redeploys.
+
+One-time setup:
+
+1. Create a private Gist with a single file named exactly
+   `comments.json` containing `{}` — copy the **Gist ID** (the long
+   hash in the URL).
+2. Create a **fine-grained personal access token** (GitHub → Settings
+   → Developer settings → Personal access tokens → Fine-grained tokens).
+   Scope: **Gists → Read and write**. No repository permissions needed.
+3. In Streamlit Cloud → **Manage app → Settings → Secrets**, add:
+   ```toml
+   GITHUB_TOKEN     = "github_pat_..."
+   COMMENTS_GIST_ID = "abc123..."
+   ```
+4. Reboot the app. The Comments column will now load from and write to
+   the Gist, with a small "synced to Gist ✓" indicator under the table.
+
+Without those secrets the app falls back to session-only comments and
+shows a hint near the table.
 
 ## Alternative: Render
 

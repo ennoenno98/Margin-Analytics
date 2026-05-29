@@ -212,8 +212,62 @@ def tier_1_to_3(values: pd.Series) -> pd.Series:
 
 COMMENTS_PATH = REPO_ROOT / "comments.json"
 
+# ---------- Comments persistence ----------
+# Streamlit Cloud's filesystem is ephemeral (resets on every code push or idle
+# reboot). To keep comments across container lifetimes we mirror them to a
+# private GitHub Gist when GITHUB_TOKEN + COMMENTS_GIST_ID are set in
+# st.secrets. The local file stays as a fallback.
+
+GIST_FILE = "comments.json"
+
+
+def _gist_config():
+    """(gist_id, token) tuple, or (None, None) if not configured."""
+    try:
+        token = st.secrets.get("GITHUB_TOKEN")
+        gist_id = st.secrets.get("COMMENTS_GIST_ID")
+    except Exception:
+        token = os.environ.get("GITHUB_TOKEN")
+        gist_id = os.environ.get("COMMENTS_GIST_ID")
+    return (gist_id, token) if (token and gist_id) else (None, None)
+
+
+def _load_comments_from_gist(gist_id: str, token: str) -> dict[str, str] | None:
+    import requests
+    r = requests.get(
+        f"https://api.github.com/gists/{gist_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=10,
+    )
+    if r.status_code != 200:
+        return None
+    files = r.json().get("files", {})
+    content = (files.get(GIST_FILE) or {}).get("content", "{}")
+    try:
+        data = json.loads(content)
+        return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def _save_comments_to_gist(gist_id: str, token: str, comments: dict[str, str]) -> bool:
+    import requests
+    body = {"files": {GIST_FILE: {"content": json.dumps(comments, indent=2, ensure_ascii=False)}}}
+    r = requests.patch(
+        f"https://api.github.com/gists/{gist_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        json=body,
+        timeout=10,
+    )
+    return r.status_code == 200
+
 
 def load_comments() -> dict[str, str]:
+    gist_id, token = _gist_config()
+    if gist_id and token:
+        remote = _load_comments_from_gist(gist_id, token)
+        if remote is not None:
+            return remote
     if not COMMENTS_PATH.exists():
         return {}
     try:
@@ -222,9 +276,19 @@ def load_comments() -> dict[str, str]:
         return {}
 
 
-def save_comments(comments: dict[str, str]) -> None:
+def save_comments(comments: dict[str, str]) -> str:
+    """Return a short status string for UI display."""
     clean = {k: v for k, v in comments.items() if v and v.strip()}
-    COMMENTS_PATH.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
+    try:
+        COMMENTS_PATH.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
+    except Exception:
+        pass
+    gist_id, token = _gist_config()
+    if gist_id and token:
+        if _save_comments_to_gist(gist_id, token, clean):
+            return "synced to Gist ✓"
+        return "Gist write failed — session only ⚠"
+    return "session only — configure GITHUB_TOKEN + COMMENTS_GIST_ID for persistence"
 
 
 SUM_COLS = [
@@ -1033,9 +1097,26 @@ with tab_overview:
     if changed:
         st.session_state["comments"] = new_comments
         try:
-            save_comments(new_comments)
+            st.session_state["comments_status"] = save_comments(new_comments)
         except Exception as exc:
-            st.warning(f"Couldn't write comments.json ({exc}); kept in session only.")
+            st.session_state["comments_status"] = f"save failed: {exc}"
+
+    # Always show a small status line so the user knows whether edits persist.
+    status = st.session_state.get("comments_status")
+    gist_id, token = _gist_config()
+    if status:
+        if "✓" in status:
+            st.success(f"Comments {status}")
+        elif "⚠" in status or "failed" in status:
+            st.warning(f"Comments {status}")
+        else:
+            st.caption(f"Comments — {status}")
+    elif not (gist_id and token):
+        st.caption(
+            "Comments are kept for this session only. To persist across "
+            "container reboots, set `GITHUB_TOKEN` and `COMMENTS_GIST_ID` "
+            "in the Streamlit Cloud secrets (see README)."
+        )
 
     dl_col1, dl_col2 = st.columns([1, 1])
     dl_col1.download_button(
