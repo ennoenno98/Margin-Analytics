@@ -990,7 +990,7 @@ with tab_overview:
     # Force a normal layout so the body scrolls instead of letting the grid
     # grow tall and bleed into the page scroll.
     grid_options["domLayout"] = "normal"
-    grid_options["alwaysShowVerticalScroll"] = True
+    grid_options["alwaysShowHorizontalScroll"] = True
     grid_options["suppressHorizontalScroll"] = False
     # Slightly larger header text so the column names don't visually collide.
     st.markdown(
