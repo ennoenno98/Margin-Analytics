@@ -910,6 +910,8 @@ with tab_overview:
         cellStyle=base_cell_style,
         wrapHeaderText=True, autoHeaderHeight=True,
         headerClass="big-header",
+        minWidth=120,
+        suppressSizeToFit=False,
     )
 
     def _style(extra):
@@ -947,38 +949,39 @@ with tab_overview:
     )
 
     # Per-column formatting + conditional styling. Wider defaults: text columns
-    # ≥140 px, currency ≥130 px, percent ≥100 px so headers don't truncate.
+    # Default widths sized so the header + a typical value fit without
+    # the user having to drag-resize the column.
     column_specs = {
-        "SKU": dict(width=140, pinned="left"),
-        "Product": dict(width=260, pinned="left",
+        "SKU": dict(width=160, pinned="left"),
+        "Product": dict(width=300, pinned="left",
                         tooltipValueGetter=JsCode(
                             "function(p){return (p.data && p.data['Product Full']) || p.value;}"
                         )),
         "Product Full": dict(hide=True),
-        "Comments": dict(editable=True, width=260,
+        "Comments": dict(editable=True, width=300,
                          headerName="Comments ✏",
                          cellStyle=_style({"backgroundColor": "#FFFDE7"})),
-        "Cluster": dict(width=200, cellStyle=style_cluster_full),
+        "Cluster": dict(width=230, cellStyle=style_cluster_full),
         "Cluster Code": dict(hide=True),
         "Margin Tier": dict(hide=True),
         "Volume Tier": dict(hide=True),
-        "Units": dict(width=100, type=["numericColumn"], valueFormatter=fmt_int),
-        "Product Sales": dict(width=140, headerName="Sales (€)", type=["numericColumn"], valueFormatter=fmt_euro),
-        "Rev Δ 4w %": dict(width=130, headerName="Rev Δ 4 w", type=["numericColumn"], valueFormatter=fmt_pct_signed, cellStyle=style_delta_text_full),
-        "CM1%": dict(width=100, type=["numericColumn"], valueFormatter=fmt_pct),
-        "CM2%": dict(width=100, type=["numericColumn"], valueFormatter=fmt_pct),
-        "CM3%": dict(width=100, type=["numericColumn"], valueFormatter=fmt_pct, cellStyle=style_cm3_full),
-        "Δ CM3 vs prior": dict(width=140, headerName="Δ CM3", type=["numericColumn"], valueFormatter=fmt_pp, cellStyle=style_delta_text_full),
-        "P&L Impact": dict(width=140, headerName="P&L (€)", type=["numericColumn"], valueFormatter=fmt_euro),
-        "Sponsored Spend": dict(width=140, headerName="Ad spend (€)", type=["numericColumn"], valueFormatter=fmt_euro),
-        "FBA Available": dict(width=130, headerName="FBA Avail.", type=["numericColumn"], valueFormatter=fmt_int),
-        "FBA Incoming": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int),
-        "AFN Reserved Quantity": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int, headerName="AFN Reserved"),
-        "FBA Total Inventory": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int, headerName="FBA Total"),
-        "Days of Supply": dict(width=130, headerName="Days of Supply", type=["numericColumn"], valueFormatter=fmt_int, cellStyle=style_dos_full),
-        "Sales Velocity": dict(width=130, headerName="Velocity / d", type=["numericColumn"], valueFormatter=fmt_float1),
-        "Units Sold (30d)": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int, headerName="Units (30 d)"),
-        "Child ASIN": dict(width=140),
+        "Units": dict(width=130, type=["numericColumn"], valueFormatter=fmt_int),
+        "Product Sales": dict(width=170, headerName="Sales (€)", type=["numericColumn"], valueFormatter=fmt_euro),
+        "Rev Δ 4w %": dict(width=160, headerName="Rev Δ 4w", type=["numericColumn"], valueFormatter=fmt_pct_signed, cellStyle=style_delta_text_full),
+        "CM1%": dict(width=120, type=["numericColumn"], valueFormatter=fmt_pct),
+        "CM2%": dict(width=120, type=["numericColumn"], valueFormatter=fmt_pct),
+        "CM3%": dict(width=120, type=["numericColumn"], valueFormatter=fmt_pct, cellStyle=style_cm3_full),
+        "Δ CM3 vs prior": dict(width=170, headerName="Δ CM3", type=["numericColumn"], valueFormatter=fmt_pp, cellStyle=style_delta_text_full),
+        "P&L Impact": dict(width=170, headerName="P&L (€)", type=["numericColumn"], valueFormatter=fmt_euro),
+        "Sponsored Spend": dict(width=170, headerName="Ad spend (€)", type=["numericColumn"], valueFormatter=fmt_euro),
+        "FBA Available": dict(width=150, headerName="FBA Avail.", type=["numericColumn"], valueFormatter=fmt_int),
+        "FBA Incoming": dict(width=150, headerName="FBA Incoming", type=["numericColumn"], valueFormatter=fmt_int),
+        "AFN Reserved Quantity": dict(width=160, type=["numericColumn"], valueFormatter=fmt_int, headerName="AFN Reserved"),
+        "FBA Total Inventory": dict(width=150, type=["numericColumn"], valueFormatter=fmt_int, headerName="FBA Total"),
+        "Days of Supply": dict(width=160, headerName="Days of Supply", type=["numericColumn"], valueFormatter=fmt_int, cellStyle=style_dos_full),
+        "Sales Velocity": dict(width=150, headerName="Velocity / d", type=["numericColumn"], valueFormatter=fmt_float1),
+        "Units Sold (30d)": dict(width=150, type=["numericColumn"], valueFormatter=fmt_int, headerName="Units (30d)"),
+        "Child ASIN": dict(width=150),
     }
     for col, spec in column_specs.items():
         if col in table_for_grid.columns:
@@ -992,6 +995,20 @@ with tab_overview:
     grid_options["domLayout"] = "normal"
     grid_options["alwaysShowHorizontalScroll"] = True
     grid_options["suppressHorizontalScroll"] = False
+    # Best-effort: on first paint, ask AgGrid to size every column so the
+    # header AND the widest cell value both fit. Falls back gracefully to the
+    # configured widths above if the column API isn't ready in this version.
+    grid_options["onFirstDataRendered"] = JsCode(
+        "function(params){"
+        "try{"
+        " var api = params.columnApi || (params.api && params.api.columnApi) || params.api;"
+        " var cols = api.getAllDisplayedColumns ? api.getAllDisplayedColumns()"
+        "          : (api.getColumns ? api.getColumns() : []);"
+        " var ids = cols.map(function(c){return c.getColId();});"
+        " if (api.autoSizeColumns) api.autoSizeColumns(ids, false);"
+        "}catch(e){console.warn('autoSize failed', e);}"
+        "}"
+    )
     # Slightly larger header text so the column names don't visually collide.
     st.markdown(
         """<style>
