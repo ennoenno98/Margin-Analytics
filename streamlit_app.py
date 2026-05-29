@@ -877,6 +877,21 @@ with tab_overview:
 
     # Pass Cluster Code through so the cluster styler can read it (hidden column).
     table_for_grid = table.copy()
+    # Keep the full product title in a hidden column so the AgGrid tooltip can
+    # show it, and replace the visible value with a short version: text before
+    # the first separator, capped at 50 chars.
+    if "Product" in table_for_grid.columns:
+        def _short_product(name):
+            if not isinstance(name, str) or not name:
+                return name
+            short = name
+            for sep in (" | ", " — ", " - ", ", "):
+                if sep in short:
+                    short = short.split(sep, 1)[0]
+                    break
+            return short if len(short) <= 50 else short[:47] + "…"
+        table_for_grid["Product Full"] = table_for_grid["Product"]
+        table_for_grid["Product"] = table_for_grid["Product"].apply(_short_product)
     if "Cluster Code" in filtered.columns and "Cluster Code" not in table_for_grid.columns:
         table_for_grid["Cluster Code"] = filtered.set_index("SKU")["Cluster Code"].reindex(
             table_for_grid["SKU"].values
@@ -935,7 +950,11 @@ with tab_overview:
     # ≥140 px, currency ≥130 px, percent ≥100 px so headers don't truncate.
     column_specs = {
         "SKU": dict(width=140, pinned="left"),
-        "Product": dict(width=320, pinned="left", tooltipField="Product"),
+        "Product": dict(width=260, pinned="left",
+                        tooltipValueGetter=JsCode(
+                            "function(p){return (p.data && p.data['Product Full']) || p.value;}"
+                        )),
+        "Product Full": dict(hide=True),
         "Comments": dict(editable=True, width=260,
                          headerName="Comments ✏",
                          cellStyle=_style({"backgroundColor": "#FFFDE7"})),
@@ -968,6 +987,11 @@ with tab_overview:
     grid_options = gb.build()
     grid_options["rowHeight"] = 40
     grid_options["headerHeight"] = 48
+    # Force a normal layout so the body scrolls instead of letting the grid
+    # grow tall and bleed into the page scroll.
+    grid_options["domLayout"] = "normal"
+    grid_options["alwaysShowVerticalScroll"] = True
+    grid_options["suppressHorizontalScroll"] = False
     # Slightly larger header text so the column names don't visually collide.
     st.markdown(
         """<style>
