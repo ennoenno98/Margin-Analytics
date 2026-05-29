@@ -908,7 +908,7 @@ with tab_overview:
     gb.configure_default_column(
         editable=False, resizable=True, sortable=True, filter=True,
         cellStyle=base_cell_style,
-        wrapHeaderText=True, autoHeaderHeight=True,
+        wrapHeaderText=False,
         headerClass="big-header",
         minWidth=120,
         suppressSizeToFit=False,
@@ -995,20 +995,6 @@ with tab_overview:
     grid_options["domLayout"] = "normal"
     grid_options["alwaysShowHorizontalScroll"] = True
     grid_options["suppressHorizontalScroll"] = False
-    # Best-effort: on first paint, ask AgGrid to size every column so the
-    # header AND the widest cell value both fit. Falls back gracefully to the
-    # configured widths above if the column API isn't ready in this version.
-    grid_options["onFirstDataRendered"] = JsCode(
-        "function(params){"
-        "try{"
-        " var api = params.columnApi || (params.api && params.api.columnApi) || params.api;"
-        " var cols = api.getAllDisplayedColumns ? api.getAllDisplayedColumns()"
-        "          : (api.getColumns ? api.getColumns() : []);"
-        " var ids = cols.map(function(c){return c.getColId();});"
-        " if (api.autoSizeColumns) api.autoSizeColumns(ids, false);"
-        "}catch(e){console.warn('autoSize failed', e);}"
-        "}"
-    )
     # Slightly larger header text so the column names don't visually collide.
     st.markdown(
         """<style>
