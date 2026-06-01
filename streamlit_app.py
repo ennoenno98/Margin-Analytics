@@ -487,8 +487,7 @@ with st.container(border=True):
     real_marketplaces = sorted(df["Marketplace Name"].dropna().unique().tolist())
     ALL_OPTION = "🌍 All countries"
     marketplaces = [ALL_OPTION] + real_marketplaces
-    default_mp = "amazon.de" if "amazon.de" in real_marketplaces else real_marketplaces[0]
-    marketplace = c1.selectbox("Marketplace", marketplaces, index=marketplaces.index(default_mp))
+    marketplace = c1.selectbox("Marketplace", marketplaces, index=0)  # default: All countries
     is_all_countries = (marketplace == ALL_OPTION)
 
     periods = sorted(df["Period"].dropna().unique(), reverse=True)
@@ -586,8 +585,18 @@ with st.container(border=True):
             f"Trailing 30 days; highest is €{rev_max:,.0f}."
         )
 
+# Revenue gate (all-country trailing-30-day sales per SKU). Applied at the
+# slice level so EVERY downstream view — table, cluster matrix, per-country
+# breakdown, margin trend — inherits the same SKU universe.
+if min_monthly_sales > 0 and len(sku_monthly_rev):
+    passing_skus = set(sku_monthly_rev[sku_monthly_rev >= min_monthly_sales].index)
+else:
+    passing_skus = None
+
 # Marketplace base slice (all weeks for this marketplace)
 mp_slice = df.copy() if is_all_countries else df[df["Marketplace Name"] == marketplace].copy()
+if passing_skus is not None:
+    mp_slice = mp_slice[mp_slice["SKU"].isin(passing_skus)]
 
 # Current view: aggregate across the selected weeks (sum + weighted avg).
 raw_slice = mp_slice[mp_slice["Period"].isin(selected_periods)].copy()
@@ -612,11 +621,6 @@ if top_only:
         st.info("Top-seller filter is per-marketplace; pick a single country to use it.")
     else:
         st.info(f"No top-seller flag column for {marketplace}; ignoring filter.")
-
-# Revenue gate (all-country trailing-30-day sales per SKU).
-if min_monthly_sales > 0 and len(sku_monthly_rev):
-    _rev = filtered["SKU"].map(sku_monthly_rev).fillna(0.0)
-    filtered = filtered[_rev >= min_monthly_sales]
 
 # ----- KPIs -----
 k1, k2, k3, k4, k5 = st.columns(5)
@@ -792,6 +796,8 @@ with tab_overview:
                 (df["Marketplace Name"] == mp_name)
                 & (df["Period"].isin(selected_periods))
             ]
+            if passing_skus is not None:
+                mp_rows = mp_rows[mp_rows["SKU"].isin(passing_skus)]
             if mp_rows.empty:
                 continue
             agg = aggregate_periods(mp_rows) if len(selected_periods) > 1 else mp_rows
@@ -1283,7 +1289,8 @@ with tab_trend:
     trend_freq = {"Month": "M", "Quarter": "Q", "Year": "Y"}[trend_unit]
     freq_label = trend_unit.lower()
 
-    # Full marketplace history, re-applying the same SKU / top-seller filters.
+    # Full marketplace history, re-applying the SKU / top-seller filters.
+    # (mp_slice is already revenue-gated at the slice level above.)
     trend_raw = mp_slice.copy()
     if sku_query.strip():
         _q = sku_query.strip().lower()
@@ -1293,10 +1300,6 @@ with tab_trend:
         ]
     if top_only and top_col and top_col in trend_raw.columns:
         trend_raw = trend_raw[trend_raw[top_col] == "Top Seller"]
-    # Apply the same all-country revenue gate as the rest of the page.
-    if min_monthly_sales > 0 and len(sku_monthly_rev):
-        _keep = sku_monthly_rev[sku_monthly_rev >= min_monthly_sales].index
-        trend_raw = trend_raw[trend_raw["SKU"].isin(_keep)]
 
     # Number of distinct buckets the chosen unit yields across the history.
     _n_buckets = (
