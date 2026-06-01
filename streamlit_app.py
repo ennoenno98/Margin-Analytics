@@ -432,6 +432,22 @@ def margin_trend(raw: pd.DataFrame, freq: str,
     return pd.DataFrame(rows)
 
 
+@st.cache_data(show_spinner=False)
+def monthly_sales_all_countries(df_full: pd.DataFrame) -> pd.Series:
+    """Per-SKU revenue over the trailing 30 days, summed across ALL marketplaces.
+
+    Used as a stable 'product size' gate independent of the marketplace and
+    period currently being viewed. Indexed by SKU.
+    """
+    d = df_full.dropna(subset=["Period"]).copy()
+    if d.empty:
+        return pd.Series(dtype="float64")
+    latest = d["Period"].max()
+    window = d[d["Period"] > latest - pd.Timedelta(days=30)]
+    sales = pd.to_numeric(window["Product Sales"], errors="coerce")
+    return sales.groupby(window["SKU"]).sum()
+
+
 # ---------- App ----------
 require_login()
 
@@ -546,6 +562,26 @@ with st.container(border=True):
     sku_query = c4.text_input("SKU or Product contains", "")
     top_only = c5.toggle("Top sellers only", value=False)
 
+    # Revenue slicer — gate on each SKU's trailing-30-day sales across ALL
+    # countries, so the threshold is a stable "product size" cut regardless of
+    # the marketplace / period currently selected. Default €5k.
+    sku_monthly_rev = monthly_sales_all_countries(df)
+    rev_max = float(sku_monthly_rev.max()) if len(sku_monthly_rev) else 0.0
+    r1, r2 = st.columns([1, 3])
+    min_monthly_sales = r1.number_input(
+        "Min monthly sales (€, all countries)",
+        min_value=0, value=5000, step=500,
+        help="Hide SKUs whose combined sales across all marketplaces over the "
+             "last 30 days are below this. Set to 0 to show everything.",
+    )
+    if rev_max:
+        n_pass = int((sku_monthly_rev >= min_monthly_sales).sum())
+        r2.caption(
+            f"{n_pass:,} of {len(sku_monthly_rev):,} SKUs clear "
+            f"€{min_monthly_sales:,.0f}/mo (all countries). "
+            f"Trailing 30 days; highest is €{rev_max:,.0f}."
+        )
+
 # Marketplace base slice (all weeks for this marketplace)
 mp_slice = df.copy() if is_all_countries else df[df["Marketplace Name"] == marketplace].copy()
 
@@ -572,6 +608,11 @@ if top_only:
         st.info("Top-seller filter is per-marketplace; pick a single country to use it.")
     else:
         st.info(f"No top-seller flag column for {marketplace}; ignoring filter.")
+
+# Revenue gate (all-country trailing-30-day sales per SKU).
+if min_monthly_sales > 0 and len(sku_monthly_rev):
+    _rev = filtered["SKU"].map(sku_monthly_rev).fillna(0.0)
+    filtered = filtered[_rev >= min_monthly_sales]
 
 # ----- KPIs -----
 k1, k2, k3, k4, k5 = st.columns(5)
@@ -1248,6 +1289,10 @@ with tab_trend:
         ]
     if top_only and top_col and top_col in trend_raw.columns:
         trend_raw = trend_raw[trend_raw[top_col] == "Top Seller"]
+    # Apply the same all-country revenue gate as the rest of the page.
+    if min_monthly_sales > 0 and len(sku_monthly_rev):
+        _keep = sku_monthly_rev[sku_monthly_rev >= min_monthly_sales].index
+        trend_raw = trend_raw[trend_raw["SKU"].isin(_keep)]
 
     # Number of distinct buckets the chosen unit yields across the history.
     _n_buckets = (
