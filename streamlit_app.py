@@ -630,7 +630,7 @@ k4.metric("Avg CM3 %", f"{avg_cm3:,.1f}" if pd.notna(avg_cm3) else "—")
 below = int((filtered["CM3%"] < target_cm3).sum())
 k5.metric(f"SKUs below {target_cm3:.0f}% CM3", f"{below:,}")
 
-tab_overview, tab_trend, tab_compare = st.tabs(["Overview", "Margin Trend", "Compare"])
+tab_overview, tab_trend = st.tabs(["Overview", "Margin Trend"])
 
 # =========================================================================
 # Overview tab — table + Δ vs previous period
@@ -1429,41 +1429,3 @@ with tab_trend:
                 f"'Change' is the predicted first→last difference in percentage "
                 f"points. SKUs with fewer than two {freq_label}s of data are omitted."
             )
-
-# =========================================================================
-# Compare tab — bubble chart for the selected period
-# =========================================================================
-with tab_compare:
-    scatter_src = filtered.dropna(subset=["Product Sales", "CM3%"]).copy()
-    if scatter_src.empty:
-        st.info("No rows with both Product Sales and CM3% to plot.")
-    else:
-        scatter_src["Top Seller"] = (
-            scatter_src[top_col].fillna("").eq("Top Seller").map({True: "Top Seller", False: "Other"})
-            if top_col and top_col in scatter_src.columns
-            else "Other"
-        )
-        fig = px.scatter(
-            scatter_src,
-            x="Product Sales",
-            y="CM3%",
-            size="Units",
-            color="Top Seller",
-            color_discrete_map={"Top Seller": "#1f3864", "Other": "#bdbdbd"},
-            hover_name="SKU",
-            hover_data={"Product": True, "Orders": True, "ROAS": ":.2f", "Units": True},
-            size_max=40,
-            title=f"Sales vs CM3% — {marketplace} @ {pd.Timestamp(period):%Y-%m-%d}",
-        )
-        fig.update_yaxes(ticksuffix="%")
-        fig.update_xaxes(tickprefix="€")
-        fig.add_hline(
-            y=target_cm3, line_dash="dot", line_color="#d32f2f",
-            annotation_text=f"Target CM3 {target_cm3:.1f}%",
-            annotation_position="top right",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.caption(
-            "Bubble size = Units sold. SKUs below the dotted line are missing the CM3% target."
-        )
