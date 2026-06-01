@@ -342,6 +342,96 @@ def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
     return base
 
 
+def _cm3_pct_by_bucket(raw: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """CM3% per (SKU, time bucket) within a slice of raw period rows.
+
+    `freq` is a pandas period alias ('D' or 'W'). CM3% is computed from
+    totals (Σ CM3 / Σ Sales) when the absolute margin column is present,
+    otherwise from a sales-weighted average of the CM3% column.
+    Returns long-form columns: SKU, bucket, CM3%.
+    """
+    r = raw.dropna(subset=["Period"]).copy()
+    if r.empty:
+        return pd.DataFrame(columns=["SKU", "bucket", "CM3%"])
+    r["bucket"] = r["Period"].dt.to_period(freq).dt.start_time
+    r["Product Sales"] = pd.to_numeric(r.get("Product Sales"), errors="coerce")
+    if "CM3" in r.columns:
+        r["CM3"] = pd.to_numeric(r["CM3"], errors="coerce")
+        grp = r.groupby(["SKU", "bucket"], as_index=False).agg(
+            _cm3=("CM3", "sum"), _sales=("Product Sales", "sum")
+        )
+        grp["CM3%"] = grp["_cm3"] / grp["_sales"].replace(0, pd.NA) * 100
+    else:
+        r["CM3%"] = pd.to_numeric(r.get("CM3%"), errors="coerce")
+        r["_w"] = (r["CM3%"] * r["Product Sales"]).where(
+            r["CM3%"].notna() & r["Product Sales"].notna()
+        )
+        grp = r.groupby(["SKU", "bucket"], as_index=False).agg(
+            _num=("_w", "sum"), _sales=("Product Sales", "sum")
+        )
+        grp["CM3%"] = grp["_num"] / grp["_sales"].replace(0, pd.NA) * 100
+    grp = grp.rename(columns={"_sales": "Sales"})
+    return grp[["SKU", "bucket", "CM3%", "Sales"]].dropna(subset=["CM3%"])
+
+
+def margin_trend(raw: pd.DataFrame, freq: str,
+                 threshold_pp: float = 2.0, min_buckets: int = 2) -> pd.DataFrame:
+    """Per-SKU margin trend over the selected window.
+
+    Fits a straight line to each SKU's CM3% across the time buckets and
+    classifies the predicted change from first to last bucket:
+      Rising    → change ≥ +threshold_pp
+      Declining → change ≤ −threshold_pp
+      Neutral   → in between
+    SKUs with fewer than `min_buckets` data points are excluded.
+
+    Returns columns: SKU, Trend, Slope (pp/bucket), Change (pp),
+    Start CM3%, End CM3%, Points.
+    """
+    import numpy as np
+
+    long = _cm3_pct_by_bucket(raw, freq)
+    if long.empty:
+        return pd.DataFrame(
+            columns=["SKU", "Trend", "Slope", "Change", "Start CM3%", "End CM3%", "Points"]
+        )
+
+    rows = []
+    for sku, g in long.groupby("SKU"):
+        g = g.sort_values("bucket")
+        n = len(g)
+        if n < min_buckets:
+            continue
+        x = np.arange(n, dtype=float)
+        y = g["CM3%"].to_numpy(dtype=float)
+        # Weight the fit by sales so low-volume weeks (which can show wild CM3%
+        # from a tiny denominator) don't dominate the slope. Fall back to an
+        # unweighted fit if weights are missing or all zero.
+        w = pd.to_numeric(g.get("Sales"), errors="coerce").to_numpy(dtype=float)
+        if w is None or not np.isfinite(w).any() or np.nansum(w) <= 0:
+            slope, intercept = np.polyfit(x, y, 1)
+        else:
+            w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+            slope, intercept = np.polyfit(x, y, 1, w=np.sqrt(w))
+        change = slope * (n - 1)            # predicted first→last change
+        if change >= threshold_pp:
+            trend = "Rising"
+        elif change <= -threshold_pp:
+            trend = "Declining"
+        else:
+            trend = "Neutral"
+        rows.append({
+            "SKU": sku,
+            "Trend": trend,
+            "Slope": slope,
+            "Change": change,
+            "Start CM3%": y[0],
+            "End CM3%": y[-1],
+            "Points": n,
+        })
+    return pd.DataFrame(rows)
+
+
 # ---------- App ----------
 require_login()
 
@@ -499,7 +589,7 @@ k4.metric("Avg CM3 %", f"{avg_cm3:,.1f}" if pd.notna(avg_cm3) else "—")
 below = int((filtered["CM3%"] < target_cm3).sum())
 k5.metric(f"SKUs below {target_cm3:.0f}% CM3", f"{below:,}")
 
-tab_overview, tab_compare = st.tabs(["Overview", "Compare"])
+tab_overview, tab_trend, tab_compare = st.tabs(["Overview", "Margin Trend", "Compare"])
 
 # =========================================================================
 # Overview tab — table + Δ vs previous period
@@ -1132,6 +1222,168 @@ with tab_overview:
         mime="application/json",
         help="Comments persist on the server but reset on each redeploy. Commit this file to keep them permanently.",
     )
+
+# =========================================================================
+# Margin Trend tab — CM3% trajectory bucketed by month / quarter / year
+# =========================================================================
+with tab_trend:
+    # This tab spans the FULL available history (month/quarter/year trends
+    # need a long horizon), honoring the marketplace + SKU + top-seller
+    # filters but not the day/week period picker above.
+    s_unit, s_thresh, s_info = st.columns([1.4, 1, 2.6])
+    trend_unit = s_unit.radio(
+        "Trend by", ["Month", "Quarter", "Year"],
+        horizontal=True, index=0, key="trend_unit",
+    )
+    trend_freq = {"Month": "M", "Quarter": "Q", "Year": "Y"}[trend_unit]
+    freq_label = trend_unit.lower()
+
+    # Full marketplace history, re-applying the same SKU / top-seller filters.
+    trend_raw = mp_slice.copy()
+    if sku_query.strip():
+        _q = sku_query.strip().lower()
+        trend_raw = trend_raw[
+            trend_raw["SKU"].astype(str).str.lower().str.contains(_q, na=False)
+            | trend_raw["Product"].astype(str).str.lower().str.contains(_q, na=False)
+        ]
+    if top_only and top_col and top_col in trend_raw.columns:
+        trend_raw = trend_raw[trend_raw[top_col] == "Top Seller"]
+
+    # Number of distinct buckets the chosen unit yields across the history.
+    _n_buckets = (
+        trend_raw["Period"].dropna().dt.to_period(trend_freq).nunique()
+        if not trend_raw.empty else 0
+    )
+
+    if trend_raw.empty or _n_buckets < 2:
+        st.info(
+            f"Not enough history to build a {freq_label} trend "
+            f"(found {_n_buckets} {freq_label}(s)). Try a finer unit "
+            f"(e.g. Month) or wait for more data to accumulate."
+        )
+    else:
+        threshold_pp = s_thresh.number_input(
+            "Trend threshold (± pp)", value=2.0, min_value=0.5, step=0.5,
+            help="CM3% change from the first to the last bucket needed to count "
+                 "as Rising or Declining. Smaller = more SKUs flagged.",
+        )
+
+        # ----- Portfolio CM3% trajectory -----
+        port = _cm3_pct_by_bucket(trend_raw, trend_freq)
+        # Aggregate across SKUs per bucket = Σ CM3 / Σ Sales, re-derived cleanly.
+        r = trend_raw.dropna(subset=["Period"]).copy()
+        r["bucket"] = r["Period"].dt.to_period(trend_freq).dt.start_time
+        r["Product Sales"] = pd.to_numeric(r.get("Product Sales"), errors="coerce")
+        if "CM3" in r.columns:
+            r["CM3"] = pd.to_numeric(r["CM3"], errors="coerce")
+            port_ts = r.groupby("bucket", as_index=False).agg(
+                cm3=("CM3", "sum"), sales=("Product Sales", "sum")
+            )
+        else:
+            r["_w"] = (pd.to_numeric(r["CM3%"], errors="coerce") * r["Product Sales"])
+            port_ts = r.groupby("bucket", as_index=False).agg(
+                cm3=("_w", "sum"), sales=("Product Sales", "sum")
+            )
+        port_ts["CM3%"] = port_ts["cm3"] / port_ts["sales"].replace(0, pd.NA) * 100
+        port_ts = port_ts.sort_values("bucket")
+
+        line = px.line(
+            port_ts, x="bucket", y="CM3%", markers=True,
+            title=f"Portfolio CM3% by {freq_label} — {marketplace}",
+        )
+        line.update_yaxes(ticksuffix="%")
+        line.update_xaxes(title=freq_label.capitalize())
+        line.add_hline(
+            y=target_cm3, line_dash="dot", line_color="#d32f2f",
+            annotation_text=f"Target {target_cm3:.1f}%", annotation_position="top right",
+        )
+        st.plotly_chart(line, use_container_width=True)
+
+        # ----- Per-SKU trend classification -----
+        trends = margin_trend(trend_raw, trend_freq, threshold_pp=threshold_pp)
+        if trends.empty:
+            st.info(f"No SKU has at least two {freq_label}s of data in this selection.")
+        else:
+            counts = trends["Trend"].value_counts()
+            n_rise = int(counts.get("Rising", 0))
+            n_neutral = int(counts.get("Neutral", 0))
+            n_decline = int(counts.get("Declining", 0))
+            s_info.markdown(
+                f"Classifying **{len(trends):,}** SKUs by CM3% change across "
+                f"**{_n_buckets} {freq_label}s** (linear fit, first → last bucket)."
+            )
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("📈 Rising margins", f"{n_rise:,}",
+                      help=f"CM3% improved by ≥ {threshold_pp:.1f} pp over the window.")
+            m2.metric("➡️ Neutral margins", f"{n_neutral:,}",
+                      help=f"CM3% changed by less than ±{threshold_pp:.1f} pp.")
+            m3.metric("📉 Declining margins", f"{n_decline:,}",
+                      help=f"CM3% dropped by ≥ {threshold_pp:.1f} pp over the window.")
+
+            # Distribution bar
+            dist = pd.DataFrame({
+                "Trend": ["Rising", "Neutral", "Declining"],
+                "SKUs": [n_rise, n_neutral, n_decline],
+            })
+            bar = px.bar(
+                dist, x="Trend", y="SKUs", color="Trend",
+                color_discrete_map={
+                    "Rising": "#1B7A3D", "Neutral": "#9E9E9E", "Declining": "#C62828",
+                },
+                text="SKUs",
+            )
+            bar.update_layout(showlegend=False, height=260, margin=dict(t=10, b=10))
+            st.plotly_chart(bar, use_container_width=True)
+
+            # ----- Per-category SKU tables -----
+            # Enrich with Product + latest sales/CM3 from the aggregated view.
+            enrich = filtered.set_index("SKU")
+            for col in ["Product", "Product Sales", "CM3%", "Cluster"]:
+                if col in enrich.columns:
+                    trends[col] = trends["SKU"].map(enrich[col])
+
+            trend_order = {
+                "📈 Rising margins": ("Rising", False),
+                "📉 Declining margins": ("Declining", True),
+                "➡️ Neutral margins": ("Neutral", None),
+            }
+            for label, (key, asc) in trend_order.items():
+                sub = trends[trends["Trend"] == key].copy()
+                if sub.empty:
+                    continue
+                if asc is None:
+                    sub = sub.sort_values("Change", key=lambda s: s.abs())
+                else:
+                    sub = sub.sort_values("Change", ascending=asc)
+                show_cols = [c for c in [
+                    "SKU", "Product", "Cluster", "Product Sales",
+                    "Start CM3%", "End CM3%", "Change", "Points",
+                ] if c in sub.columns]
+                with st.expander(f"{label} ({len(sub):,})", expanded=(key != "Neutral")):
+                    st.dataframe(
+                        sub[show_cols].style.format({
+                            "Product Sales": "€{:,.0f}",
+                            "Start CM3%": "{:.1f}%",
+                            "End CM3%": "{:.1f}%",
+                            "Change": "{:+.1f} pp",
+                            "Points": "{:.0f}",
+                        }, na_rep="—"),
+                        use_container_width=True, hide_index=True,
+                    )
+                    st.download_button(
+                        f"Download {key} SKUs (CSV)",
+                        data=sub[show_cols].to_csv(index=False).encode("utf-8"),
+                        file_name=f"margin_{key.lower()}_{marketplace}_{pd.Timestamp(period):%Y%m%d}.csv",
+                        mime="text/csv",
+                        key=f"dl_trend_{key}",
+                    )
+
+            st.caption(
+                f"Trend = linear fit of CM3% across the selected {freq_label}s; "
+                f"'Change' is the predicted first→last difference in percentage "
+                f"points. SKUs with fewer than two {freq_label}s of data are omitted."
+            )
 
 # =========================================================================
 # Compare tab — bubble chart for the selected period
