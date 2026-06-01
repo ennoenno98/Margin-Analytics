@@ -28,6 +28,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle  # noqa: E4
 from reportlab.lib.units import cm  # noqa: E402
 from reportlab.platypus import (  # noqa: E402
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak,
+    KeepTogether,
 )
 
 # ─── Palette ──────────────────────────────────────────────────────────
@@ -243,51 +244,80 @@ def build():
 
     # ----- Four focus segments -----
     E.append(Paragraph("The four segments to discuss", h2))
+    E.append(Paragraph(
+        "Each segment lists its five most P&amp;L-relevant SKUs — for the high-margin segments "
+        "these are the biggest CM3 contributors; for the low-margin segments, the biggest CM3 "
+        "drains. The prompts are starting points for the room, not fixed actions.", body))
+    E.append(Spacer(1, 4))
 
+    # (colour, verdict, open prompts, sort-ascending-by-CM3?)
+    # Low-margin segments → ascending (most-negative P&L first = biggest drains).
+    # High-margin segments → descending (biggest P&L contributors first).
     seg_meta = {
         "Low margin · High sales": (RED,
-            "Biggest lever. High volume is actively destroying or barely making margin.",
-            "<b>Procurement:</b> renegotiate COGS / MOQs on these specific SKUs. "
-            "<b>Product:</b> review pack size, bundle, or BOM cost. "
-            "<b>Marketing:</b> cut ad spend / discount depth here — we're buying unprofitable volume."),
+            "Biggest lever — high volume at thin or negative margin.",
+            "Where is the margin going: landed cost, fulfilment, or discount/ad spend? "
+            "Which of these are structural vs. fixable, and which is volume worth keeping at all?",
+            True),
         "Low margin · Medium sales": (AMBER,
-            "Watch list. Mid volume, weak margin — fix or de-prioritise before they grow.",
-            "<b>Procurement:</b> include in the next cost review wave. "
-            "<b>Marketing:</b> stop promoting until margin is repaired."),
+            "Watch list — weak margin before they scale further.",
+            "Are these on a path to the high-sales / low-margin trap, and what would it take to "
+            "turn the margin before they grow?",
+            True),
         "High margin · Low sales": (GREEN,
-            "Scale opportunity. Great margin, under-exposed — grow with low risk.",
-            "<b>Marketing:</b> prioritise for ads, content and merchandising. "
-            "<b>Product:</b> check availability / listing quality isn't the bottleneck."),
+            "Scale opportunity — strong margin, under-exposed.",
+            "What is capping demand — visibility, content, availability, price? Where could extra "
+            "investment pay back given the healthy margin?",
+            False),
         "High margin · High sales": (NAVY,
-            "Protect. The profit engine of the catalogue.",
-            "<b>All:</b> defend price, buy-box and stock. "
-            "<b>Procurement:</b> secure supply continuity; avoid stock-outs."),
+            "Protect — the profit engine of the catalogue.",
+            "What are the risks to these (price pressure, stock-outs, competitor entry), and how "
+            "much headroom is there before margin erodes?",
+            False),
     }
     for name, st in focus.items():
-        col, headline, actions = seg_meta[name]
-        E.append(Paragraph(name, ParagraphStyle("seg", parent=h3, textColor=col)))
+        col, verdict, prompt, asc = seg_meta[name]
+        block = [Paragraph(name, ParagraphStyle("seg", parent=h3, textColor=col))]
         line = (f"<b>{st['n']} SKUs</b> &nbsp;|&nbsp; {eur(st['sales'])} sales "
                 f"({st['sales']/total_sales*100:.0f}% of total) &nbsp;|&nbsp; "
                 f"{eur(st['cm3'])} CM3 &nbsp;|&nbsp; <b>{pct(st['cm3pct'])}</b> blended margin")
-        E.append(Paragraph(line, body))
-        E.append(Paragraph(f"<i>{headline}</i>", body))
-        E.append(Paragraph(actions, body))
-        # top 3 example SKUs by sales
-        top3 = st["rows"].sort_values("Product Sales", ascending=False).head(3)
-        if len(top3):
-            ex = "; ".join(f"{str(r['Product'])[:38]} ({eur(r['Product Sales'])}, {pct(r['CM3%'])})"
-                           for _, r in top3.iterrows())
-            E.append(Paragraph(f"Examples: {ex}", small))
-        E.append(Spacer(1, 6))
+        block.append(Paragraph(line, body))
+        block.append(Paragraph(f"<i>{verdict}</i> &nbsp; {prompt}", body))
 
-    E.append(PageBreak())
+        # Five most P&L-relevant SKUs (CM3 €), direction per segment.
+        ex = st["rows"].sort_values("CM3", ascending=asc).head(5)
+        if len(ex):
+            data = [["Product", "P&L (CM3 €)", "Sales", "CM3%"]]
+            for _, r in ex.iterrows():
+                data.append([
+                    str(r["Product"])[:46],
+                    eur(r["CM3"]), eur(r["Product Sales"]), pct(r["CM3%"]),
+                ])
+            t = Table(data, colWidths=[8.6 * cm, 2.7 * cm, 2.3 * cm, 1.8 * cm])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), col),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+            ]))
+            block.append(Spacer(1, 3))
+            block.append(t)
+        block.append(Spacer(1, 9))
+        E.append(KeepTogether(block))
 
     # ----- Trend leaderboards -----
-    E.append(Paragraph("Margin trend — biggest movers", h2))
-    E.append(Paragraph(
-        "CM3% change from March to May per SKU (all-country, sales-weighted linear fit), limited to "
-        "SKUs with at least €10,000 of net sales over the window so the list is material.", body))
-    E.append(Image(str(p_png), width=15.5 * cm, height=6.9 * cm))
+    E.append(Spacer(1, 4))
+    E.append(KeepTogether([
+        Paragraph("Margin trend — biggest movers", h2),
+        Paragraph(
+            "CM3% change from March to May per SKU (all-country, sales-weighted linear fit), "
+            "limited to SKUs with at least €10,000 of net sales over the window so the list is "
+            "material.", body),
+        Image(str(p_png), width=15.5 * cm, height=6.9 * cm),
+    ]))
     E.append(Spacer(1, 6))
 
     def trend_table(rows, ascending, color):
@@ -314,11 +344,15 @@ def build():
         ]))
         return t
 
-    E.append(Paragraph("Top 10 improving", ParagraphStyle("g", parent=h3, textColor=GREEN)))
-    E.append(trend_table(trends, ascending=False, color=GREEN))
+    E.append(KeepTogether([
+        Paragraph("Top 10 improving", ParagraphStyle("g", parent=h3, textColor=GREEN)),
+        trend_table(trends, ascending=False, color=GREEN),
+    ]))
     E.append(Spacer(1, 10))
-    E.append(Paragraph("Bottom 10 declining", ParagraphStyle("r", parent=h3, textColor=RED)))
-    E.append(trend_table(trends, ascending=True, color=RED))
+    E.append(KeepTogether([
+        Paragraph("Bottom 10 declining", ParagraphStyle("r", parent=h3, textColor=RED)),
+        trend_table(trends, ascending=True, color=RED),
+    ]))
 
     E.append(Spacer(1, 8))
     E.append(Paragraph(
