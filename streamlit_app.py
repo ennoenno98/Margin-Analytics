@@ -564,13 +564,13 @@ with st.container(border=True):
 
     # Revenue slicer — gate on each SKU's trailing-30-day sales across ALL
     # countries, so the threshold is a stable "product size" cut regardless of
-    # the marketplace / period currently selected. Default €5k.
+    # the marketplace / period currently selected. Default €2.5k.
     sku_monthly_rev = monthly_sales_all_countries(df)
     rev_max = float(sku_monthly_rev.max()) if len(sku_monthly_rev) else 0.0
     r1, r2 = st.columns([1, 3])
     min_monthly_sales = r1.number_input(
         "Min monthly sales (€, all countries)",
-        min_value=0, value=5000, step=500,
+        min_value=0, value=2500, step=500,
         help="Hide SKUs whose combined sales across all marketplaces over the "
              "last 30 days are below this. Set to 0 to show everything.",
     )
