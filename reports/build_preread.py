@@ -31,18 +31,78 @@ from reportlab.platypus import (  # noqa: E402
     KeepTogether,
 )
 
-# ─── Palette ──────────────────────────────────────────────────────────
-NAVY = colors.HexColor("#1F3864")
-GREEN = colors.HexColor("#1B7A3D")
-RED = colors.HexColor("#C62828")
+# ─── Vegavero corporate palette ───────────────────────────────────────
+NAVY = colors.HexColor("#205F2A")   # brand green (primary chrome / headers)
+GREEN = colors.HexColor("#2E7D32")  # semantic "improving"
+RED = colors.HexColor("#C62828")    # semantic "declining"
+CORAL = colors.HexColor("#F5758D")  # brand coral accent
 AMBER = colors.HexColor("#B26A00")
-LIGHT = colors.HexColor("#F2F4F8")
-GREY = colors.HexColor("#666666")
+LIGHT = colors.HexColor("#EBF3D1")  # brand light-green (tiles / alt rows)
+CREAM = colors.HexColor("#FFFBF2")  # brand background
+INK = colors.HexColor("#2A2A2A")    # body text on cream
+GREY = colors.HexColor("#6B6B6B")
+
+ASSETS = REPO / "reports" / "assets"
+LOGO = ASSETS / "vegavero_logo.png"
+BLOB = ASSETS / "blob_light.png"
 OUT = REPO / "reports" / "Margin_Review_Mar-May_2026.pdf"
 CHART_DIR = REPO / "reports" / "_charts"
 CHART_DIR.mkdir(parents=True, exist_ok=True)
 
+# Chart styling to match the brand
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",  # Calibri not available on the build box
+    "axes.edgecolor": "#205F2A",
+    "axes.labelcolor": "#2A2A2A",
+    "text.color": "#2A2A2A",
+    "xtick.color": "#2A2A2A",
+    "ytick.color": "#2A2A2A",
+    "figure.facecolor": "#FFFBF2",
+    "axes.facecolor": "#FFFBF2",
+    "savefig.facecolor": "#FFFBF2",
+})
+
 WINDOW_LABEL = "March – May 2026"
+
+
+def _page_bg(canvas, doc, title=False):
+    """Cream background + Vegavero logo on every page; blob accent on title."""
+    canvas.saveState()
+    w, h = A4
+    canvas.setFillColor(CREAM)
+    canvas.rect(0, 0, w, h, stroke=0, fill=1)
+    if title:
+        # Light-green organic blob, top-right, behind the title block.
+        try:
+            canvas.drawImage(str(BLOB), w - 9.5 * cm, h - 7.5 * cm,
+                             width=10.5 * cm, height=6 * cm, mask="auto",
+                             preserveAspectRatio=True, anchor="ne")
+        except Exception:
+            pass
+    # Logo top-left
+    try:
+        canvas.drawImage(str(LOGO), 1.6 * cm, h - 1.7 * cm,
+                         width=3.2 * cm, height=1.18 * cm, mask="auto",
+                         preserveAspectRatio=True, anchor="nw")
+    except Exception:
+        pass
+    # Footer
+    canvas.setFont("Helvetica", 7)
+    canvas.setFillColor(GREY)
+    canvas.drawString(1.6 * cm, 0.9 * cm, "Vegavero · Margin Review")
+    canvas.drawRightString(w - 1.6 * cm, 0.9 * cm, f"{WINDOW_LABEL}  ·  p.{doc.page}")
+    canvas.setStrokeColor(LIGHT)
+    canvas.setLineWidth(1)
+    canvas.line(1.6 * cm, 1.2 * cm, w - 1.6 * cm, 1.2 * cm)
+    canvas.restoreState()
+
+
+def _on_first(canvas, doc):
+    _page_bg(canvas, doc, title=True)
+
+
+def _on_later(canvas, doc):
+    _page_bg(canvas, doc, title=False)
 
 
 def eur(x):
@@ -126,7 +186,8 @@ def chart_matrix(tb):
 def chart_portfolio(port):
     fig, ax = plt.subplots(figsize=(7.2, 3.2))
     x = [d.strftime("%b %Y") for d in port["month"]]
-    ax.plot(x, port["CM3%"], marker="o", color="#1F3864", linewidth=2.4, markersize=8)
+    ax.plot(x, port["CM3%"], marker="o", color="#205F2A", linewidth=2.6, markersize=9,
+            markerfacecolor="#205F2A", markeredgecolor="#FFFBF2")
     for xi, yi in zip(x, port["CM3%"]):
         ax.annotate(f"{yi:.1f}%", (xi, yi), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=10, fontweight="bold")
     ax.axhline(19.7, ls=":", color="#C62828", lw=1.4)
@@ -158,25 +219,40 @@ def build():
     p_png = chart_portfolio(port)
 
     styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=styles["Title"], textColor=NAVY, fontSize=22, spaceAfter=4)
-    sub = ParagraphStyle("sub", parent=styles["Normal"], textColor=GREY, fontSize=10.5, spaceAfter=2)
+    h1 = ParagraphStyle("h1", parent=styles["Title"], textColor=NAVY, fontSize=26,
+                        spaceAfter=4, alignment=0, spaceBefore=18)
+    sub = ParagraphStyle("sub", parent=styles["Normal"], textColor=GREY, fontSize=10.5,
+                         spaceAfter=2, alignment=0)
+    tag = ParagraphStyle("tag", parent=styles["Normal"], textColor=colors.white,
+                         fontSize=8.5, alignment=0, spaceAfter=2)
     h2 = ParagraphStyle("h2", parent=styles["Heading2"], textColor=NAVY, fontSize=14, spaceBefore=12, spaceAfter=6)
     h3 = ParagraphStyle("h3", parent=styles["Heading3"], textColor=NAVY, fontSize=11.5, spaceBefore=8, spaceAfter=3)
-    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=10, leading=14, spaceAfter=4)
+    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=10, leading=14,
+                          spaceAfter=4, textColor=INK)
     small = ParagraphStyle("small", parent=styles["Normal"], fontSize=8.5, leading=11, textColor=GREY)
     bullet = ParagraphStyle("bullet", parent=body, leftIndent=12, bulletIndent=2)
 
+    # Extra top margin on every page so content clears the logo band.
     doc = SimpleDocTemplate(str(OUT), pagesize=A4,
                             leftMargin=1.6 * cm, rightMargin=1.6 * cm,
-                            topMargin=1.5 * cm, bottomMargin=1.4 * cm,
+                            topMargin=2.3 * cm, bottomMargin=1.6 * cm,
                             title="Margin Review — March to May 2026")
     E = []
 
-    # ----- Title + exec summary -----
+    # ----- Title + exec summary (headline left, brand blob right) -----
+    tagtab = Table([[Paragraph("MARGIN REVIEW", tag)]], colWidths=[3.6 * cm])
+    tagtab.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), CORAL),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("ROUNDEDCORNERS", [4, 4, 4, 4]),
+    ]))
+    E.append(tagtab)
+    E.append(Spacer(1, 6))
     E.append(Paragraph("Margin Review", h1))
     E.append(Paragraph(f"{WINDOW_LABEL} &nbsp;·&nbsp; all marketplaces &nbsp;·&nbsp; "
                        f"prepared for Product, Procurement &amp; Marketing", sub))
-    E.append(Spacer(1, 10))
+    E.append(Spacer(1, 12))
 
     kpi = [["Net sales", "Contribution Margin 3", "Blended CM3%", "Active SKUs"],
            [eur(total_sales), eur(total_cm3), pct(blended), f"{len(agg):,}"]]
@@ -360,7 +436,7 @@ def build():
         "margin after product, fulfilment and ad costs. Segments use within-period terciles; trend "
         "is a sales-weighted fit of monthly CM3%. Sub-€10k SKUs excluded from leaderboards.", small))
 
-    doc.build(E)
+    doc.build(E, onFirstPage=_on_first, onLaterPages=_on_later)
     print(f"Wrote {OUT}  ({OUT.stat().st_size/1024:.0f} KB)")
 
 
