@@ -393,7 +393,8 @@ def margin_trend(raw: pd.DataFrame, freq: str,
     long = _cm3_pct_by_bucket(raw, freq)
     if long.empty:
         return pd.DataFrame(
-            columns=["SKU", "Trend", "Slope", "Change", "Start CM3%", "End CM3%", "Points"]
+            columns=["SKU", "Trend", "Slope", "Change",
+                     "Start CM3%", "End CM3%", "Start period", "End period", "Points"]
         )
 
     rows = []
@@ -420,6 +421,7 @@ def margin_trend(raw: pd.DataFrame, freq: str,
             trend = "Declining"
         else:
             trend = "Neutral"
+        buckets = g["bucket"].tolist()
         rows.append({
             "SKU": sku,
             "Trend": trend,
@@ -427,6 +429,8 @@ def margin_trend(raw: pd.DataFrame, freq: str,
             "Change": change,
             "Start CM3%": y[0],
             "End CM3%": y[-1],
+            "Start period": buckets[0],
+            "End period": buckets[-1],
             "Points": n,
         })
     return pd.DataFrame(rows)
@@ -1388,6 +1392,19 @@ with tab_trend:
                 if col in enrich.columns:
                     trends[col] = trends["SKU"].map(enrich[col])
 
+            # Label the start/end bucket per SKU according to the chosen unit.
+            def _fmt_bucket(ts):
+                if pd.isna(ts):
+                    return "—"
+                ts = pd.Timestamp(ts)
+                if trend_freq == "M":
+                    return ts.strftime("%b %Y")
+                if trend_freq == "Q":
+                    return f"Q{ts.quarter} {ts.year}"
+                return str(ts.year)
+            trends["From"] = trends["Start period"].map(_fmt_bucket)
+            trends["To"] = trends["End period"].map(_fmt_bucket)
+
             trend_order = {
                 "📈 Rising margins": ("Rising", False),
                 "📉 Declining margins": ("Declining", True),
@@ -1403,7 +1420,7 @@ with tab_trend:
                     sub = sub.sort_values("Change", ascending=asc)
                 show_cols = [c for c in [
                     "SKU", "Product", "Cluster", "Product Sales",
-                    "Start CM3%", "End CM3%", "Change", "Points",
+                    "From", "Start CM3%", "To", "End CM3%", "Change", "Points",
                 ] if c in sub.columns]
                 with st.expander(f"{label} ({len(sub):,})", expanded=(key != "Neutral")):
                     st.dataframe(
@@ -1415,6 +1432,12 @@ with tab_trend:
                             "Points": "{:.0f}",
                         }, na_rep="—"),
                         use_container_width=True, hide_index=True,
+                        column_config={
+                            "From": st.column_config.TextColumn(
+                                "From", help="First " + freq_label + " with data for this SKU"),
+                            "To": st.column_config.TextColumn(
+                                "To", help="Last " + freq_label + " with data for this SKU"),
+                        },
                     )
                     st.download_button(
                         f"Download {key} SKUs (CSV)",
@@ -1425,7 +1448,11 @@ with tab_trend:
                     )
 
             st.caption(
-                f"Trend = linear fit of CM3% across the selected {freq_label}s; "
+                f"Trend = linear fit of CM3% across the {freq_label}s; "
                 f"'Change' is the predicted first→last difference in percentage "
-                f"points. SKUs with fewer than two {freq_label}s of data are omitted."
+                f"points. **Start CM3% is measured in the 'From' {freq_label} and "
+                f"End CM3% in the 'To' {freq_label}** (each SKU's first/last "
+                f"{freq_label} with data — these can differ between SKUs if a "
+                f"product only sold for part of the history). SKUs with fewer "
+                f"than two {freq_label}s of data are omitted."
             )
