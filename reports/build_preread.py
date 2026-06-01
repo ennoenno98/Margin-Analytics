@@ -139,8 +139,9 @@ def compute():
     # Margin trend, monthly, all-country, materiality floor €10k over window
     trends = margin_trend(win, "M", threshold_pp=2.0)
     enr = agg.set_index("SKU")
-    for c in ["Product", "Product Sales", "CM3", "CM3%"]:
-        trends[c] = trends["SKU"].map(enr[c])
+    for c in ["Product", "Product Sales", "CM1%", "CM2%", "CM3", "CM3%"]:
+        if c in enr.columns:
+            trends[c] = trends["SKU"].map(enr[c])
     trends = trends[(trends["Points"] >= 2) & (trends["Product Sales"] >= 10000)].copy()
 
     cm3_cuts = np.round(np.nanpercentile(tb["CM3%"].astype(float), [33.33, 66.67]), 1)
@@ -395,29 +396,33 @@ def build():
     E.append(KeepTogether([
         Paragraph("Margin trend — biggest movers", h2),
         Paragraph(
-            "CM3% change from March to May per SKU (all-country, sales-weighted linear fit), "
-            "limited to SKUs with at least €10,000 of net sales over the window so the list is "
-            "material.", body),
+            "Ranked by CM3% change from March to May per SKU (all-country, sales-weighted linear "
+            "fit), limited to SKUs with at least €10,000 of net sales over the window. CM1% and "
+            "CM2% are the period-blended levels for context — comparing them with the CM3 "
+            "trajectory shows whether a move came from COGS (CM1) or from fulfilment / ad cost "
+            "downstream.", body),
         Image(str(p_png), width=15.5 * cm, height=6.9 * cm),
     ]))
     E.append(Spacer(1, 6))
 
     def trend_table(rows, ascending, color):
         rows = rows.sort_values("Change", ascending=ascending).head(10)
-        data = [["Product", "Sales", "Mar CM3", "May CM3", "Δ pp"]]
+        data = [["Product", "Sales", "CM1%", "CM2%", "Mar CM3", "May CM3", "Δ CM3"]]
         for _, r in rows.iterrows():
             data.append([
-                str(r["Product"])[:42],
+                str(r["Product"])[:38],
                 eur(r["Product Sales"]),
+                pct(r.get("CM1%")), pct(r.get("CM2%")),
                 pct(r["Start CM3%"]),
                 pct(r["End CM3%"]),
                 f"{r['Change']:+.1f}",
             ])
-        t = Table(data, colWidths=[8.2 * cm, 2.3 * cm, 2.0 * cm, 2.0 * cm, 1.8 * cm])
+        t = Table(data, colWidths=[6.0 * cm, 2.1 * cm, 1.4 * cm, 1.4 * cm,
+                                   1.6 * cm, 1.6 * cm, 1.4 * cm])
         t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), color),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
