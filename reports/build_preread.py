@@ -1,0 +1,334 @@
+"""Build the March–May 2026 margin-review preread PDF (all-country level).
+
+Reusable: pulls the latest margin export, recomputes the four focus segments
+and the margin-trend leaderboards, renders charts, and writes a multi-page PDF.
+
+    python reports/build_preread.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+from streamlit_app import (  # noqa: E402
+    load_data, latest_export, aggregate_periods, tier_1_to_3, margin_trend,
+)
+
+from reportlab.lib import colors  # noqa: E402
+from reportlab.lib.pagesizes import A4  # noqa: E402
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle  # noqa: E402
+from reportlab.lib.units import cm  # noqa: E402
+from reportlab.platypus import (  # noqa: E402
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak,
+)
+
+# ─── Palette ──────────────────────────────────────────────────────────
+NAVY = colors.HexColor("#1F3864")
+GREEN = colors.HexColor("#1B7A3D")
+RED = colors.HexColor("#C62828")
+AMBER = colors.HexColor("#B26A00")
+LIGHT = colors.HexColor("#F2F4F8")
+GREY = colors.HexColor("#666666")
+OUT = REPO / "reports" / "Margin_Review_Mar-May_2026.pdf"
+CHART_DIR = REPO / "reports" / "_charts"
+CHART_DIR.mkdir(parents=True, exist_ok=True)
+
+WINDOW_LABEL = "March – May 2026"
+
+
+def eur(x):
+    return f"€{x:,.0f}" if pd.notna(x) else "—"
+
+
+def pct(x):
+    return f"{x:.1f}%" if pd.notna(x) else "—"
+
+
+# ─── Compute ──────────────────────────────────────────────────────────
+def compute():
+    df = load_data(latest_export(REPO / "novadata_exports"))
+    start = pd.Timestamp("2026-03-01", tz="UTC")
+    end = pd.Timestamp("2026-05-31", tz="UTC")
+    win = df[(df["Period"] >= start) & (df["Period"] <= end)].copy()
+
+    agg = aggregate_periods(win)
+    agg = agg[agg["Product Sales"] > 0].copy()
+
+    tb = agg.dropna(subset=["CM3%", "Product Sales"]).copy()
+    tb["MT"] = tier_1_to_3(tb["CM3%"])
+    tb["VT"] = tier_1_to_3(tb["Product Sales"])
+    tb["C"] = tb["MT"].astype("string") + "-" + tb["VT"].astype("string")
+
+    # Monthly portfolio CM3% (all-country)
+    w = win.dropna(subset=["Period"]).copy()
+    w["month"] = w["Period"].dt.to_period("M").dt.to_timestamp()
+    w["CM3"] = pd.to_numeric(w["CM3"], errors="coerce")
+    w["Product Sales"] = pd.to_numeric(w["Product Sales"], errors="coerce")
+    port = w.groupby("month", as_index=False).agg(cm3=("CM3", "sum"), sales=("Product Sales", "sum"))
+    port["CM3%"] = port["cm3"] / port["sales"] * 100
+
+    # Margin trend, monthly, all-country, materiality floor €10k over window
+    trends = margin_trend(win, "M", threshold_pp=2.0)
+    enr = agg.set_index("SKU")
+    for c in ["Product", "Product Sales", "CM3", "CM3%"]:
+        trends[c] = trends["SKU"].map(enr[c])
+    trends = trends[(trends["Points"] >= 2) & (trends["Product Sales"] >= 10000)].copy()
+
+    cm3_cuts = np.round(np.nanpercentile(tb["CM3%"].astype(float), [33.33, 66.67]), 1)
+    sales_cuts = np.round(np.nanpercentile(tb["Product Sales"].astype(float), [33.33, 66.67]), 0)
+
+    return dict(agg=agg, tb=tb, port=port, trends=trends,
+                cm3_cuts=cm3_cuts, sales_cuts=sales_cuts)
+
+
+def cluster_stats(tb, code):
+    s = tb[tb["C"] == code]
+    sales = s["Product Sales"].sum()
+    cm3 = s["CM3"].sum()
+    return dict(n=len(s), sales=sales, cm3=cm3,
+                cm3pct=(cm3 / sales * 100 if sales else np.nan), rows=s)
+
+
+# ─── Charts ───────────────────────────────────────────────────────────
+def chart_matrix(tb):
+    margins = {1: "High margin", 2: "Mid margin", 3: "Low margin"}
+    vols = {1: "High sales", 2: "Mid sales", 3: "Low sales"}
+    sales_grid = np.zeros((3, 3)); cm3_grid = np.full((3, 3), np.nan); n_grid = np.zeros((3, 3))
+    for mi, m in enumerate([1, 2, 3]):
+        for vi, v in enumerate([1, 2, 3]):
+            st = cluster_stats(tb, f"{m}-{v}")
+            sales_grid[mi, vi] = st["sales"]; cm3_grid[mi, vi] = st["cm3pct"]; n_grid[mi, vi] = st["n"]
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    im = ax.imshow(cm3_grid, cmap="RdYlGn", vmin=-15, vmax=30, aspect="auto")
+    ax.set_xticks(range(3)); ax.set_xticklabels([vols[v] for v in [1, 2, 3]])
+    ax.set_yticks(range(3)); ax.set_yticklabels([margins[m] for m in [1, 2, 3]])
+    for mi in range(3):
+        for vi in range(3):
+            ax.text(vi, mi - 0.16, f"{int(n_grid[mi,vi])} SKUs", ha="center", va="center", fontsize=9, color="#111")
+            ax.text(vi, mi + 0.06, f"€{sales_grid[mi,vi]/1000:,.0f}k", ha="center", va="center", fontsize=11, fontweight="bold", color="#111")
+            ax.text(vi, mi + 0.28, f"{cm3_grid[mi,vi]:.1f}% CM3", ha="center", va="center", fontsize=9, color="#222")
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cb.set_label("Blended CM3%")
+    ax.set_title("Margin × Sales matrix — sales and blended CM3% per segment", fontsize=11, fontweight="bold", pad=10)
+    fig.tight_layout()
+    p = CHART_DIR / "matrix.png"; fig.savefig(p, dpi=150); plt.close(fig)
+    return p
+
+
+def chart_portfolio(port):
+    fig, ax = plt.subplots(figsize=(7.2, 3.2))
+    x = [d.strftime("%b %Y") for d in port["month"]]
+    ax.plot(x, port["CM3%"], marker="o", color="#1F3864", linewidth=2.4, markersize=8)
+    for xi, yi in zip(x, port["CM3%"]):
+        ax.annotate(f"{yi:.1f}%", (xi, yi), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=10, fontweight="bold")
+    ax.axhline(19.7, ls=":", color="#C62828", lw=1.4)
+    ax.text(len(x) - 1, 19.7, " Target 19.7%", color="#C62828", va="bottom", ha="right", fontsize=8)
+    ax.set_ylabel("Portfolio CM3%"); ax.grid(axis="y", alpha=0.3)
+    ax.set_title("Blended portfolio CM3% by month (all countries)", fontsize=11, fontweight="bold")
+    fig.tight_layout()
+    p = CHART_DIR / "portfolio.png"; fig.savefig(p, dpi=150); plt.close(fig)
+    return p
+
+
+# ─── PDF ──────────────────────────────────────────────────────────────
+def build():
+    d = compute()
+    tb, agg, port, trends = d["tb"], d["agg"], d["port"], d["trends"]
+
+    total_sales = agg["Product Sales"].sum()
+    total_cm3 = agg["CM3"].sum()
+    blended = total_cm3 / total_sales * 100
+
+    focus = {
+        "Low margin · High sales": cluster_stats(tb, "3-1"),
+        "Low margin · Medium sales": cluster_stats(tb, "3-2"),
+        "High margin · Low sales": cluster_stats(tb, "1-3"),
+        "High margin · High sales": cluster_stats(tb, "1-1"),
+    }
+
+    m_png = chart_matrix(tb)
+    p_png = chart_portfolio(port)
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=styles["Title"], textColor=NAVY, fontSize=22, spaceAfter=4)
+    sub = ParagraphStyle("sub", parent=styles["Normal"], textColor=GREY, fontSize=10.5, spaceAfter=2)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], textColor=NAVY, fontSize=14, spaceBefore=12, spaceAfter=6)
+    h3 = ParagraphStyle("h3", parent=styles["Heading3"], textColor=NAVY, fontSize=11.5, spaceBefore=8, spaceAfter=3)
+    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=10, leading=14, spaceAfter=4)
+    small = ParagraphStyle("small", parent=styles["Normal"], fontSize=8.5, leading=11, textColor=GREY)
+    bullet = ParagraphStyle("bullet", parent=body, leftIndent=12, bulletIndent=2)
+
+    doc = SimpleDocTemplate(str(OUT), pagesize=A4,
+                            leftMargin=1.6 * cm, rightMargin=1.6 * cm,
+                            topMargin=1.5 * cm, bottomMargin=1.4 * cm,
+                            title="Margin Review — March to May 2026")
+    E = []
+
+    # ----- Title + exec summary -----
+    E.append(Paragraph("Margin Review", h1))
+    E.append(Paragraph(f"{WINDOW_LABEL} &nbsp;·&nbsp; all marketplaces &nbsp;·&nbsp; "
+                       f"prepared for Product, Procurement &amp; Marketing", sub))
+    E.append(Spacer(1, 10))
+
+    kpi = [["Net sales", "Contribution Margin 3", "Blended CM3%", "Active SKUs"],
+           [eur(total_sales), eur(total_cm3), pct(blended), f"{len(agg):,}"]]
+    t = Table(kpi, colWidths=[4.3 * cm] * 4)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, 0), 8.5),
+        ("FONTSIZE", (0, 1), (-1, 1), 15),
+        ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (0, 1), (-1, 1), NAVY),
+        ("BACKGROUND", (0, 1), (-1, 1), LIGHT),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), 2, colors.white),
+    ]))
+    E.append(t)
+    E.append(Spacer(1, 12))
+
+    E.append(Paragraph("Why we're meeting", h2))
+    E.append(Paragraph(
+        f"Over {WINDOW_LABEL} the catalogue generated <b>{eur(total_sales)}</b> in net sales at a "
+        f"<b>blended CM3 of {pct(blended)}</b> — well below the {pct(19.7)} target. The headline gap "
+        f"is concentrated, not spread evenly: a small group of high-revenue, low-margin SKUs is "
+        f"diluting the whole portfolio, while a healthy high-margin core is being under-scaled. "
+        f"This preread frames four product segments and the biggest month-over-month margin movers "
+        f"so Product, Procurement and Marketing can align on where to act first.", body))
+
+    low_high = focus["Low margin · High sales"]
+    high_high = focus["High margin · High sales"]
+    high_low = focus["High margin · Low sales"]
+    E.append(Paragraph("Headline takeaways", h3))
+    for b in [
+        f"<b>The margin drag is concentrated.</b> {low_high['n']} 'low-margin / high-sales' SKUs "
+        f"turn over {eur(low_high['sales'])} ({low_high['sales']/total_sales*100:.0f}% of sales) at "
+        f"just {pct(low_high['cm3pct'])} CM3 — they earn {eur(low_high['cm3'])} of contribution. "
+        f"Fixing these is the single largest lever.",
+        f"<b>The profitable core is solid but small.</b> {high_high['n']} 'high-margin / high-sales' "
+        f"SKUs deliver {eur(high_high['cm3'])} of CM3 at {pct(high_high['cm3pct'])} — protect price and "
+        f"availability here at all costs.",
+        f"<b>There is untapped upside.</b> {high_low['n']} 'high-margin / low-sales' SKUs already run "
+        f"at {pct(high_low['cm3pct'])} CM3 but only {eur(high_low['sales'])} of sales — a marketing / "
+        f"merchandising scale opportunity with no margin risk.",
+        f"<b>Margins are trending down portfolio-wide.</b> Blended CM3 fell from "
+        f"{pct(port['CM3%'].iloc[0])} in {port['month'].iloc[0].strftime('%b')} to "
+        f"{pct(port['CM3%'].iloc[-1])} in {port['month'].iloc[-1].strftime('%b')}; the bottom-10 "
+        f"decliners (p.4) explain most of the slide.",
+    ]:
+        E.append(Paragraph(b, bullet, bulletText="•"))
+
+    E.append(PageBreak())
+
+    # ----- Matrix page -----
+    E.append(Paragraph("Margin × Sales matrix", h2))
+    E.append(Paragraph(
+        "Every SKU is placed in a 3×3 grid: thirds by all-country CM3% (margin) and thirds by "
+        "all-country net sales (volume). Cells show SKU count, total sales and the segment's "
+        "blended CM3%.", body))
+    E.append(Image(str(m_png), width=16.5 * cm, height=10.5 * cm))
+    E.append(Spacer(1, 6))
+    E.append(Paragraph(
+        f"Tier cut-offs (terciles): margin at {d['cm3_cuts'][0]:.1f}% and {d['cm3_cuts'][1]:.1f}% CM3; "
+        f"sales at {eur(d['sales_cuts'][0])} and {eur(d['sales_cuts'][1])} over the three months.", small))
+    E.append(PageBreak())
+
+    # ----- Four focus segments -----
+    E.append(Paragraph("The four segments to discuss", h2))
+
+    seg_meta = {
+        "Low margin · High sales": (RED,
+            "Biggest lever. High volume is actively destroying or barely making margin.",
+            "<b>Procurement:</b> renegotiate COGS / MOQs on these specific SKUs. "
+            "<b>Product:</b> review pack size, bundle, or BOM cost. "
+            "<b>Marketing:</b> cut ad spend / discount depth here — we're buying unprofitable volume."),
+        "Low margin · Medium sales": (AMBER,
+            "Watch list. Mid volume, weak margin — fix or de-prioritise before they grow.",
+            "<b>Procurement:</b> include in the next cost review wave. "
+            "<b>Marketing:</b> stop promoting until margin is repaired."),
+        "High margin · Low sales": (GREEN,
+            "Scale opportunity. Great margin, under-exposed — grow with low risk.",
+            "<b>Marketing:</b> prioritise for ads, content and merchandising. "
+            "<b>Product:</b> check availability / listing quality isn't the bottleneck."),
+        "High margin · High sales": (NAVY,
+            "Protect. The profit engine of the catalogue.",
+            "<b>All:</b> defend price, buy-box and stock. "
+            "<b>Procurement:</b> secure supply continuity; avoid stock-outs."),
+    }
+    for name, st in focus.items():
+        col, headline, actions = seg_meta[name]
+        E.append(Paragraph(name, ParagraphStyle("seg", parent=h3, textColor=col)))
+        line = (f"<b>{st['n']} SKUs</b> &nbsp;|&nbsp; {eur(st['sales'])} sales "
+                f"({st['sales']/total_sales*100:.0f}% of total) &nbsp;|&nbsp; "
+                f"{eur(st['cm3'])} CM3 &nbsp;|&nbsp; <b>{pct(st['cm3pct'])}</b> blended margin")
+        E.append(Paragraph(line, body))
+        E.append(Paragraph(f"<i>{headline}</i>", body))
+        E.append(Paragraph(actions, body))
+        # top 3 example SKUs by sales
+        top3 = st["rows"].sort_values("Product Sales", ascending=False).head(3)
+        if len(top3):
+            ex = "; ".join(f"{str(r['Product'])[:38]} ({eur(r['Product Sales'])}, {pct(r['CM3%'])})"
+                           for _, r in top3.iterrows())
+            E.append(Paragraph(f"Examples: {ex}", small))
+        E.append(Spacer(1, 6))
+
+    E.append(PageBreak())
+
+    # ----- Trend leaderboards -----
+    E.append(Paragraph("Margin trend — biggest movers", h2))
+    E.append(Paragraph(
+        "CM3% change from March to May per SKU (all-country, sales-weighted linear fit), limited to "
+        "SKUs with at least €10,000 of net sales over the window so the list is material.", body))
+    E.append(Image(str(p_png), width=15.5 * cm, height=6.9 * cm))
+    E.append(Spacer(1, 6))
+
+    def trend_table(rows, ascending, color):
+        rows = rows.sort_values("Change", ascending=ascending).head(10)
+        data = [["Product", "Sales", "Mar CM3", "May CM3", "Δ pp"]]
+        for _, r in rows.iterrows():
+            data.append([
+                str(r["Product"])[:42],
+                eur(r["Product Sales"]),
+                pct(r["Start CM3%"]),
+                pct(r["End CM3%"]),
+                f"{r['Change']:+.1f}",
+            ])
+        t = Table(data, colWidths=[8.2 * cm, 2.3 * cm, 2.0 * cm, 2.0 * cm, 1.8 * cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), color),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.white),
+        ]))
+        return t
+
+    E.append(Paragraph("Top 10 improving", ParagraphStyle("g", parent=h3, textColor=GREEN)))
+    E.append(trend_table(trends, ascending=False, color=GREEN))
+    E.append(Spacer(1, 10))
+    E.append(Paragraph("Bottom 10 declining", ParagraphStyle("r", parent=h3, textColor=RED)))
+    E.append(trend_table(trends, ascending=True, color=RED))
+
+    E.append(Spacer(1, 8))
+    E.append(Paragraph(
+        "Method &amp; scope: Novadata daily margin export, all marketplaces. CM3 = contribution "
+        "margin after product, fulfilment and ad costs. Segments use within-period terciles; trend "
+        "is a sales-weighted fit of monthly CM3%. Sub-€10k SKUs excluded from leaderboards.", small))
+
+    doc.build(E)
+    print(f"Wrote {OUT}  ({OUT.stat().st_size/1024:.0f} KB)")
+
+
+if __name__ == "__main__":
+    build()
