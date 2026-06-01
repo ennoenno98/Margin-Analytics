@@ -153,9 +153,12 @@ def compute():
 def cluster_stats(tb, code):
     s = tb[tb["C"] == code]
     sales = s["Product Sales"].sum()
+    cm1 = s["CM1"].sum() if "CM1" in s.columns else np.nan
+    cm2 = s["CM2"].sum() if "CM2" in s.columns else np.nan
     cm3 = s["CM3"].sum()
-    return dict(n=len(s), sales=sales, cm3=cm3,
-                cm3pct=(cm3 / sales * 100 if sales else np.nan), rows=s)
+    pc = (lambda v: v / sales * 100 if sales else np.nan)
+    return dict(n=len(s), sales=sales, cm1=cm1, cm2=cm2, cm3=cm3,
+                cm1pct=pc(cm1), cm2pct=pc(cm2), cm3pct=pc(cm3), rows=s)
 
 
 # ─── Charts ───────────────────────────────────────────────────────────
@@ -356,20 +359,23 @@ def build():
         block = [Paragraph(name, ParagraphStyle("seg", parent=h3, textColor=col))]
         line = (f"<b>{st['n']} SKUs</b> &nbsp;|&nbsp; {eur(st['sales'])} sales "
                 f"({st['sales']/total_sales*100:.0f}% of total) &nbsp;|&nbsp; "
-                f"{eur(st['cm3'])} CM3 &nbsp;|&nbsp; <b>{pct(st['cm3pct'])}</b> blended margin")
+                f"blended margin <b>CM1 {pct(st['cm1pct'])} &nbsp;›&nbsp; "
+                f"CM2 {pct(st['cm2pct'])} &nbsp;›&nbsp; CM3 {pct(st['cm3pct'])}</b>")
         block.append(Paragraph(line, body))
         block.append(Paragraph(f"<i>{verdict}</i> &nbsp; {prompt}", body))
 
         # Five most P&L-relevant SKUs (CM3 €), direction per segment.
         ex = st["rows"].sort_values("CM3", ascending=asc).head(5)
         if len(ex):
-            data = [["Product", "P&L (CM3 €)", "Sales", "CM3%"]]
+            data = [["Product", "P&L (CM3 €)", "Sales", "CM1%", "CM2%", "CM3%"]]
             for _, r in ex.iterrows():
                 data.append([
-                    str(r["Product"])[:46],
-                    eur(r["CM3"]), eur(r["Product Sales"]), pct(r["CM3%"]),
+                    str(r["Product"])[:42],
+                    eur(r["CM3"]), eur(r["Product Sales"]),
+                    pct(r.get("CM1%")), pct(r.get("CM2%")), pct(r["CM3%"]),
                 ])
-            t = Table(data, colWidths=[8.6 * cm, 2.7 * cm, 2.3 * cm, 1.8 * cm])
+            t = Table(data, colWidths=[6.6 * cm, 2.4 * cm, 2.2 * cm,
+                                       1.5 * cm, 1.5 * cm, 1.5 * cm])
             t.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), col),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
