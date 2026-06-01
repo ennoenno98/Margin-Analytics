@@ -1289,9 +1289,10 @@ with tab_trend:
     trend_freq = {"Month": "M", "Quarter": "Q", "Year": "Y"}[trend_unit]
     freq_label = trend_unit.lower()
 
-    # Full marketplace history, re-applying the SKU / top-seller filters.
-    # (mp_slice is already revenue-gated at the slice level above.)
-    trend_raw = mp_slice.copy()
+    # Honor every top slicer: mp_slice is already marketplace- + revenue-gated,
+    # and we now also restrict to the user's period selection. SKU search +
+    # top-sellers re-applied here for symmetry with the Overview tab.
+    trend_raw = mp_slice[mp_slice["Period"].isin(selected_periods)].copy()
     if sku_query.strip():
         _q = sku_query.strip().lower()
         trend_raw = trend_raw[
@@ -1309,9 +1310,10 @@ with tab_trend:
 
     if trend_raw.empty or _n_buckets < 2:
         st.info(
-            f"Not enough history to build a {freq_label} trend "
-            f"(found {_n_buckets} {freq_label}(s)). Try a finer unit "
-            f"(e.g. Month) or wait for more data to accumulate."
+            f"Not enough data in the current selection to build a {freq_label} "
+            f"trend (found {_n_buckets} {freq_label}(s) of data). Widen the "
+            f"date selection in the top filter bar, or pick a finer unit "
+            f"(e.g. Month)."
         )
     else:
         threshold_pp = s_thresh.number_input(
@@ -1339,9 +1341,12 @@ with tab_trend:
         port_ts["CM3%"] = port_ts["cm3"] / port_ts["sales"].replace(0, pd.NA) * 100
         port_ts = port_ts.sort_values("bucket")
 
+        _span_start = pd.Timestamp(min(selected_periods)).strftime("%b %Y")
+        _span_end = pd.Timestamp(max(selected_periods)).strftime("%b %Y")
+        _span_label = _span_start if _span_start == _span_end else f"{_span_start} – {_span_end}"
         line = px.line(
             port_ts, x="bucket", y="CM3%", markers=True,
-            title=f"Portfolio CM3% by {freq_label} — {marketplace}",
+            title=f"Portfolio CM3% by {freq_label} — {marketplace} · {_span_label}",
         )
         line.update_yaxes(ticksuffix="%")
         line.update_xaxes(title=freq_label.capitalize())
