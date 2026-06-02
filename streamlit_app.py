@@ -125,7 +125,7 @@ def load_products(path: Path) -> pd.DataFrame:
 def load_data(path: Path) -> pd.DataFrame:
     # pd.read_csv handles .gz transparently when the suffix is .csv.gz.
     df = pd.read_csv(path)
-    df["Period"] = pd.to_datetime(df["Period"], errors="coerce")
+    df["Period"] = pd.to_datetime(df["Period"], errors="coerce", utc=True).dt.tz_localize(None)
 
     # Schema variants:
     # - Daily (current): Contribution Margin 1/2/3 (€ absolute), Advertising Costs.
@@ -850,7 +850,7 @@ with tab_overview:
                     lambda row: ["font-weight:600; background:#F2F4F8" if row["Marketplace"] == "Total" else ""] * len(row),
                     axis=1,
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -870,7 +870,7 @@ with tab_overview:
                 yaxis_title="€", height=320, margin=dict(t=40, b=20, l=10, r=10),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
             )
-            st.plotly_chart(country_fig, use_container_width=True)
+            st.plotly_chart(country_fig, width="stretch")
 
     # ----- Cluster matrix (clickable 3x3 button grid) -----
     st.markdown(
@@ -949,7 +949,7 @@ with tab_overview:
                     if st.button(
                         label,
                         key=f"cluster_btn_{code}",
-                        use_container_width=True,
+                        width="stretch",
                         help=cluster_name(code) + (" — active filter" if is_active else ""),
                     ):
                         st.session_state["active_cluster_code"] = None if is_active else code
@@ -1045,7 +1045,7 @@ with tab_overview:
     st.caption(delta_caption + " · " + growth_caption + " · " + inventory_caption)
 
     # --- Unified editable table with conditional cell formatting via AgGrid ---
-    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
     fmt_euro = JsCode("function(p){return p.value==null?'—':'€'+Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
     fmt_int = JsCode("function(p){return p.value==null?'—':Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
@@ -1212,11 +1212,10 @@ with tab_overview:
         table_for_grid,
         gridOptions=grid_options,
         allow_unsafe_jscode=True,
-        update_mode=GridUpdateMode.VALUE_CHANGED,
+        update_on=["cellValueChanged"],
         fit_columns_on_grid_load=False,
         height=640,
         theme="streamlit",
-        reload_data=False,
         key=f"main_grid_{marketplace}_{period}_{granularity}",
     )
 
@@ -1354,7 +1353,7 @@ with tab_trend:
             y=target_cm3, line_dash="dot", line_color="#d32f2f",
             annotation_text=f"Target {target_cm3:.1f}%", annotation_position="top right",
         )
-        st.plotly_chart(line, use_container_width=True)
+        st.plotly_chart(line, width="stretch")
 
         # ----- Per-SKU trend classification -----
         trends = margin_trend(trend_raw, trend_freq, threshold_pp=threshold_pp)
@@ -1391,7 +1390,7 @@ with tab_trend:
                 text="SKUs",
             )
             bar.update_layout(showlegend=False, height=260, margin=dict(t=10, b=10))
-            st.plotly_chart(bar, use_container_width=True)
+            st.plotly_chart(bar, width="stretch")
 
             # ----- Per-category SKU tables -----
             # Enrich with Product + latest sales/CM3 from the aggregated view.
@@ -1439,7 +1438,7 @@ with tab_trend:
                             "Change": "{:+.1f} pp",
                             "Points": "{:.0f}",
                         }, na_rep="—"),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                         column_config={
                             "From": st.column_config.TextColumn(
                                 "From", help="First " + freq_label + " with data for this SKU"),

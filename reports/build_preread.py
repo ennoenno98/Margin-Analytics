@@ -116,8 +116,8 @@ def pct(x):
 # ─── Compute ──────────────────────────────────────────────────────────
 def compute():
     df = load_data(latest_export(REPO / "novadata_exports"))
-    start = pd.Timestamp("2026-03-01", tz="UTC")
-    end = pd.Timestamp("2026-05-31", tz="UTC")
+    start = pd.Timestamp("2026-03-01")
+    end = pd.Timestamp("2026-05-31")
     win = df[(df["Period"] >= start) & (df["Period"] <= end)].copy()
 
     agg = aggregate_periods(win)
