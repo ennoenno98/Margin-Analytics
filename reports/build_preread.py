@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO))
 from streamlit_app import (  # noqa: E402
     load_data, latest_export, aggregate_periods, tier_1_to_3, margin_trend,
     latest_products_export, load_products,
+    load_adjustments, apply_adjustments,
 )
 
 from reportlab.lib import colors  # noqa: E402
@@ -114,6 +115,40 @@ def pct(x):
     return f"{x:.1f}%" if pd.notna(x) else "—"
 
 
+def _spread_adjustments_to_daily(win: pd.DataFrame, adjustments: dict,
+                                  window_start, window_end) -> pd.DataFrame:
+    """Distribute each adjustment's CM deltas evenly across the days of
+    overlap between its range and the report window. Recomputes %CMs."""
+    if not adjustments or win.empty:
+        return win
+    out = win.copy()
+    for sku, entries in adjustments.items():
+        for adj in entries:
+            days = pd.date_range(adj["from"], adj["to"], freq="D").normalize()
+            # Constrain to the report's own window so partial overlap pro-rates.
+            days = days[(days >= window_start) & (days <= window_end)]
+            if len(days) == 0:
+                continue
+            mask = (out["SKU"] == sku) & (out["Period"].isin(days))
+            n_rows = int(mask.sum())
+            if n_rows == 0:
+                continue
+            for col, delta in (adj.get("deltas") or {}).items():
+                if col in out.columns:
+                    out.loc[mask, col] = (
+                        pd.to_numeric(out.loc[mask, col], errors="coerce").fillna(0)
+                        + delta / n_rows
+                    )
+            sales = pd.to_numeric(out.loc[mask, "Product Sales"], errors="coerce").fillna(0)
+            for short in ("CM1", "CM2", "CM3"):
+                if short in out.columns and f"{short}%" in out.columns:
+                    out.loc[mask, f"{short}%"] = (
+                        pd.to_numeric(out.loc[mask, short], errors="coerce")
+                        / sales.replace(0, pd.NA) * 100
+                    )
+    return out
+
+
 # ─── Compute ──────────────────────────────────────────────────────────
 def compute():
     df = load_data(latest_export(REPO / "novadata_exports"))
@@ -121,8 +156,18 @@ def compute():
     end = pd.Timestamp("2026-05-31")
     win = df[(df["Period"] >= start) & (df["Period"] <= end)].copy()
 
+    # Apply manual adjustments to the RAW daily rows so the headline KPI,
+    # cluster matrix, segments, monthly portfolio line and trend leaderboards
+    # all reflect the same adjusted view consistently. The per-SKU delta is
+    # spread evenly across the days where the adjustment's range overlaps the
+    # report's window, recomputing %CMs from the new totals.
+    adjustments = load_adjustments()
+    win = _spread_adjustments_to_daily(win, adjustments, start, end)
+
     agg = aggregate_periods(win)
     agg = agg[agg["Product Sales"] > 0].copy()
+    adj_notes = {sku: entries[0].get("note", "") for sku, entries in adjustments.items()
+                 if sku in set(agg["SKU"])}
 
     tb = agg.dropna(subset=["CM3%", "Product Sales"]).copy()
     tb["MT"] = tier_1_to_3(tb["CM3%"])
@@ -177,6 +222,7 @@ def compute():
         slow = slow.sort_values("dos", ascending=False).reset_index(drop=True)
 
     return dict(agg=agg, tb=tb, port=port, trends=trends, slow=slow,
+                adj_notes=adj_notes,
                 cm3_cuts=cm3_cuts, sales_cuts=sales_cuts)
 
 
@@ -236,6 +282,7 @@ def chart_portfolio(port):
 def build():
     d = compute()
     tb, agg, port, trends = d["tb"], d["agg"], d["port"], d["trends"]
+    adj_notes = d.get("adj_notes", {})
 
     total_sales = agg["Product Sales"].sum()
     total_cm3 = agg["CM3"].sum()
@@ -285,6 +332,12 @@ def build():
     E.append(Paragraph("Margin Review", h1))
     E.append(Paragraph(f"{WINDOW_LABEL} &nbsp;·&nbsp; all marketplaces &nbsp;·&nbsp; "
                        f"prepared for Product, Procurement &amp; Marketing", sub))
+    if adj_notes:
+        E.append(Spacer(1, 4))
+        E.append(Paragraph(
+            f"<font color='#B26A00'><b>Note:</b></font> {len(adj_notes)} one-off "
+            f"adjustment(s) applied — see methodology box on the last page.",
+            ParagraphStyle("adjnote", parent=sub, textColor=AMBER, fontSize=9)))
     E.append(Spacer(1, 12))
 
     kpi = [["Net sales", "Contribution Margin 3", "Blended CM3%", "Active SKUs"],
@@ -546,12 +599,49 @@ def build():
             "i.e. cash sitting in unsold stock. Sales / CM3% are this SKU's Mar–May economics "
             "for context. DoS values shown in red exceed 360 days (a year of stock).", small))
 
+    # ----- Adjustment box (only if any adjustment is applied) -------------
+    if adj_notes:
+        E.append(Spacer(1, 10))
+        # Look up the SKU's adjusted CM3 to put the numbers in context.
+        rows = [[Paragraph("<b>SKU</b>", small),
+                 Paragraph("<b>Adjustment note</b>", small),
+                 Paragraph("<b>Adjusted CM3</b>", small)]]
+        for sku, note in adj_notes.items():
+            r = agg[agg["SKU"] == sku]
+            cm3 = r["CM3"].iloc[0] if len(r) else None
+            cm3pct = r["CM3%"].iloc[0] if len(r) else None
+            adj_cm3 = (f"{eur(cm3)} ({pct(cm3pct)})"
+                       if cm3 is not None and pd.notna(cm3) else "—")
+            short_note = (note[:240] + "…") if note and len(note) > 240 else (note or "")
+            rows.append([
+                Paragraph(f"<b>{sku}</b>", small),
+                Paragraph(short_note, small),
+                Paragraph(adj_cm3, small),
+            ])
+        adj_tbl = Table(rows, colWidths=[2.4 * cm, 12.0 * cm, 3.0 * cm])
+        adj_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), AMBER),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BACKGROUND", (0, 1), (-1, -1), LIGHT),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("BOX", (0, 0), (-1, -1), 0.5, AMBER),
+        ]))
+        E.append(KeepTogether([
+            Paragraph("Manual adjustments applied",
+                      ParagraphStyle("adj_h", parent=h3, textColor=AMBER)),
+            adj_tbl,
+        ]))
+
     E.append(Spacer(1, 8))
     E.append(Paragraph(
         "Method &amp; scope: Novadata daily margin + products exports, all marketplaces. "
         "CM3 = contribution margin after product, fulfilment and ad costs. Segments use "
         "within-period terciles; trend is a sales-weighted fit of monthly CM3%. Sub-€10k SKUs "
-        "excluded from leaderboards. Days of Supply derived from FBA Available ÷ Sales Velocity.",
+        "excluded from leaderboards. Days of Supply derived from FBA Available ÷ Sales Velocity. "
+        "Manual adjustments listed above are read from <i>adjustments.json</i> at build time and "
+        "are NOT written back to the Novadata source data.",
         small))
 
     doc.build(E, onFirstPage=_on_first, onLaterPages=_on_later)
