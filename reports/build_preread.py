@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from streamlit_app import (  # noqa: E402
     load_data, latest_export, aggregate_periods, tier_1_to_3, margin_trend,
+    latest_products_export, load_products,
 )
 
 from reportlab.lib import colors  # noqa: E402
@@ -147,7 +148,35 @@ def compute():
     cm3_cuts = np.round(np.nanpercentile(tb["CM3%"].astype(float), [33.33, 66.67]), 1)
     sales_cuts = np.round(np.nanpercentile(tb["Product Sales"].astype(float), [33.33, 66.67]), 0)
 
-    return dict(agg=agg, tb=tb, port=port, trends=trends,
+    # Slow movers: latest inventory snapshot from the products feed, all-country
+    # sum, Days of Supply = FBA Available / Sales Velocity. Threshold 180 days.
+    slow = pd.DataFrame()
+    pp_path = latest_products_export(REPO / "novadata_exports")
+    if pp_path is not None:
+        pp = load_products(pp_path)
+        for col in ("FBA Available", "Sales Velocity"):
+            if col in pp.columns:
+                pp[col] = pd.to_numeric(pp[col], errors="coerce")
+        # Sum FBA + Velocity across marketplaces, then derive DoS from the totals.
+        sku_inv = pp.groupby("SKU", as_index=False).agg(
+            fba=("FBA Available", "sum"),
+            vel=("Sales Velocity", "sum"),
+        )
+        sku_inv["dos"] = sku_inv["fba"] / sku_inv["vel"].where(sku_inv["vel"] > 0)
+        # Join with Mar-May economics (sales, units, CM3%) for ranking + value.
+        slow = sku_inv.merge(
+            agg[["SKU", "Product", "Product Sales", "Units", "CM3%"]],
+            on="SKU", how="left",
+        )
+        slow = slow[slow["dos"] > 180].copy()
+        # Tied-up value ≈ FBA × avg unit price over the period.
+        units = pd.to_numeric(slow["Units"], errors="coerce")
+        sales = pd.to_numeric(slow["Product Sales"], errors="coerce")
+        slow["unit_price"] = sales / units.where(units > 0)
+        slow["tied_up"] = slow["fba"] * slow["unit_price"]
+        slow = slow.sort_values("dos", ascending=False).reset_index(drop=True)
+
+    return dict(agg=agg, tb=tb, port=port, trends=trends, slow=slow,
                 cm3_cuts=cm3_cuts, sales_cuts=sales_cuts)
 
 
@@ -441,11 +470,89 @@ def build():
         trend_table(trends, ascending=True, color=RED),
     ]))
 
+    # ----- Slow movers ------------------------------------------------------
+    slow = d["slow"]
+    if not slow.empty:
+        E.append(PageBreak())
+        E.append(Paragraph("Slow movers — Days of Supply > 180", h2))
+
+        n = len(slow)
+        critical = int((slow["dos"] > 360).sum())
+        fba_units = int(slow["fba"].fillna(0).sum())
+        tied_up = slow["tied_up"].fillna(0).sum()
+
+        E.append(Paragraph(
+            f"<b>{n} SKUs</b> have more than six months of FBA stock at current sales velocity, "
+            f"of which <b>{critical}</b> exceed twelve months (critical overstock). "
+            f"Together they tie up roughly <b>{eur(tied_up)}</b> of inventory value "
+            f"({fba_units:,} FBA units). Days of Supply = FBA Available ÷ Sales Velocity "
+            f"(units/day), with both totals summed across marketplaces.", body))
+        E.append(Spacer(1, 6))
+
+        kpi = [["Slow-mover SKUs (>180 d)", "Critical (>360 d)", "FBA units locked", "Tied-up value"],
+               [f"{n:,}", f"{critical:,}", f"{fba_units:,}", eur(tied_up)]]
+        tk = Table(kpi, colWidths=[4.3 * cm] * 4)
+        tk.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), AMBER),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, 0), 8.5),
+            ("FONTSIZE", (0, 1), (-1, 1), 13),
+            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+            ("TEXTCOLOR", (0, 1), (-1, 1), NAVY),
+            ("BACKGROUND", (0, 1), (-1, 1), LIGHT),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("GRID", (0, 0), (-1, -1), 2, colors.white),
+        ]))
+        E.append(tk)
+        E.append(Spacer(1, 12))
+
+        top_slow = slow.head(15).copy()
+        data = [["Product", "FBA", "Vel/d", "DoS", "Tied-up", "Sales", "CM3%"]]
+        for _, r in top_slow.iterrows():
+            data.append([
+                str(r.get("Product") or r["SKU"])[:36],
+                f"{int(r['fba']):,}" if pd.notna(r['fba']) else "—",
+                f"{r['vel']:.1f}" if pd.notna(r['vel']) and r['vel'] > 0 else "—",
+                f"{int(r['dos']):,}" if pd.notna(r['dos']) else "—",
+                eur(r['tied_up']) if pd.notna(r['tied_up']) else "—",
+                eur(r['Product Sales']) if pd.notna(r.get('Product Sales')) else "—",
+                pct(r['CM3%']) if pd.notna(r.get('CM3%')) else "—",
+            ])
+        tt = Table(data, colWidths=[6.0 * cm, 1.6 * cm, 1.6 * cm, 1.6 * cm,
+                                    2.1 * cm, 2.1 * cm, 1.6 * cm])
+        tstyle = [
+            ("BACKGROUND", (0, 0), (-1, 0), AMBER),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
+        # Highlight DoS > 360 in soft coral
+        for i, (_, r) in enumerate(top_slow.iterrows(), start=1):
+            if pd.notna(r["dos"]) and r["dos"] > 360:
+                tstyle.append(("TEXTCOLOR", (3, i), (3, i), RED))
+                tstyle.append(("FONTNAME", (3, i), (3, i), "Helvetica-Bold"))
+        tt.setStyle(TableStyle(tstyle))
+        E.append(KeepTogether([
+            Paragraph("Top 15 by Days of Supply", ParagraphStyle("amb", parent=h3, textColor=AMBER)),
+            tt,
+        ]))
+        E.append(Spacer(1, 6))
+        E.append(Paragraph(
+            "Tied-up value ≈ FBA units × avg unit price (sales / units over March–May), "
+            "i.e. cash sitting in unsold stock. Sales / CM3% are this SKU's Mar–May economics "
+            "for context. DoS values shown in red exceed 360 days (a year of stock).", small))
+
     E.append(Spacer(1, 8))
     E.append(Paragraph(
-        "Method &amp; scope: Novadata daily margin export, all marketplaces. CM3 = contribution "
-        "margin after product, fulfilment and ad costs. Segments use within-period terciles; trend "
-        "is a sales-weighted fit of monthly CM3%. Sub-€10k SKUs excluded from leaderboards.", small))
+        "Method &amp; scope: Novadata daily margin + products exports, all marketplaces. "
+        "CM3 = contribution margin after product, fulfilment and ad costs. Segments use "
+        "within-period terciles; trend is a sales-weighted fit of monthly CM3%. Sub-€10k SKUs "
+        "excluded from leaderboards. Days of Supply derived from FBA Available ÷ Sales Velocity.",
+        small))
 
     doc.build(E, onFirstPage=_on_first, onLaterPages=_on_later)
     print(f"Wrote {OUT}  ({OUT.stat().st_size/1024:.0f} KB)")
