@@ -118,6 +118,24 @@ def load_products(path: Path) -> pd.DataFrame:
     for c in present_cols:
         p[c] = p.groupby(keys)[c].ffill()
     latest = p.groupby(keys, as_index=False)[present_cols].last()
+
+    # Derive missing columns when Novadata stops emitting them:
+    # - Days of Supply = FBA Available / Sales Velocity (units/day).
+    # - FBA Total Inventory ≈ Available + Incoming + Reserved.
+    if ("Days of Supply" not in latest.columns
+            and "FBA Available" in latest.columns
+            and "Sales Velocity" in latest.columns):
+        vel = pd.to_numeric(latest["Sales Velocity"], errors="coerce")
+        latest["Days of Supply"] = (
+            pd.to_numeric(latest["FBA Available"], errors="coerce")
+            / vel.where(vel > 0)
+        )
+    if "FBA Total Inventory" not in latest.columns:
+        parts = [pd.to_numeric(latest[c], errors="coerce").fillna(0)
+                 for c in ("FBA Available", "FBA Incoming", "AFN Reserved Quantity")
+                 if c in latest.columns]
+        if parts:
+            latest["FBA Total Inventory"] = sum(parts)
     return latest
 
 
@@ -638,7 +656,7 @@ k4.metric("Avg CM3 %", f"{avg_cm3:,.1f}" if pd.notna(avg_cm3) else "—")
 below = int((filtered["CM3%"] < target_cm3).sum())
 k5.metric(f"SKUs below {target_cm3:.0f}% CM3", f"{below:,}")
 
-tab_overview, tab_trend = st.tabs(["Overview", "Margin Trend"])
+tab_overview, tab_trend, tab_slow = st.tabs(["Overview", "Margin Trend", "Slow movers"])
 
 # =========================================================================
 # Overview tab — table + Δ vs previous period
@@ -723,9 +741,12 @@ with tab_overview:
             dos_agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
             inventory_latest["Days of Supply"] = dos_agg["num"] / dos_agg["den"].replace(0, pd.NA)
 
-    # Augment with products-feed-only columns if available.
-    extra_inv_cols = ["FBA Incoming", "AFN Reserved Quantity",
-                      "FBA Total Inventory", "Units Sold (30d)"]
+    # Augment with the products feed. It now populates the core inventory
+    # columns (which the margin feed leaves empty), so we OVERRIDE on non-null
+    # values from products and only fall back to the margin feed otherwise.
+    products_cols = ["FBA Available", "FBA Incoming", "AFN Reserved Quantity",
+                     "FBA Total Inventory", "Sales Velocity", "Days of Supply",
+                     "Units Sold (30d)"]
     products_path = latest_products_export(EXPORTS_DIR)
     products_caption = ""
     if products_path is not None:
@@ -735,19 +756,30 @@ with tab_overview:
             p_rows = products_lookup
         else:
             p_rows = products_lookup[products_lookup["Marketplace Name"] == marketplace]
-        for col in extra_inv_cols:
-            if col in p_rows.columns:
-                inventory_latest[col] = p_rows.groupby("SKU")[col].sum(min_count=1)
-        # Note if the products feed is currently empty.
+        for col in products_cols:
+            if col not in p_rows.columns:
+                continue
+            # Sum across marketplaces in All-countries mode (additive units);
+            # for ratios like Days of Supply we recompute from totals below.
+            if col == "Days of Supply":
+                continue
+            inventory_latest[col] = p_rows.groupby("SKU")[col].sum(min_count=1)
+        # Recompute Days of Supply from the (possibly aggregated) totals.
+        if ("FBA Available" in inventory_latest.columns
+                and "Sales Velocity" in inventory_latest.columns):
+            vel = pd.to_numeric(inventory_latest["Sales Velocity"], errors="coerce")
+            inventory_latest["Days of Supply"] = (
+                pd.to_numeric(inventory_latest["FBA Available"], errors="coerce")
+                / vel.where(vel > 0)
+            )
         has_any = any(
             col in p_rows.columns and p_rows[col].notna().any()
-            for col in extra_inv_cols
+            for col in products_cols
         )
         if not has_any:
             products_caption = (
                 f" Products feed `{products_path.name}` has no inventory values yet — "
-                f"FBA Incoming / AFN Reserved / FBA Total / Units (30d) will populate "
-                f"once Novadata starts emitting those fields."
+                f"will populate once Novadata starts emitting those fields."
             )
 
     for col in inventory_latest.columns:
@@ -1462,4 +1494,94 @@ with tab_trend:
                 f"{freq_label} with data — these can differ between SKUs if a "
                 f"product only sold for part of the history). SKUs with fewer "
                 f"than two {freq_label}s of data are omitted."
+            )
+
+# =========================================================================
+# Slow movers tab — SKUs with Days of Supply above threshold (default 180)
+# =========================================================================
+with tab_slow:
+    if "Days of Supply" not in filtered.columns:
+        st.info("No inventory data available — Days of Supply column missing.")
+    else:
+        s1, s2 = st.columns([1, 3])
+        dos_threshold = s1.number_input(
+            "Days of Supply >",
+            min_value=30, value=180, step=30,
+            help="Tage Reach — wie viele Tage Bestand bei aktueller Velocity. "
+                 "Standard 180 = mehr als 6 Monate Lager.",
+        )
+
+        slow = filtered.copy()
+        slow["Days of Supply"] = pd.to_numeric(slow["Days of Supply"], errors="coerce")
+        slow = slow[slow["Days of Supply"] > dos_threshold].copy()
+
+        if slow.empty:
+            s2.markdown(
+                f"&nbsp; No SKUs with Days of Supply > {dos_threshold} in the current view. "
+                f"Either inventory is healthy, the filters are too narrow, or the Days of "
+                f"Supply column isn't populated by Novadata yet (known gap)."
+            )
+        else:
+            # Tied-up stock value: FBA Available × avg unit price (sales / units over period)
+            units = pd.to_numeric(slow.get("Units"), errors="coerce")
+            sales = pd.to_numeric(slow.get("Product Sales"), errors="coerce")
+            fba = pd.to_numeric(slow.get("FBA Available"), errors="coerce")
+            unit_price = sales / units.replace(0, pd.NA)
+            slow["Avg unit price"] = unit_price
+            slow["Tied-up value"] = fba * unit_price
+            slow = slow.sort_values("Days of Supply", ascending=False)
+
+            s2.markdown(
+                f"**{len(slow):,} SKUs** mit > {dos_threshold} Tagen Reach. "
+                f"Median {slow['Days of Supply'].median():,.0f} d, "
+                f"Max {slow['Days of Supply'].max():,.0f} d."
+            )
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Slow-mover SKUs", f"{len(slow):,}")
+            k2.metric("FBA units locked", f"{int(fba.sum()):,}" if fba.notna().any() else "—")
+            tied = slow["Tied-up value"].sum()
+            k3.metric("Tied-up stock value (≈€)",
+                      f"€{tied:,.0f}" if pd.notna(tied) and tied > 0 else "—",
+                      help="FBA Available × avg unit price (sales / units over the selected period).")
+            avg_cm3_slow = pd.to_numeric(slow.get("CM3%"), errors="coerce").mean()
+            k4.metric("Avg CM3 %", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—")
+
+            show_cols = [c for c in [
+                "SKU", "Product", "Cluster",
+                "FBA Available", "Sales Velocity", "Days of Supply",
+                "Avg unit price", "Tied-up value",
+                "Product Sales", "Units", "CM3%",
+            ] if c in slow.columns]
+
+            st.dataframe(
+                slow[show_cols].style.format({
+                    "FBA Available": "{:,.0f}",
+                    "Sales Velocity": "{:,.1f}",
+                    "Days of Supply": "{:,.0f}",
+                    "Avg unit price": "€{:,.2f}",
+                    "Tied-up value": "€{:,.0f}",
+                    "Product Sales": "€{:,.0f}",
+                    "Units": "{:,.0f}",
+                    "CM3%": "{:.1f}%",
+                }, na_rep="—").map(
+                    lambda v: "background-color: #F8CBAD" if pd.notna(v) and v > dos_threshold * 2
+                    else ("background-color: #FFE0B2" if pd.notna(v) and v > dos_threshold else ""),
+                    subset=["Days of Supply"],
+                ),
+                width="stretch", hide_index=True, height=520,
+            )
+
+            st.download_button(
+                "Download slow movers (CSV)",
+                data=slow[show_cols].to_csv(index=False).encode("utf-8"),
+                file_name=f"slow_movers_{marketplace}_{pd.Timestamp(period):%Y%m%d}.csv",
+                mime="text/csv",
+            )
+
+            st.caption(
+                "Days of Supply = FBA Available ÷ Sales Velocity (units/day). The orange shade "
+                f"marks SKUs above {dos_threshold} d; the deeper red above {dos_threshold*2} d "
+                "(critical overstock). 'Tied-up value' is FBA units × the SKU's average unit "
+                "price over the selected period — a rough estimate of cash sitting in stock."
             )
