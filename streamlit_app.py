@@ -229,6 +229,69 @@ def tier_1_to_3(values: pd.Series) -> pd.Series:
 
 
 COMMENTS_PATH = REPO_ROOT / "comments.json"
+ADJUSTMENTS_PATH = REPO_ROOT / "adjustments.json"
+
+
+# ---------- Manual one-off adjustments ----------
+# Read from adjustments.json. Each entry pro-rates a CM1/CM2/CM3 € delta over
+# the days where the user's period selection overlaps the adjustment's
+# date range. Applied AFTER aggregation, never written back to the Novadata
+# data files. Used to back out abnormal events (massive returns, fraud,
+# one-off chargebacks, etc.) without polluting the source dataset.
+@st.cache_data(show_spinner=False)
+def load_adjustments() -> dict[str, list[dict]]:
+    if not ADJUSTMENTS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(ADJUSTMENTS_PATH.read_text())
+    except Exception:
+        return {}
+    out = {}
+    for sku, entries in raw.items():
+        if sku.startswith("_"):
+            continue
+        if isinstance(entries, dict):
+            entries = [entries]
+        out[sku] = entries
+    return out
+
+
+def apply_adjustments(filtered: pd.DataFrame, adjustments: dict, selected_periods: list):
+    """Add pro-rated deltas, recompute %s, return (df, {SKU: note})."""
+    if not adjustments or filtered.empty or not selected_periods:
+        return filtered, {}
+    sel = pd.to_datetime([pd.Timestamp(p) for p in selected_periods]).normalize()
+    sel_set = set(sel)
+    notes = {}
+    f = filtered.copy()
+    for sku, entries in adjustments.items():
+        if sku not in set(f["SKU"]):
+            continue
+        for adj in entries:
+            days = pd.date_range(adj["from"], adj["to"], freq="D").normalize()
+            overlap = len(set(days) & sel_set)
+            total = len(days)
+            if not total or not overlap:
+                continue
+            ratio = overlap / total
+            mask = f["SKU"] == sku
+            for col, delta in (adj.get("deltas") or {}).items():
+                if col in f.columns:
+                    f.loc[mask, col] = (
+                        pd.to_numeric(f.loc[mask, col], errors="coerce").fillna(0) + delta * ratio
+                    )
+            sales = pd.to_numeric(f.loc[mask, "Product Sales"], errors="coerce").fillna(0)
+            for short in ("CM1", "CM2", "CM3"):
+                if short in f.columns and f"{short}%" in f.columns:
+                    f.loc[mask, f"{short}%"] = (
+                        pd.to_numeric(f.loc[mask, short], errors="coerce")
+                        / sales.replace(0, pd.NA) * 100
+                    )
+            tag = "" if abs(ratio - 1) < 0.01 else f" (pro-rated × {ratio:.0%})"
+            notes[sku] = (f"✱ ADJUSTED{tag}: {adj.get('note', 'Manual adjustment applied.')}"
+                          + (f"  [{adj.get('applied_at')}]" if adj.get("applied_at") else ""))
+    return f, notes
+
 
 # ---------- Comments persistence ----------
 # Streamlit Cloud's filesystem is ephemeral (resets on every code push or idle
@@ -809,6 +872,10 @@ with tab_overview:
         filtered["Rev Δ 4w %"] = pd.NA
         growth_caption = "No equivalent set 4 weeks back, so Rev Δ 4w % is empty."
 
+    # ----- Apply manual one-off adjustments (adjustments.json) -----
+    adjustments = load_adjustments()
+    filtered, adj_notes = apply_adjustments(filtered, adjustments, selected_periods)
+
     # ----- P&L Impact = total CM3 (absolute € contribution) -----
     # Daily export carries CM3 in € directly; weekly legacy schema only has the
     # percentage, so fall back to CM3% × Sales there.
@@ -1050,6 +1117,21 @@ with tab_overview:
     if "comments" not in st.session_state:
         st.session_state["comments"] = load_comments()
     filtered["Comments"] = filtered["SKU"].map(st.session_state["comments"]).fillna("")
+    # Surface manual-adjustment notes from adjustments.json so adjusted rows
+    # are visibly marked in the table.
+    if adj_notes:
+        def _merge_note(row):
+            adj = adj_notes.get(row["SKU"], "")
+            user = row.get("Comments") or ""
+            if adj and user:
+                return f"{adj} | {user}"
+            return adj or user
+        filtered["Comments"] = filtered.apply(_merge_note, axis=1)
+        st.info(
+            f"**Manual adjustments applied to {len(adj_notes)} SKU(s).** "
+            f"Affected rows show a ✱ ADJUSTED marker in Comments. "
+            f"Source: `adjustments.json` (one-off, not in Novadata)."
+        )
 
     INVENTORY_COLS = {
         "FBA Available", "FBA Incoming", "AFN Reserved Quantity",

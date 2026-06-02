@@ -1,0 +1,20 @@
+{
+  "_meta": {
+    "purpose": "One-off manual corrections to specific SKUs' CM1/CM2/CM3 € figures. Applied AFTER aggregate_periods, NOT written back to the Novadata exports. Each entry is pro-rated over the days of overlap between its date range and the user's current selection.",
+    "schema": "adjustments[SKU] = [ { from, to, deltas: {CM1, CM2, CM3}, note, applied_at, applied_by } ]"
+  },
+  "VV-VITA-266": [
+    {
+      "from": "2026-03-01",
+      "to": "2026-05-31",
+      "deltas": {
+        "CM1": 91873,
+        "CM2": 91873,
+        "CM3": 90573
+      },
+      "note": "Return-spike normalisation: May 2026 absorbed 4,068 unit returns and €91,873 in refunded product sales — vs a 1.7-2.2% baseline return rate in Mar/Apr. The spike is a catch-up of returns from earlier periods, not a Mar-May economic event, so the abnormal portion is added back to CM1/CM2/CM3. Adjusted CM3 ≈ +€27,000 (+45%), consistent with healthy Vegavero SKUs. NOT written back to the source data.",
+      "applied_at": "2026-06-02",
+      "applied_by": "manual review (pl_data_2026_06_02.csv)"
+    }
+  ]
+}
