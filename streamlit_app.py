@@ -357,6 +357,38 @@ def load_comments() -> dict[str, str]:
         return {}
 
 
+def persist_comment_edits(edited_skus, edited_comments):
+    """Diff comments column against st.session_state['comments'], persist on change.
+
+    Used by both the Overview AgGrid and the Slow movers data_editor so the
+    Comments column is a single store keyed by SKU.
+    """
+    new_comments = dict(st.session_state.get("comments", {}))
+    changed = False
+    for sku, comment in zip(edited_skus, edited_comments):
+        # Skip the adjustment marker so users can't accidentally drop it.
+        text = (str(comment) if comment is not None else "")
+        # Strip the auto-injected '✱ ADJUSTED: ... |' prefix when persisting,
+        # so only the user's own note round-trips into comments.json.
+        if "✱ ADJUSTED" in text and "|" in text:
+            text = text.split("|", 1)[1]
+        text = text.strip()
+        prev = new_comments.get(sku, "")
+        if text != prev:
+            if text:
+                new_comments[sku] = text
+            elif sku in new_comments:
+                del new_comments[sku]
+            changed = True
+    if changed:
+        st.session_state["comments"] = new_comments
+        try:
+            st.session_state["comments_status"] = save_comments(new_comments)
+        except Exception as exc:
+            st.session_state["comments_status"] = f"save failed: {exc}"
+    return changed
+
+
 def save_comments(comments: dict[str, str]) -> str:
     """Return a short status string for UI display."""
     clean = {k: v for k, v in comments.items() if v and v.strip()}
@@ -1336,24 +1368,8 @@ with tab_overview:
     edited = pd.DataFrame(grid_response["data"]) if grid_response and "data" in grid_response else table_for_grid
 
     # Persist any comment changes back to comments.json / session.
-    new_comments = dict(st.session_state["comments"])
-    changed = False
     if "Comments" in edited.columns and "SKU" in edited.columns:
-        for sku, comment in zip(edited["SKU"], edited["Comments"]):
-            comment_str = (str(comment) if comment is not None else "").strip()
-            prev = new_comments.get(sku, "")
-            if comment_str != prev:
-                if comment_str:
-                    new_comments[sku] = comment_str
-                elif sku in new_comments:
-                    del new_comments[sku]
-                changed = True
-    if changed:
-        st.session_state["comments"] = new_comments
-        try:
-            st.session_state["comments_status"] = save_comments(new_comments)
-        except Exception as exc:
-            st.session_state["comments_status"] = f"save failed: {exc}"
+        persist_comment_edits(edited["SKU"], edited["Comments"])
 
     # Always show a small status line so the user knows whether edits persist.
     status = st.session_state.get("comments_status")
@@ -1629,30 +1645,53 @@ with tab_slow:
             avg_cm3_slow = pd.to_numeric(slow.get("CM3%"), errors="coerce").mean()
             k4.metric("Avg CM3 %", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—")
 
+            # Pull current comments (same store the Overview tab edits) so any
+            # note added here ↔ shows up on the other tab automatically.
+            if "comments" not in st.session_state:
+                st.session_state["comments"] = load_comments()
+            slow["Comments"] = slow["SKU"].map(st.session_state["comments"]).fillna("")
+
             show_cols = [c for c in [
                 "SKU", "Product", "Cluster",
                 "FBA Available", "Sales Velocity", "Days of Supply",
                 "Avg unit price", "Tied-up value",
                 "Product Sales", "Units", "CM3%",
+                "Comments",
             ] if c in slow.columns]
 
-            st.dataframe(
-                slow[show_cols].style.format({
-                    "FBA Available": "{:,.0f}",
-                    "Sales Velocity": "{:,.1f}",
-                    "Days of Supply": "{:,.0f}",
-                    "Avg unit price": "€{:,.2f}",
-                    "Tied-up value": "€{:,.0f}",
-                    "Product Sales": "€{:,.0f}",
-                    "Units": "{:,.0f}",
-                    "CM3%": "{:.1f}%",
-                }, na_rep="—").map(
-                    lambda v: "background-color: #F8CBAD" if pd.notna(v) and v > dos_threshold * 2
-                    else ("background-color: #FFE0B2" if pd.notna(v) and v > dos_threshold else ""),
-                    subset=["Days of Supply"],
-                ),
+            slow_view = slow[show_cols].reset_index(drop=True)
+            slow_edited = st.data_editor(
+                slow_view,
                 width="stretch", hide_index=True, height=520,
+                key="slow_movers_editor",
+                column_config={
+                    "SKU": st.column_config.TextColumn("SKU", disabled=True),
+                    "Product": st.column_config.TextColumn("Product", disabled=True, width="large"),
+                    "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
+                    "FBA Available": st.column_config.NumberColumn("FBA Avail.", format="%d", disabled=True),
+                    "Sales Velocity": st.column_config.NumberColumn("Velocity / d", format="%.1f", disabled=True),
+                    "Days of Supply": st.column_config.NumberColumn(
+                        "Days of Supply", format="%d", disabled=True,
+                        help=f"Orange ≥ {dos_threshold} d (your threshold); red ≥ {dos_threshold*2} d (critical).",
+                    ),
+                    "Avg unit price": st.column_config.NumberColumn("Avg unit price", format="€%.2f", disabled=True),
+                    "Tied-up value": st.column_config.NumberColumn("Tied-up value", format="€%d", disabled=True),
+                    "Product Sales": st.column_config.NumberColumn("Sales (€)", format="€%d", disabled=True),
+                    "Units": st.column_config.NumberColumn("Units", format="%d", disabled=True),
+                    "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
+                    "Comments": st.column_config.TextColumn(
+                        "Comments ✏",
+                        help="Free-text note per SKU. Synced with the Overview tab's Comments column.",
+                        width="medium",
+                    ),
+                },
             )
+
+            # Persist any comment edits made here through the shared helper —
+            # so notes typed on Slow movers immediately appear on Overview and
+            # vice versa, all backed by the same Gist/local file.
+            if "Comments" in slow_edited.columns and "SKU" in slow_edited.columns:
+                persist_comment_edits(slow_edited["SKU"], slow_edited["Comments"])
 
             st.download_button(
                 "Download slow movers (CSV)",
