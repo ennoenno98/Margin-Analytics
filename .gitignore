@@ -7,3 +7,4 @@ venv/
 .DS_Store
 novadata_export.log
 novadata_exports/_raw_*.csv
+comments.json
