@@ -338,7 +338,7 @@ def apply_adjustments(filtered: pd.DataFrame, adjustments: dict, selected_period
                 if short in f.columns and f"{short}%" in f.columns:
                     f.loc[mask, f"{short}%"] = (
                         pd.to_numeric(f.loc[mask, short], errors="coerce")
-                        / sales.replace(0, pd.NA) * 100
+                        / sales.where(sales > 0) * 100
                     )
             tag = "" if abs(ratio - 1) < 0.01 else f" (pro-rated × {ratio:.0%})"
             notes[sku] = (f"✱ ADJUSTED{tag}: {adj.get('note', 'Manual adjustment applied.')}"
@@ -493,7 +493,9 @@ def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
             "_w": weights.where(valid),
         })
         agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
-        agg[c] = agg["num"] / agg["den"].replace(0, pd.NA)
+        # Force float dtype — division on float32 with where() can otherwise
+        # propagate object dtype when all values are NaN, which trips AgGrid.
+        agg[c] = (agg["num"] / agg["den"].where(agg["den"] > 0)).astype("float32")
         base = base.merge(agg[[c]], left_on="SKU", right_index=True, how="left")
 
     # When absolute margins are present (daily schema), prefer the cleaner
@@ -504,7 +506,7 @@ def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
         for short in ["CM1", "CM2", "CM3"]:
             if short in base.columns:
                 cm_total = pd.to_numeric(base[short], errors="coerce")
-                base[f"{short}%"] = cm_total / sales_total.replace(0, pd.NA) * 100
+                base[f"{short}%"] = (cm_total / sales_total.where(sales_total > 0) * 100).astype("float32")
     return base
 
 
@@ -526,7 +528,7 @@ def _cm3_pct_by_bucket(raw: pd.DataFrame, freq: str) -> pd.DataFrame:
         grp = r.groupby(["SKU", "bucket"], as_index=False).agg(
             _cm3=("CM3", "sum"), _sales=("Product Sales", "sum")
         )
-        grp["CM3%"] = grp["_cm3"] / grp["_sales"].replace(0, pd.NA) * 100
+        grp["CM3%"] = grp["_cm3"] / grp["_sales"].where(grp["_sales"] > 0) * 100
     else:
         r["CM3%"] = pd.to_numeric(r.get("CM3%"), errors="coerce")
         r["_w"] = (r["CM3%"] * r["Product Sales"]).where(
@@ -535,7 +537,7 @@ def _cm3_pct_by_bucket(raw: pd.DataFrame, freq: str) -> pd.DataFrame:
         grp = r.groupby(["SKU", "bucket"], as_index=False).agg(
             _num=("_w", "sum"), _sales=("Product Sales", "sum")
         )
-        grp["CM3%"] = grp["_num"] / grp["_sales"].replace(0, pd.NA) * 100
+        grp["CM3%"] = grp["_num"] / grp["_sales"].where(grp["_sales"] > 0) * 100
     grp = grp.rename(columns={"_sales": "Sales"})
     return grp[["SKU", "bucket", "CM3%", "Sales"]].dropna(subset=["CM3%"])
 
@@ -889,7 +891,7 @@ with tab_overview:
                 "_w": weights.where(valid),
             })
             dos_agg = tmp.groupby("SKU").agg(num=("_v", "sum"), den=("_w", "sum"))
-            inventory_latest["Days of Supply"] = dos_agg["num"] / dos_agg["den"].replace(0, pd.NA)
+            inventory_latest["Days of Supply"] = dos_agg["num"] / dos_agg["den"].where(dos_agg["den"] > 0)
 
     # Augment with the products feed. It now populates the core inventory
     # columns (which the margin feed leaves empty), so we OVERRIDE on non-null
@@ -948,8 +950,9 @@ with tab_overview:
         prior_4w_agg = aggregate_periods(prior_4w_raw)
         prev_rev = prior_4w_agg.set_index("SKU")["Product Sales"]
         # Align by SKU; some current SKUs may not appear in the prior set.
-        wow4 = ((cur_rev - prev_rev.reindex(cur_rev.index))
-                / prev_rev.reindex(cur_rev.index).replace(0, pd.NA)) * 100
+        prev_rev_aligned = prev_rev.reindex(cur_rev.index)
+        wow4 = ((cur_rev - prev_rev_aligned)
+                / prev_rev_aligned.where(prev_rev_aligned > 0)) * 100
         filtered["Rev Δ 4w %"] = filtered["SKU"].map(wow4)
         growth_caption = (
             f"Rev Δ 4w % compares the selection to the same days 4 weeks earlier "
@@ -1522,7 +1525,7 @@ with tab_trend:
             port_ts = r.groupby("bucket", as_index=False).agg(
                 cm3=("_w", "sum"), sales=("Product Sales", "sum")
             )
-        port_ts["CM3%"] = port_ts["cm3"] / port_ts["sales"].replace(0, pd.NA) * 100
+        port_ts["CM3%"] = port_ts["cm3"] / port_ts["sales"].where(port_ts["sales"] > 0) * 100
         port_ts = port_ts.sort_values("bucket")
 
         _span_start = pd.Timestamp(min(selected_periods)).strftime("%b %Y")
@@ -1679,7 +1682,7 @@ with tab_slow:
             units = pd.to_numeric(slow.get("Units"), errors="coerce")
             sales = pd.to_numeric(slow.get("Product Sales"), errors="coerce")
             fba = pd.to_numeric(slow.get("FBA Available"), errors="coerce")
-            unit_price = sales / units.replace(0, pd.NA)
+            unit_price = sales / units.where(units > 0)
             slow["Avg unit price"] = unit_price
             slow["Tied-up value"] = fba * unit_price
             slow = slow.sort_values("Days of Supply", ascending=False)
