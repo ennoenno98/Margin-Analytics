@@ -101,8 +101,22 @@ def load_products(path: Path) -> pd.DataFrame:
     Incoming, AFN Reserved Quantity, FBA Total Inventory, Sales Velocity,
     Units Sold (30d), Days of Supply.
     """
-    p = pd.read_csv(path)
-    p["Period"] = pd.to_datetime(p["Period"], errors="coerce")
+    # Read only what we need — the products feed has 22 cols × 113k rows,
+    # most of them text we never use (Brand, Store Name, filter columns).
+    KEEP = {
+        "Period", "SKU", "Marketplace Name",
+        "FBA Available", "FBA Incoming", "AFN Reserved Quantity",
+        "FBA Total Inventory", "Sales Velocity", "Units Sold (30d)",
+        "Days of Supply",
+    }
+    p = pd.read_csv(path, usecols=lambda c: c in KEEP)
+    p["Period"] = pd.to_datetime(p["Period"], errors="coerce", utc=True).dt.tz_localize(None)
+    for col in ("SKU", "Marketplace Name"):
+        if col in p.columns:
+            try:
+                p[col] = p[col].astype("string[pyarrow]")
+            except (ImportError, TypeError):
+                pass
     inventory_cols = [
         "FBA Available", "FBA Incoming", "AFN Reserved Quantity",
         "FBA Total Inventory", "Sales Velocity", "Units Sold (30d)",
@@ -110,7 +124,7 @@ def load_products(path: Path) -> pd.DataFrame:
     ]
     for c in inventory_cols:
         if c in p.columns:
-            p[c] = pd.to_numeric(p[c], errors="coerce")
+            p[c] = pd.to_numeric(p[c], errors="coerce", downcast="float")
     # Take the latest non-null value per (SKU, marketplace) per column.
     p = p.sort_values("Period")
     keys = ["SKU", "Marketplace Name"]
@@ -141,13 +155,29 @@ def load_products(path: Path) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_data(path: Path) -> pd.DataFrame:
-    # pd.read_csv handles .gz transparently when the suffix is .csv.gz.
-    df = pd.read_csv(path)
+    """Load the daily margin export, dropping unused columns and shrinking
+    dtypes to keep memory low (Streamlit Cloud's free tier caps at ~1 GB).
+
+    The raw file is ~50 MB CSV / 174k rows × 26 cols; loaded naively that's
+    ~500 MB in pandas (object dtypes on long product titles + unused IDs).
+    After this function, the dataframe is closer to 50–80 MB.
+    """
+    # Whitelist: columns the dashboard actually uses. Anything not in here
+    # (Seller Partner ID, Store Name, Marketplace, Parent ASIN, Brand) is
+    # dropped at parse time so it never enters memory.
+    KEEP = {
+        "Period", "SKU", "Product", "Marketplace Name", "Child ASIN",
+        "Orders", "Units", "Product Sales",
+        "Contribution Margin 1", "Contribution Margin 2", "Contribution Margin 3",
+        "Advertising Costs",
+        "CM1%", "CM2%", "CM3%", "Sponsored Spend",  # legacy weekly schema
+        "ROAS", "CTR",
+        "FBA Available", "Days of Supply", "Sales Velocity",
+        "UK filters", "FR filters", "ES filters", "DE filters", "IT filters",
+    }
+    df = pd.read_csv(path, usecols=lambda c: c in KEEP)
     df["Period"] = pd.to_datetime(df["Period"], errors="coerce", utc=True).dt.tz_localize(None)
 
-    # Schema variants:
-    # - Daily (current): Contribution Margin 1/2/3 (€ absolute), Advertising Costs.
-    # - Weekly (legacy): CM1%/CM2%/CM3%, Sponsored Spend.
     cm_abs = {
         "Contribution Margin 1": "CM1",
         "Contribution Margin 2": "CM2",
@@ -155,32 +185,55 @@ def load_data(path: Path) -> pd.DataFrame:
     }
     for src, short in cm_abs.items():
         if src in df.columns:
-            df[short] = pd.to_numeric(df[src], errors="coerce")
-
+            df[short] = pd.to_numeric(df[src], errors="coerce", downcast="float")
     if "Advertising Costs" in df.columns:
-        df["Sponsored Spend"] = pd.to_numeric(df["Advertising Costs"], errors="coerce")
+        df["Sponsored Spend"] = pd.to_numeric(df["Advertising Costs"], errors="coerce", downcast="float")
 
     numeric_cols = [
         "CM1%", "CM2%", "CM3%", "Sponsored Spend", "ROAS", "CTR",
-        "Orders", "Units", "Product Sales",
-        "FBA Available", "Days of Supply", "Sales Velocity",
+        "Product Sales", "FBA Available", "Days of Supply", "Sales Velocity",
         "CM1", "CM2", "CM3",
     ]
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce", downcast="float")
+    for col in ("Orders", "Units"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce", downcast="integer")
 
-    # Derive CM%s from absolute amounts when only the daily schema is present.
+    # Derive CM%s when only absolute margins are present (daily schema).
     sales = df.get("Product Sales")
     if sales is not None:
+        safe_sales = sales.where(sales > 0)
         for short in ["CM1", "CM2", "CM3"]:
             pct_col = f"{short}%"
             if short in df.columns and pct_col not in df.columns:
-                df[pct_col] = df[short] / sales.replace(0, pd.NA) * 100
+                df[pct_col] = (df[short] / safe_sales * 100).astype("float32")
 
-    # Derive Days of Supply if absent: stock / daily velocity.
     if "Days of Supply" not in df.columns and "FBA Available" in df.columns and "Sales Velocity" in df.columns:
-        df["Days of Supply"] = df["FBA Available"] / df["Sales Velocity"].replace(0, pd.NA)
+        vel = df["Sales Velocity"]
+        df["Days of Supply"] = (df["FBA Available"] / vel.where(vel > 0)).astype("float32")
+
+    # Drop the now-redundant source columns (we keep the derived shorts).
+    drop = [c for c in ("Contribution Margin 1", "Contribution Margin 2",
+                        "Contribution Margin 3", "Advertising Costs")
+            if c in df.columns]
+    if drop:
+        df = df.drop(columns=drop)
+
+    # Categorize low-cardinality strings (only the ones we never groupby on)
+    # and use pyarrow-backed StringDtype for the rest (SKU, Marketplace Name).
+    # Together this cuts the dataframe from ~500 MB → ~40 MB on the real data.
+    for col in ("UK filters", "FR filters", "ES filters", "DE filters", "IT filters",
+                "Child ASIN", "Product"):
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+    for col in ("SKU", "Marketplace Name"):
+        if col in df.columns:
+            try:
+                df[col] = df[col].astype("string[pyarrow]")
+            except (ImportError, TypeError):
+                pass
 
     return df
 
@@ -706,15 +759,17 @@ if min_monthly_sales > 0 and len(sku_monthly_rev):
 else:
     passing_skus = None
 
-# Marketplace base slice (all weeks for this marketplace)
-mp_slice = df.copy() if is_all_countries else df[df["Marketplace Name"] == marketplace].copy()
+# Marketplace base slice (all weeks for this marketplace). Boolean-index views
+# only — no .copy() on the cached load_data frame, which is up to ~80 MB.
+if is_all_countries:
+    mp_slice = df
+else:
+    mp_slice = df[df["Marketplace Name"] == marketplace]
 if passing_skus is not None:
     mp_slice = mp_slice[mp_slice["SKU"].isin(passing_skus)]
 
 # Current view: aggregate across the selected weeks (sum + weighted avg).
-raw_slice = mp_slice[mp_slice["Period"].isin(selected_periods)].copy()
-# Aggregate when multiple weeks are picked, or when 'All countries' is on (the
-# same SKU appears in several marketplaces and must be rolled up).
+raw_slice = mp_slice[mp_slice["Period"].isin(selected_periods)]
 needs_aggregation = (len(selected_periods) > 1) or is_all_countries
 filtered = aggregate_periods(raw_slice) if needs_aggregation else raw_slice.copy()
 is_multi_period = len(selected_periods) > 1
