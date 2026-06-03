@@ -1286,6 +1286,17 @@ with tab_overview:
 
     # Pass Cluster Code through so the cluster styler can read it (hidden column).
     table_for_grid = table.copy()
+    # Defensive: AgGrid serialises the dataframe to the front end and has had
+    # issues with pandas extension dtypes (pyarrow-string, category, nullable
+    # Int64). Convert these to plain object/float at the render boundary so
+    # the JS layer always sees standard JSON types. Memory-optimised dtypes
+    # are preserved everywhere else.
+    for _col in list(table_for_grid.columns):
+        _dt = str(table_for_grid[_col].dtype)
+        if _dt in ("string", "category"):
+            table_for_grid[_col] = table_for_grid[_col].astype("object")
+        elif _dt in ("Int64", "Int32", "Int16", "Int8"):
+            table_for_grid[_col] = pd.to_numeric(table_for_grid[_col], errors="coerce").astype("float64")
     # Keep the full product title in a hidden column so the AgGrid tooltip can
     # show it, and replace the visible value with a short version: text before
     # the first separator, capped at 50 chars.
