@@ -1729,8 +1729,51 @@ with tab_overview:
         data=json.dumps(st.session_state["comments"], indent=2, ensure_ascii=False).encode("utf-8"),
         file_name="comments.json",
         mime="application/json",
-        help="Comments persist on the server but reset on each redeploy. Commit this file to keep them permanently.",
+        help="Snapshot of every comment. Save it as a backup or to seed another deploy.",
     )
+
+    with st.expander("Import comments from a JSON file"):
+        st.caption(
+            "Accepts either the old flat format `{sku: \"text\"}` or the new "
+            "nested format `{sku: {country: \"text\"}}`. Old flat entries are "
+            "auto-migrated to the `_legacy` slot and surface in every country "
+            "view until you overwrite them with a country-specific note."
+        )
+        uploaded = st.file_uploader(
+            "Upload comments.json", type=["json"], key="comments_import",
+            label_visibility="collapsed",
+        )
+        merge_mode = st.radio(
+            "How to combine with existing comments",
+            ["Merge (keep existing, fill in gaps)", "Replace (overwrite everything)"],
+            horizontal=True, key="comments_import_mode",
+        )
+        if uploaded is not None:
+            try:
+                imported_raw = json.loads(uploaded.read().decode("utf-8"))
+                imported = _normalise_comments(imported_raw)
+                if merge_mode.startswith("Replace"):
+                    new_store = imported
+                else:
+                    existing = dict(st.session_state.get("comments", {}))
+                    for sku, entry in imported.items():
+                        merged = dict(existing.get(sku, {}))
+                        for k, v in entry.items():
+                            merged.setdefault(k, v)  # don't overwrite existing values
+                        existing[sku] = merged
+                    new_store = existing
+                st.session_state["comments"] = new_store
+                status = save_comments(new_store)
+                n_entries = sum(len(v) for v in imported.values())
+                st.success(
+                    f"Imported {n_entries} note(s) across {len(imported)} SKU(s). "
+                    f"Status: {status}"
+                )
+                st.rerun()
+            except json.JSONDecodeError as exc:
+                st.error(f"Not valid JSON: {exc}")
+            except Exception as exc:
+                st.error(f"Import failed: {exc!r}")
 
 # =========================================================================
 # Margin Trend tab — CM3% trajectory bucketed by month / quarter / year
