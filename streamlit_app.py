@@ -412,11 +412,20 @@ def _load_comments_from_gist(gist_id: str, token: str):
         return None, f"network error: {exc!s}"
     if r.status_code == 200:
         files = r.json().get("files", {})
-        content = (files.get(GIST_FILE) or {}).get("content", "{}")
+        if GIST_FILE not in files:
+            present = ", ".join(files.keys()) or "no files"
+            return {}, (
+                f"Gist OK but no file named '{GIST_FILE}' (Gist has: {present}). "
+                f"Rename the file in your Gist to '{GIST_FILE}' or paste into that one."
+            )
+        content = files.get(GIST_FILE, {}).get("content", "{}")
         try:
-            return json.loads(content), "ok"
-        except Exception:
-            return {}, "Gist content isn't valid JSON — starting from {}"
+            data = json.loads(content)
+        except Exception as exc:
+            return {}, f"Gist file '{GIST_FILE}' isn't valid JSON: {exc}"
+        if not isinstance(data, dict):
+            return {}, f"Gist file '{GIST_FILE}' top-level value is {type(data).__name__}, expected object"
+        return data, "ok"
     msg = {
         401: "401 — token rejected (invalid / expired)",
         403: "403 — token lacks Gists: read & write, or belongs to a different user",
@@ -516,10 +525,15 @@ def load_comments() -> dict:
     if gist_id and token:
         remote, detail = _load_comments_from_gist(gist_id, token)
         if remote is not None:
-            st.session_state["comments_status"] = (
-                "synced to Gist ✓" if detail == "ok" else f"loaded from Gist with warning: {detail}"
-            )
-            return _normalise_comments(remote)
+            normalised = _normalise_comments(remote)
+            n_skus = len(normalised)
+            n_notes = sum(len(v) for v in normalised.values())
+            base = f"synced to Gist ✓ — loaded {n_notes} note(s) across {n_skus} SKU(s)"
+            if detail == "ok":
+                st.session_state["comments_status"] = base
+            else:
+                st.session_state["comments_status"] = f"{base}; warning: {detail}"
+            return normalised
         st.session_state["comments_status"] = (
             f"Gist read failed ({detail}) — falling back to session-only ⚠"
         )
