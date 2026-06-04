@@ -1196,7 +1196,7 @@ with tab_overview:
                     "Sales (€)": "€{:,.0f}",
                     "P&L Impact (€)": "€{:,.0f}",
                     "Ad spend (€)": "€{:,.0f}",
-                    "Country CM3 %": "{:.0f}%",
+                    "Country CM3 %": "{:.1f}%",
                     "Units": "{:,.0f}",
                     "SKUs": "{:,.0f}",
                 }, na_rep="—").apply(
@@ -1349,10 +1349,10 @@ with tab_overview:
         d1.metric("SKUs in cluster", f"{len(filtered):,}")
         d2.metric("Total sales (€)", f"{filtered['Product Sales'].sum():,.0f}")
         avg_cm3_c = filtered["CM3%"].mean()
-        d3.metric("Avg CM3 %", f"{avg_cm3_c:.0f}" if pd.notna(avg_cm3_c) else "—")
+        d3.metric("Avg CM3 %", f"{avg_cm3_c:.1f}" if pd.notna(avg_cm3_c) else "—")
         d4.metric("Total units", f"{filtered['Units'].sum():,.0f}")
         avg_mom_c = filtered["Rev Δ 4w %"].mean() if "Rev Δ 4w %" in filtered.columns else pd.NA
-        d5.metric("Avg Rev Δ 4w %", f"{avg_mom_c:+.0f}%" if pd.notna(avg_mom_c) else "—")
+        d5.metric("Avg Rev Δ 4w %", f"{avg_mom_c:+.1f}%" if pd.notna(avg_mom_c) else "—")
 
     toggle_col1, toggle_col2 = st.columns(2)
     below_target_only = toggle_col1.checkbox(
@@ -1430,11 +1430,11 @@ with tab_overview:
 
     fmt_euro = JsCode("function(p){return p.value==null?'—':'€'+Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
     fmt_int = JsCode("function(p){return p.value==null?'—':Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
-    fmt_pct = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(0)+'%';}")
-    fmt_pct_signed = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(0)+'%';}")
-    fmt_pp = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(0)+' pp';}")
+    fmt_pct = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(1)+'%';}")
+    fmt_pct_signed = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(1)+'%';}")
+    fmt_pp = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(1)+' pp';}")
     fmt_float2 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(0);}")
-    fmt_float1 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(0);}")
+    fmt_float1 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(1);}")
 
     style_cm3 = JsCode(
         f"function(p){{if(p.value==null)return null;"
@@ -1828,9 +1828,9 @@ with tab_trend:
                     st.dataframe(
                         sub[show_cols].style.format({
                             "Product Sales": "€{:,.0f}",
-                            "Start CM3%": "{:.0f}%",
-                            "End CM3%": "{:.0f}%",
-                            "Change": "{:+.0f} pp",
+                            "Start CM3%": "{:.1f}%",
+                            "End CM3%": "{:.1f}%",
+                            "Change": "{:+.1f} pp",
                             "Points": "{:.0f}",
                         }, na_rep="—"),
                         width="stretch", hide_index=True,
@@ -1908,7 +1908,7 @@ with tab_slow:
                       f"€{tied:,.0f}" if pd.notna(tied) and tied > 0 else "—",
                       help="FBA Available × avg unit price (sales / units over the selected period).")
             avg_cm3_slow = pd.to_numeric(slow.get("CM3%"), errors="coerce").mean()
-            k4.metric("Avg CM3 %", f"{avg_cm3_slow:.0f}%" if pd.notna(avg_cm3_slow) else "—")
+            k4.metric("Avg CM3 %", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—")
 
             # Pull current comments (same store the Overview tab edits) so any
             # note added here ↔ shows up on the other tab automatically.
@@ -1942,16 +1942,16 @@ with tab_slow:
                     "Product": st.column_config.TextColumn("Product", disabled=True, width="large"),
                     "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
                     "FBA Available": st.column_config.NumberColumn("FBA Avail.", format="%d", disabled=True),
-                    "Sales Velocity": st.column_config.NumberColumn("Velocity / d", format="%d", disabled=True),
+                    "Sales Velocity": st.column_config.NumberColumn("Velocity / d", format="%.1f", disabled=True),
                     "Days of Supply": st.column_config.NumberColumn(
                         "Days of Supply", format="%d", disabled=True,
                         help=f"Orange ≥ {dos_threshold} d (your threshold); red ≥ {dos_threshold*2} d (critical).",
                     ),
-                    "Avg unit price": st.column_config.NumberColumn("Avg unit price", format="€%d", disabled=True),
+                    "Avg unit price": st.column_config.NumberColumn("Avg unit price", format="€%.1f", disabled=True),
                     "Tied-up value": st.column_config.NumberColumn("Tied-up value", format="€%d", disabled=True),
                     "Product Sales": st.column_config.NumberColumn("Sales (€)", format="€%d", disabled=True),
                     "Units": st.column_config.NumberColumn("Units", format="%d", disabled=True),
-                    "CM3%": st.column_config.NumberColumn("CM3 %", format="%d%%", disabled=True),
+                    "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
                     "Comments": st.column_config.TextColumn(
                         (f"Comments — all countries (read-only)" if is_all_countries
                          else f"Comments — {_country_tag(marketplace)} ✏"),
