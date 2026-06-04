@@ -366,7 +366,7 @@ def _gist_config():
     return (gist_id, token) if (token and gist_id) else (None, None)
 
 
-def _load_comments_from_gist(gist_id: str, token: str) -> dict[str, str] | None:
+def _load_comments_from_gist(gist_id: str, token: str):
     import requests
     r = requests.get(
         f"https://api.github.com/gists/{gist_id}",
@@ -378,13 +378,12 @@ def _load_comments_from_gist(gist_id: str, token: str) -> dict[str, str] | None:
     files = r.json().get("files", {})
     content = (files.get(GIST_FILE) or {}).get("content", "{}")
     try:
-        data = json.loads(content)
-        return {str(k): str(v) for k, v in data.items()}
+        return json.loads(content)
     except Exception:
         return {}
 
 
-def _save_comments_to_gist(gist_id: str, token: str, comments: dict[str, str]) -> bool:
+def _save_comments_to_gist(gist_id: str, token: str, comments: dict) -> bool:
     import requests
     body = {"files": {GIST_FILE: {"content": json.dumps(comments, indent=2, ensure_ascii=False)}}}
     r = requests.patch(
@@ -396,55 +395,135 @@ def _save_comments_to_gist(gist_id: str, token: str, comments: dict[str, str]) -
     return r.status_code == 200
 
 
-def load_comments() -> dict[str, str]:
+# Marker key used for legacy single-string comments migrated from the old
+# flat-by-SKU schema. Rendered with a "[legacy]" prefix wherever shown.
+LEGACY_KEY = "_legacy"
+
+
+def _normalise_comments(raw: dict) -> dict:
+    """Migrate any flat {sku: str} entries to the nested per-country format
+    {sku: {country: text}}. Idempotent — safe to run on already-normalised
+    data.
+    """
+    out: dict[str, dict[str, str]] = {}
+    for sku, val in (raw or {}).items():
+        if not sku:
+            continue
+        if isinstance(val, dict):
+            inner = {str(k): str(v) for k, v in val.items() if v and str(v).strip()}
+            if inner:
+                out[sku] = inner
+        elif isinstance(val, str) and val.strip():
+            out[sku] = {LEGACY_KEY: val.strip()}
+    return out
+
+
+def load_comments() -> dict:
+    """Returns nested dict: {sku: {country: text}}.
+    Country can be a marketplace name (e.g. 'amazon.de') or '_legacy'.
+    """
     gist_id, token = _gist_config()
     if gist_id and token:
         remote = _load_comments_from_gist(gist_id, token)
         if remote is not None:
-            return remote
+            return _normalise_comments(remote)
     if not COMMENTS_PATH.exists():
         return {}
     try:
-        return {str(k): str(v) for k, v in json.loads(COMMENTS_PATH.read_text()).items()}
+        return _normalise_comments(json.loads(COMMENTS_PATH.read_text()))
     except Exception:
         return {}
 
 
-def persist_comment_edits(edited_skus, edited_comments):
-    """Diff comments column against st.session_state['comments'], persist on change.
+def _country_tag(marketplace: str) -> str:
+    """Short tag for display: 'amazon.de' → 'DE'."""
+    if not marketplace or marketplace == LEGACY_KEY:
+        return "*"
+    return marketplace.replace("amazon.", "").replace("co.uk", "uk").upper()
 
-    Used by both the Overview AgGrid and the Slow movers data_editor so the
-    Comments column is a single store keyed by SKU.
+
+def comment_for_view(sku: str, marketplace: str, store: dict) -> str:
+    """Build the displayable Comments string for one SKU in a given view.
+
+    - Single-country view: return that country's note, with '[legacy] '
+      prefix if only a migrated legacy comment exists.
+    - All-countries view (marketplace == None or '__all__'): concatenate
+      every per-country note prefixed by country tag, plus any legacy.
     """
-    new_comments = dict(st.session_state.get("comments", {}))
+    entry = store.get(sku) or {}
+    if not entry:
+        return ""
+    if marketplace and marketplace != "__all__":
+        own = entry.get(marketplace)
+        if own:
+            return own
+        legacy = entry.get(LEGACY_KEY)
+        return f"[legacy] {legacy}" if legacy else ""
+    # All-countries: concatenate all known scopes
+    parts = []
+    for mp, note in entry.items():
+        if not note:
+            continue
+        if mp == LEGACY_KEY:
+            parts.append(f"[*] {note}")
+        else:
+            parts.append(f"[{_country_tag(mp)}] {note}")
+    return "  ·  ".join(parts)
+
+
+def persist_comment_edits(edited_skus, edited_comments, marketplace: str | None) -> bool:
+    """Diff Comments column against the store and persist per-(SKU, country).
+
+    The marketplace argument is the current view's marketplace; pass None /
+    '__all__' for the All-countries view (in which case the column is
+    read-only and we no-op).
+    """
+    if not marketplace or marketplace == "__all__":
+        return False  # All-countries view is read-only; ignore edits
+    store: dict[str, dict[str, str]] = dict(st.session_state.get("comments", {}))
     changed = False
     for sku, comment in zip(edited_skus, edited_comments):
-        # Skip the adjustment marker so users can't accidentally drop it.
         text = (str(comment) if comment is not None else "")
         # Strip the auto-injected '✱ ADJUSTED: ... |' prefix when persisting,
-        # so only the user's own note round-trips into comments.json.
+        # so only the user's own note round-trips.
         if "✱ ADJUSTED" in text and "|" in text:
             text = text.split("|", 1)[1]
+        # Also strip a '[legacy] ' prefix — that's display chrome, not user input.
+        if text.startswith("[legacy] "):
+            text = text[len("[legacy] "):]
         text = text.strip()
-        prev = new_comments.get(sku, "")
-        if text != prev:
-            if text:
-                new_comments[sku] = text
-            elif sku in new_comments:
-                del new_comments[sku]
-            changed = True
+        entry = dict(store.get(sku, {}))
+        prev = entry.get(marketplace, "")
+        if text == prev:
+            continue
+        if text:
+            entry[marketplace] = text
+            # Once the user has written a country-specific note, clear the
+            # legacy slot so it doesn't keep prefixing the cell.
+            entry.pop(LEGACY_KEY, None)
+        else:
+            entry.pop(marketplace, None)
+        if entry:
+            store[sku] = entry
+        elif sku in store:
+            del store[sku]
+        changed = True
     if changed:
-        st.session_state["comments"] = new_comments
+        st.session_state["comments"] = store
         try:
-            st.session_state["comments_status"] = save_comments(new_comments)
+            st.session_state["comments_status"] = save_comments(store)
         except Exception as exc:
             st.session_state["comments_status"] = f"save failed: {exc}"
     return changed
 
 
-def save_comments(comments: dict[str, str]) -> str:
-    """Return a short status string for UI display."""
-    clean = {k: v for k, v in comments.items() if v and v.strip()}
+def save_comments(comments: dict) -> str:
+    """Return a short status string for UI display. Stores nested format."""
+    clean = {
+        sku: {k: v for k, v in (entry or {}).items() if v and str(v).strip()}
+        for sku, entry in (comments or {}).items()
+    }
+    clean = {sku: inner for sku, inner in clean.items() if inner}
     try:
         COMMENTS_PATH.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
     except Exception:
@@ -1204,9 +1283,16 @@ with tab_overview:
         filtered = filtered[filtered["CM3%"] < target_cm3]
 
     # ----- Per-SKU comments (loaded from comments.json) -----
+    # Comments are stored per (SKU, country). In a single-country view the
+    # cell shows / edits that country's note. In All-countries view it shows
+    # every country's note concatenated, read-only.
     if "comments" not in st.session_state:
         st.session_state["comments"] = load_comments()
-    filtered["Comments"] = filtered["SKU"].map(st.session_state["comments"]).fillna("")
+    comment_scope = "__all__" if is_all_countries else marketplace
+    filtered["Comments"] = [
+        comment_for_view(sku, comment_scope, st.session_state["comments"])
+        for sku in filtered["SKU"]
+    ]
     # Surface manual-adjustment notes from adjustments.json so adjusted rows
     # are visibly marked in the table.
     if adj_notes:
@@ -1378,9 +1464,12 @@ with tab_overview:
                             "function(p){return (p.data && p.data['Product Full']) || p.value;}"
                         )),
         "Product Full": dict(hide=True),
-        "Comments": dict(editable=True, width=300,
-                         headerName="Comments ✏",
-                         cellStyle=_style({"backgroundColor": "#FFFDE7"})),
+        "Comments": dict(
+            editable=not is_all_countries, width=300,
+            headerName=("Comments (all countries — read-only)" if is_all_countries else "Comments ✏"),
+            cellStyle=_style({"backgroundColor": "#FFFDE7"}),
+            wrapText=True, autoHeight=True,
+        ),
         "Cluster": dict(width=230, cellStyle=style_cluster_full),
         "Cluster Code": dict(hide=True),
         "Margin Tier": dict(hide=True),
@@ -1437,8 +1526,10 @@ with tab_overview:
     edited = pd.DataFrame(grid_response["data"]) if grid_response and "data" in grid_response else table_for_grid
 
     # Persist any comment changes back to comments.json / session.
+    # All-countries view is read-only (the cell is a concatenation of every
+    # country's note); persist_comment_edits will no-op in that case.
     if "Comments" in edited.columns and "SKU" in edited.columns:
-        persist_comment_edits(edited["SKU"], edited["Comments"])
+        persist_comment_edits(edited["SKU"], edited["Comments"], comment_scope)
 
     # Always show a small status line so the user knows whether edits persist.
     status = st.session_state.get("comments_status")
@@ -1718,7 +1809,11 @@ with tab_slow:
             # note added here ↔ shows up on the other tab automatically.
             if "comments" not in st.session_state:
                 st.session_state["comments"] = load_comments()
-            slow["Comments"] = slow["SKU"].map(st.session_state["comments"]).fillna("")
+            slow_scope = "__all__" if is_all_countries else marketplace
+            slow["Comments"] = [
+                comment_for_view(sku, slow_scope, st.session_state["comments"])
+                for sku in slow["SKU"]
+            ]
 
             show_cols = [c for c in [
                 "SKU", "Product", "Cluster",
@@ -1749,8 +1844,13 @@ with tab_slow:
                     "Units": st.column_config.NumberColumn("Units", format="%d", disabled=True),
                     "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
                     "Comments": st.column_config.TextColumn(
-                        "Comments ✏",
-                        help="Free-text note per SKU. Synced with the Overview tab's Comments column.",
+                        ("Comments (all countries — read-only)"
+                         if is_all_countries else "Comments ✏"),
+                        help=(
+                            "Read-only in All countries view (concatenated note from every "
+                            "marketplace). Pick a single country to edit." if is_all_countries
+                            else "Free-text note per SKU + country. Synced with the Overview tab."),
+                        disabled=is_all_countries,
                         width="medium",
                     ),
                 },
@@ -1760,7 +1860,7 @@ with tab_slow:
             # so notes typed on Slow movers immediately appear on Overview and
             # vice versa, all backed by the same Gist/local file.
             if "Comments" in slow_edited.columns and "SKU" in slow_edited.columns:
-                persist_comment_edits(slow_edited["SKU"], slow_edited["Comments"])
+                persist_comment_edits(slow_edited["SKU"], slow_edited["Comments"], slow_scope)
 
             st.download_button(
                 "Download slow movers (CSV)",
