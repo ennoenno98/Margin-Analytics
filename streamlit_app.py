@@ -1455,7 +1455,7 @@ with tab_overview:
     }
 
     display_cols = [
-        "SKU", "Product", "Comments", "Global note", "Cluster",
+        "SKU", "Product", "Global note", "Comments", "Cluster",
         "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior", "P&L Impact",
         "Sponsored Spend",
