@@ -23,7 +23,7 @@ CHART = ROOT / "reports" / "_oos_sheet_example.png"
 # Model parameters (match oos_analytics.py defaults).
 W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 3.0, 30
 PPC_CUT, PRICE_UP, MIN_PPC = 0.5, 0.08, 2.0
-SKU, MKT = "VV-VITA-208", "amazon.de"
+SKU, MKT = "VV-VITA-216", "amazon.de"
 
 # ---------- compute the example SKU's daily series ----------
 mp = ROOT / "novadata_exports/margin_export_2026-06-03.csv.gz"
@@ -100,9 +100,19 @@ summ = dict(
 )
 title_en = pd.read_csv(ROOT / "product_titles_en.csv", dtype=str).set_index("SKU")["Title"].get(SKU, SKU)
 
-# ---------- chart (Nov-Dec window) ----------
-win = pd.date_range("2025-11-01", "2025-12-31")
+# ---------- chart: auto-pick the ~75-day window that best shows BOTH ----------
+OOS_LBLS = ["Physical OOS", "Critically low (<3d)", "Marketplace gap"]
+is_oos = panel["label"].isin(OOS_LBLS).astype(int)
+is_cd = (panel["label"] == "Cooling down").astype(int)
+ro = is_oos.rolling(75, min_periods=1).sum()
+rc = is_cd.rolling(75, min_periods=1).sum()
+score = pd.concat([ro, rc], axis=1).min(axis=1)   # window with both present
+w_end = score.idxmax(); w_start = w_end - pd.Timedelta(days=74)
+win = pd.date_range(w_start, w_end)
 p = panel.reindex(win)
+w_oos = int(p["label"].isin(["Physical OOS", "Critically low (<3d)", "Marketplace gap"]).sum())
+w_cd = int((p["label"] == "Cooling down").sum())
+w_hi, w_lo, w_reach = p.eu_stock.max(), p.eu_stock.min(), p.dos.min()
 fig, ax = plt.subplots(figsize=(9, 3.4))
 ax.bar(win, p.units.values, color="#2a9d8f", label="Units sold/day")
 ax.plot(win, p["exp"].values, color="#264653", lw=1.6, ls=":", label="Expected demand (lambda)")
@@ -114,14 +124,18 @@ for c, col in shade.items():
 ax2 = ax.twinx()
 ax2.plot(win, p.eu_stock.values, color="#8d99ae", lw=1.6, label="EU stock (ledger)")
 ax.set_ylabel("Units / day"); ax2.set_ylabel("EU sellable stock")
-ax.set_title(f"{SKU} ({title_en}) — {MKT}: Nov-Dec 2025")
+ax.set_title(f"{SKU} ({title_en}) — {MKT}: {w_start:%d %b} – {w_end:%d %b %Y}")
 h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
 ax.legend(h1 + h2, l1 + l2, loc="upper center", fontsize=7.5, ncol=3)
 fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(CHART, dpi=150); plt.close(fig)
 
-# representative rows
-ex = panel.reindex(pd.date_range("2025-11-16", "2025-12-18"))
-ex = ex[ex.index.isin(pd.date_range("2025-11-16", "2025-12-18", freq="2D")) | (ex["label"] != "—")]
+# representative rows: ensure both cooling-down and OOS days are shown
+exw = panel.reindex(win)
+ex = pd.concat([
+    exw[exw["label"] == "Cooling down"].head(8),
+    exw[exw["label"].isin(OOS_LBLS)].head(10),
+    exw[exw["label"] == "—"].iloc[::15].head(4),
+]).drop_duplicates().sort_index()
 rows = [["Date", "Units", "λ", "EU stk", "Reach", "Price", "Category", "Lost €", "Miss €"]]
 for dt, r in ex.head(22).iterrows():
     rows.append([dt.strftime("%m-%d"), f"{r.units:.0f}", f"{r['exp']:.0f}",
@@ -215,10 +229,14 @@ P(f"<b>{SKU} — {title_en}</b>, {MKT}. Full year on this marketplace: "
   f"(miss €{eu_(summ['miss_rev'])} revenue / €{eu_(summ['miss_cm3'])} CM3).")
 E.append(Image(str(CHART), width=16.5*cm, height=6.2*cm))
 gap(0.15)
-P("Nov–Dec 2025: EU stock fell from ~800 to ~30 units for a SKU selling 30–50/day "
-  "(reach collapsed). Sales flatlined for ~2 weeks until the 16 Dec restock. The "
-  "EU balance never hit literally zero (floor ~23), so the <b>reach &lt; 3</b> "
-  "rule — not a balance-of-zero rule — is what flags this real lost-sales episode.")
+P(f"Highlighted window {w_start:%d %b %Y} – {w_end:%d %b %Y}: EU stock ranged "
+  f"from ~{eu_(w_hi)} down to ~{eu_(w_lo)} units and reach bottomed at "
+  f"~{w_reach:.0f} day(s). In this window the model flagged <b>{w_oos} OOS day(s)</b> "
+  f"(red/orange shading) and <b>{w_cd} cooling-down day(s)</b> (purple) — the SKU "
+  "was throttled (price up / ad spend cut) while stock was tight, then went into "
+  "genuine stock-out as reach collapsed. Note the balance rarely hits literally "
+  "zero, so the <b>reach &lt; 3</b> rule, not a balance-of-zero rule, is what "
+  "catches the hard stock-out.")
 gap(0.15)
 P("Representative days (Lost/Miss shown as CM3 €):", small)
 E.append(mktable(rows, col_w=[1.5*cm, 1.2*cm, 1.0*cm, 1.4*cm, 1.3*cm, 1.4*cm,
