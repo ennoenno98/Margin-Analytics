@@ -23,7 +23,7 @@ CHART = ROOT / "reports" / "_oos_sheet_example.png"
 # Model parameters (match oos_analytics.py defaults).
 W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 3.0, 30
 PPC_CUT, PRICE_UP, MIN_PPC = 0.5, 0.08, 2.0
-SKU, MKT = "VV-VITA-216", "amazon.de"
+SKU, MKT = "VV-VITA-231", "amazon.de"
 
 # ---------- compute the example SKU's daily series ----------
 mp = ROOT / "novadata_exports/margin_export_2026-06-03.csv.gz"
