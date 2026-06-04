@@ -400,20 +400,35 @@ def _gist_config():
 
 
 def _load_comments_from_gist(gist_id: str, token: str):
+    """Return (data, detail). data is None on failure; detail explains why."""
     import requests
-    r = requests.get(
-        f"https://api.github.com/gists/{gist_id}",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-        timeout=10,
-    )
-    if r.status_code != 200:
-        return None
-    files = r.json().get("files", {})
-    content = (files.get(GIST_FILE) or {}).get("content", "{}")
     try:
-        return json.loads(content)
+        r = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+    except Exception as exc:
+        return None, f"network error: {exc!s}"
+    if r.status_code == 200:
+        files = r.json().get("files", {})
+        content = (files.get(GIST_FILE) or {}).get("content", "{}")
+        try:
+            return json.loads(content), "ok"
+        except Exception:
+            return {}, "Gist content isn't valid JSON — starting from {}"
+    msg = {
+        401: "401 — token rejected (invalid / expired)",
+        403: "403 — token lacks Gists: read & write, or belongs to a different user",
+        404: "404 — Gist ID not found by this token",
+    }.get(r.status_code, f"HTTP {r.status_code}")
+    try:
+        body_msg = r.json().get("message")
+        if body_msg:
+            msg = f"{msg}: {body_msg}"
     except Exception:
-        return {}
+        pass
+    return None, msg
 
 
 def _save_comments_to_gist(gist_id: str, token: str, comments: dict):
@@ -493,12 +508,21 @@ def _normalise_comments(raw: dict) -> dict:
 def load_comments() -> dict:
     """Returns nested dict: {sku: {country: text}}.
     Country can be a marketplace name (e.g. 'amazon.de') or '_legacy'.
+    Also writes the read result into st.session_state['comments_status'] so
+    the UI can immediately surface a misconfigured Gist on page load (instead
+    of waiting for the user to edit a cell).
     """
     gist_id, token = _gist_config()
     if gist_id and token:
-        remote = _load_comments_from_gist(gist_id, token)
+        remote, detail = _load_comments_from_gist(gist_id, token)
         if remote is not None:
+            st.session_state["comments_status"] = (
+                "synced to Gist ✓" if detail == "ok" else f"loaded from Gist with warning: {detail}"
+            )
             return _normalise_comments(remote)
+        st.session_state["comments_status"] = (
+            f"Gist read failed ({detail}) — falling back to session-only ⚠"
+        )
     if not COMMENTS_PATH.exists():
         return {}
     try:
@@ -1660,22 +1684,38 @@ with tab_overview:
             edited_global=edited["Global note"] if "Global note" in edited.columns else None,
         )
 
-    # Always show a small status line so the user knows whether edits persist.
+    # Status line + a Test button so the operator can poke Gist credentials
+    # without having to edit a comment first.
     status = st.session_state.get("comments_status")
     gist_id, token = _gist_config()
-    if status:
-        if "✓" in status:
-            st.success(f"Comments {status}")
-        elif "⚠" in status or "failed" in status:
-            st.warning(f"Comments {status}")
-        else:
-            st.caption(f"Comments — {status}")
-    elif not (gist_id and token):
-        st.caption(
-            "Comments are kept for this session only. To persist across "
-            "container reboots, set `GITHUB_TOKEN` and `COMMENTS_GIST_ID` "
-            "in the Streamlit Cloud secrets (see README)."
-        )
+    status_col, btn_col = st.columns([5, 1])
+    with status_col:
+        if status:
+            if "✓" in status:
+                st.success(f"Comments {status}")
+            elif "⚠" in status or "failed" in status:
+                st.warning(f"Comments {status}")
+            else:
+                st.caption(f"Comments — {status}")
+        elif not (gist_id and token):
+            st.caption(
+                "Comments are kept for this session only. To persist across "
+                "container reboots, set `GITHUB_TOKEN` and `COMMENTS_GIST_ID` "
+                "in the Streamlit Cloud secrets (see README)."
+            )
+    with btn_col:
+        if gist_id and token and st.button("Test Gist", help="Try a read + write round-trip against the configured Gist and report the exact result."):
+            data, read_detail = _load_comments_from_gist(gist_id, token)
+            if data is None:
+                st.session_state["comments_status"] = f"Gist read failed ({read_detail}) ⚠"
+            else:
+                # Round-trip the same payload so we exercise the write path too.
+                ok, write_detail = _save_comments_to_gist(gist_id, token, data)
+                if ok:
+                    st.session_state["comments_status"] = "synced to Gist ✓  (test passed)"
+                else:
+                    st.session_state["comments_status"] = f"Gist write failed ({write_detail}) — session only ⚠"
+            st.rerun()
 
     dl_col1, dl_col2 = st.columns([1, 1])
     dl_col1.download_button(
