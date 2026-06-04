@@ -416,6 +416,20 @@ def short_product(name, n: int = 45) -> str:
     return head if len(head) <= n else head[: n - 1].rstrip() + "…"
 
 
+@st.cache_data(show_spinner=False)
+def load_english_titles(path: Path) -> pd.Series:
+    """SKU -> English product title, from product_titles_en.csv (Shopify export).
+
+    Lets the dashboard show a consistent English name; the Novadata title is
+    kept as the fallback for SKUs not present in the Shopify catalog.
+    """
+    if not path.exists():
+        return pd.Series(dtype="object")
+    t = pd.read_csv(path, dtype=str).dropna(subset=["SKU", "Title"])
+    t["SKU"] = t["SKU"].str.strip()
+    return t.drop_duplicates("SKU").set_index("SKU")["Title"]
+
+
 def stockout_events(scope: pd.DataFrame) -> pd.DataFrame:
     """Collapse consecutive OOS days into events per SKU×marketplace."""
     d = scope[scope["oos"]].copy()
@@ -476,7 +490,10 @@ if margin_path is None:
     st.stop()
 
 long_all, meta, asof, eu = compute_oos_long(margin_path, ledger_path)
-prod_map = meta.set_index("SKU")["Product"]
+prod_map = meta.set_index("SKU")["Product"].astype("object")
+en_titles = load_english_titles(REPO_ROOT / "product_titles_en.csv")
+if not en_titles.empty:
+    prod_map.update(en_titles)             # prefer English where we have it
 prod_short = prod_map.map(short_product)   # readable names for tables
 brand_map = meta.set_index("SKU")["Brand"]
 inv = inventory_status(eu, asof)
