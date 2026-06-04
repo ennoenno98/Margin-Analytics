@@ -388,11 +388,32 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
 
 
 # ---------- Helpers ----------
-def eur(x: float) -> str:
+def _eu(s: str) -> str:
+    """Swap US grouping/decimal to European: 1,234.5 -> 1.234,5."""
+    return s.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+def fmt_num(x: float, dec: int = 0) -> str:
+    """European-formatted number (dot thousands, comma decimals)."""
     try:
-        return f"€{x:,.0f}"
+        return _eu(f"{x:,.{dec}f}")
     except (TypeError, ValueError):
         return "—"
+
+
+def eur(x: float) -> str:
+    try:
+        return "€" + _eu(f"{x:,.0f}")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def short_product(name, n: int = 45) -> str:
+    """Readable short product name: the part before the first '|', trimmed."""
+    if not isinstance(name, str):
+        return ""
+    head = name.split("|", 1)[0].strip()
+    return head if len(head) <= n else head[: n - 1].rstrip() + "…"
 
 
 def stockout_events(scope: pd.DataFrame) -> pd.DataFrame:
@@ -456,6 +477,7 @@ if margin_path is None:
 
 long_all, meta, asof, eu = compute_oos_long(margin_path, ledger_path)
 prod_map = meta.set_index("SKU")["Product"]
+prod_short = prod_map.map(short_product)   # readable names for tables
 brand_map = meta.set_index("SKU")["Brand"]
 inv = inventory_status(eu, asof)
 inv_stock = inv.set_index("SKU")["cur_stock"] if not inv.empty else pd.Series(dtype=float)
@@ -544,12 +566,12 @@ agg = agg.sort_values("lost_cm3", ascending=False)
 
 # ---------- KPI tiles ----------
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("SKUs affected", f"{agg['SKU'].nunique():,}")
+k1.metric("SKUs affected", fmt_num(agg["SKU"].nunique()))
 k2.metric("Lost revenue", eur(agg["lost_rev"].sum()))
 k3.metric("Lost CM3 (P&L impact)", eur(agg["lost_cm3"].sum()))
-k4.metric("Lost units", f"{agg['lost_units'].sum():,.0f}")
+k4.metric("Lost units", fmt_num(agg["lost_units"].sum()))
 phys_days = int((oos_rows["cause"] == "Physical (network)").sum())
-k5.metric("Physical stock-out days", f"{phys_days:,}")
+k5.metric("Physical stock-out days", fmt_num(phys_days))
 st.caption(
     f"Data through **{asof.date()}** · scope **{start.date()} → {end.date()}** "
     f"· marketplace **{market}**. Lost CM3 is the estimated contribution margin "
@@ -588,11 +610,11 @@ with tab1:
     st.dataframe(
         table, width="stretch", hide_index=True, height=520,
         column_config={
-            "Lost revenue (€)": st.column_config.NumberColumn(format="€%.0f"),
-            "Lost CM3 (€)": st.column_config.NumberColumn(format="€%.0f"),
-            "Lost units": st.column_config.NumberColumn(format="%.0f"),
-            "Current FBA stock": st.column_config.NumberColumn(format="%.0f"),
-            "Days of supply": st.column_config.NumberColumn(format="%.0f"),
+            "Lost revenue (€)": st.column_config.NumberColumn(format="euro"),
+            "Lost CM3 (€)": st.column_config.NumberColumn(format="euro"),
+            "Lost units": st.column_config.NumberColumn(format="localized"),
+            "Current FBA stock": st.column_config.NumberColumn(format="localized"),
+            "Days of supply": st.column_config.NumberColumn(format="localized"),
             "OOS rate %": st.column_config.ProgressColumn(
                 format="%.1f%%", min_value=0, max_value=100),
         },
@@ -685,10 +707,10 @@ with tab3:
         low = risk[(risk["days_of_supply"] < LOW_STOCK_DAYS)
                    | (risk["cur_stock"] <= 0)].sort_values("days_of_supply")
         r1, r2, r3 = st.columns(3)
-        r1.metric("SKUs currently out of stock", f"{int((risk['cur_stock'] <= 0).sum()):,}")
+        r1.metric("SKUs currently out of stock", fmt_num(int((risk["cur_stock"] <= 0).sum())))
         r2.metric(f"Low stock (< {LOW_STOCK_DAYS}d supply)",
-                  f"{int((risk['days_of_supply'] < LOW_STOCK_DAYS).sum()):,}")
-        r3.metric("Units in transit (sel.)", f"{risk['in_transit'].sum():,.0f}")
+                  fmt_num(int((risk["days_of_supply"] < LOW_STOCK_DAYS).sum())))
+        r3.metric("Units in transit (sel.)", fmt_num(risk["in_transit"].sum()))
         st.subheader(f"Stock-out risk — replenish first (as of {asof.date()})")
         disp = low[["SKU", "Product", "cur_stock", "in_transit",
                     "avg_daily_demand", "days_of_supply"]].rename(columns={
@@ -697,10 +719,10 @@ with tab3:
         st.dataframe(
             disp, width="stretch", hide_index=True, height=460,
             column_config={
-                "Current stock": st.column_config.NumberColumn(format="%.0f"),
-                "In transit": st.column_config.NumberColumn(format="%.0f"),
-                "Avg demand/day": st.column_config.NumberColumn(format="%.1f"),
-                "Days of supply": st.column_config.NumberColumn(format="%.0f")})
+                "Current stock": st.column_config.NumberColumn(format="localized"),
+                "In transit": st.column_config.NumberColumn(format="localized"),
+                "Avg demand/day": st.column_config.NumberColumn(format="localized"),
+                "Days of supply": st.column_config.NumberColumn(format="localized")})
         st.caption("Days of supply = current EU sellable stock ÷ trailing 30-day "
                    "average units shipped. Sorted lowest-first.")
 
@@ -721,14 +743,14 @@ with tab4:
             "lost_cm3": "Lost CM3 (€)"})
         disp["Start"] = disp["Start"].dt.date
         disp["End"] = disp["End"].dt.date
-        st.caption(f"{len(disp):,} discrete stock-out events · "
+        st.caption(f"{fmt_num(len(disp))} discrete stock-out events · "
                    f"longest {int(ev['Days'].max())} days.")
         st.dataframe(
             disp, width="stretch", hide_index=True, height=520,
             column_config={
-                "Lost revenue (€)": st.column_config.NumberColumn(format="€%.0f"),
-                "Lost CM3 (€)": st.column_config.NumberColumn(format="€%.0f"),
-                "Lost units": st.column_config.NumberColumn(format="%.0f")})
+                "Lost revenue (€)": st.column_config.NumberColumn(format="euro"),
+                "Lost CM3 (€)": st.column_config.NumberColumn(format="euro"),
+                "Lost units": st.column_config.NumberColumn(format="localized")})
         st.download_button(
             "⬇️ Download events (CSV)", disp.to_csv(index=False).encode("utf-8"),
             file_name=f"oos_events_{start.date()}_{end.date()}.csv", mime="text/csv")
@@ -750,10 +772,10 @@ with tab5:
                 "thresholds in 'Cooling-down detection settings' above.")
     else:
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("SKUs cooled down", f"{cd['SKU'].nunique():,}")
+        m1.metric("SKUs cooled down", fmt_num(cd["SKU"].nunique()))
         m2.metric("Revenue miss", eur(cd["rev_miss"].sum()))
         m3.metric("CM3 miss", eur(cd["cm3_miss"].sum()))
-        m4.metric("Cool-down SKU-days", f"{len(cd):,}")
+        m4.metric("Cool-down SKU-days", fmt_num(len(cd)))
 
         cagg = (
             cd.groupby("SKU", observed=True)
@@ -769,9 +791,9 @@ with tab5:
         st.dataframe(
             table, width="stretch", hide_index=True, height=460,
             column_config={
-                "Revenue miss (€)": st.column_config.NumberColumn(format="€%.0f"),
-                "CM3 miss (€)": st.column_config.NumberColumn(format="€%.0f"),
-                "Units miss": st.column_config.NumberColumn(format="%.0f")})
+                "Revenue miss (€)": st.column_config.NumberColumn(format="euro"),
+                "CM3 miss (€)": st.column_config.NumberColumn(format="euro"),
+                "Units miss": st.column_config.NumberColumn(format="localized")})
         st.download_button(
             "⬇️ Download cooling-down (CSV)", table.to_csv(index=False).encode("utf-8"),
             file_name=f"oos_cooldown_{start.date()}_{end.date()}.csv", mime="text/csv")
