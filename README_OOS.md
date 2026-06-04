@@ -15,7 +15,7 @@ It combines two Amazon sources:
 
 | Source | Path | Gives |
 | --- | --- | --- |
-| **FBA Inventory Ledger** | `amazon_ledger/inventory_ledger_*.csv.gz` | Real daily warehouse balance + customer shipments per SKU per fulfilment country → true physical stock-outs, actual demand, days-of-supply / low-stock risk. |
+| **FBA Inventory Ledger** | `amazon_ledger/inventory_ledger_*.csv.gz` | Real daily warehouse balance + customer shipments per SKU. The seller runs **Pan-EU**, so stock is pooled across the network → physical OOS only when the whole EU balance hits zero. Powers true physical stock-outs, actual demand, days-of-supply / low-stock risk. |
 | **Novadata margin export** | `novadata_exports/margin_export_*.csv.gz` | Per-SKU per-marketplace daily Units / Sales / CM3 → marketplace-level lost sales and the price + margin per unit to value lost units in €. |
 
 **Why hybrid?** With Pan-EU pooling the network is almost never at literally
@@ -37,8 +37,11 @@ A SKU × marketplace is **out of stock** on a day when **any** of:
    anomaly (this filter is what stops a thin marketplace's normal no-sale days
    from being mistaken for stock-outs).
 
-Each OOS day is tagged with its **cause** (Physical / Local-EFN / Marketplace
-gap) using the ledger's per-country balance.
+Each OOS day is tagged with its **cause**: *Physical (network)* when the EU pool
+is empty, otherwise *Marketplace gap* — sales stopped in that marketplace
+despite EU stock (offer suppression, buy-box loss, listing issue, …). Under
+Pan-EU an empty *local* warehouse is not a stock-out (the pool fulfils it), so
+there's no separate local cause.
 
 ### How impact is valued
 

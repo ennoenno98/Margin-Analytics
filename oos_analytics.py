@@ -11,13 +11,15 @@ Question it answers:
 HYBRID data model — it combines two Amazon sources:
 
   1. Amazon FBA Inventory Ledger  (amazon_ledger/inventory_ledger_*.csv.gz)
-     The authoritative daily warehouse balance + customer shipments per SKU per
-     fulfilment country. Gives the *true* physical stock-out signal, real
-     demand (units shipped), and forward-looking days-of-supply / low-stock
-     risk. Refreshed by uploading a new export to amazon_ledger/ (see
-     README_OOS.md). NOTE: with Pan-EU pooling the network is almost never at
-     literally zero stock, so a balance==0 rule alone barely fires — which is
-     why we layer the marketplace signal below.
+     The authoritative daily warehouse balance + customer shipments per SKU.
+     The seller runs Pan-EU, so availability is pooled across the network and a
+     SKU is physically out of stock only when the *whole* EU sellable balance
+     hits zero. Gives the true physical stock-out signal, real demand (units
+     shipped), and forward-looking days-of-supply / low-stock risk. Refreshed by
+     uploading a new export to amazon_ledger/ (see README_OOS.md). NOTE: under
+     Pan-EU the network is almost never at literally zero stock, so a balance==0
+     rule alone barely fires — which is why we layer the marketplace signal
+     below.
 
   2. Novadata daily margin export  (novadata_exports/margin_export_*.csv.gz)
      Per-SKU per-marketplace daily Units / Sales / CM3. Gives marketplace-level
@@ -29,8 +31,9 @@ A SKU×marketplace is OUT OF STOCK on a day when EITHER:
   * FBA Available is 0 (Novadata snapshot), OR
   * the marketplace went quiet: Units == 0 on a day enclosed by sales, for a
     SKU whose demand rate is high enough that selling nothing is a real anomaly.
-Each OOS day is tagged with its cause (Physical / Local-EFN / Marketplace gap)
-using the ledger's per-country balance.
+Each OOS day is tagged with its cause: "Physical (network)" when the EU pool is
+empty, otherwise "Marketplace gap" (sales stopped despite EU stock — offer
+suppression, buy-box loss, listing issue, …).
 
 Lost units = expected daily demand − whatever still sold; valued at the SKU's
 trailing avg price (→ lost revenue) and avg CM3 per unit (→ lost CM3, the P&L
@@ -63,12 +66,6 @@ BASELINE_WINDOW = 90       # trailing window for expected demand / price / CM3
 DEFAULT_MIN_DEMAND = 3.0   # min expected units/day to infer a marketplace gap
 TAIL_DAYS = 21             # treat trailing zero-runs near "today" as ongoing OOS
 LOW_STOCK_DAYS = 21        # days-of-supply threshold for the low-stock risk view
-
-# Sales marketplace -> FBA warehouse country (for tagging local/EFN stock-outs).
-MARKETPLACE_TO_WAREHOUSE = {
-    "amazon.de": "DE", "amazon.co.uk": "GB", "amazon.fr": "FR",
-    "amazon.it": "IT", "amazon.es": "ES", "amazon.ie": "IE", "amazon.se": "SE",
-}
 
 st.set_page_config(page_title="OOS Impact Analytics", page_icon="📦", layout="wide")
 
@@ -155,19 +152,17 @@ def load_margin(path: Path) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_ledger(path: Path | None):
-    """Amazon FBA Inventory Ledger → EU-pooled and per-country daily panels.
+    """Amazon FBA Inventory Ledger → EU-pooled daily panel.
 
-    Returns (eu, country):
-      eu      : one row per (SKU, Date) — sellable EU network balance, units
-                shipped to customers (demand), units in transit.
-      country : one row per (SKU, Location, Date) — sellable balance in that
-                warehouse country (used to tag local / EFN stock-outs).
-    Both empty if no ledger file is present (tool degrades to Novadata only).
+    Returns one row per (SKU, Date) — sellable EU network balance, units
+    shipped to customers (demand) and units in transit. The seller runs Pan-EU,
+    so availability is pooled across the network: a SKU is physically out of
+    stock only when the *whole* EU sellable balance hits zero. Empty if no
+    ledger file is present (the tool then degrades to Novadata signals only).
     """
     empty_eu = pd.DataFrame(columns=["SKU", "Date", "eu_stock", "shipped", "in_transit"])
-    empty_ct = pd.DataFrame(columns=["SKU", "Location", "Date", "local_stock"])
     if path is None:
-        return empty_eu, empty_ct
+        return empty_eu
     KEEP = {
         "Date", "MSKU", "Location", "Disposition",
         "Ending Warehouse Balance", "Customer Shipments",
@@ -187,12 +182,8 @@ def load_ledger(path: Path | None):
         in_transit=("In Transit Between Warehouses", "sum"),
     )
     eu["shipped"] = (-eu["shipped"]).clip(lower=0)  # outbound is negative
-    country = led.groupby(["SKU", "Location", "Date"], as_index=False).agg(
-        local_stock=("Ending Warehouse Balance", "sum")
-    )
     eu["SKU"] = eu["SKU"].astype(str)
-    country["SKU"] = country["SKU"].astype(str)
-    return eu, country
+    return eu
 
 
 @st.cache_data(show_spinner="Computing stock-out history…")
@@ -208,7 +199,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
       eu   : EU-pooled ledger panel (for the inventory & risk view).
     """
     df = load_margin(margin_path)
-    eu, country = load_ledger(ledger_path)
+    eu = load_ledger(ledger_path)
     keys = ["SKU", "Marketplace Name"]
 
     g = df.groupby(["Period"] + keys, observed=True, as_index=False).agg(
@@ -263,7 +254,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     long["recent"] = long["Period"] >= (asof - pd.Timedelta(days=TAIL_DAYS))
     long["fba_known"] = long["fba"].notna()
 
-    # --- Merge Amazon ledger signals ---
+    # --- Merge the EU-pooled Amazon ledger stock signal ---
     long["SKU"] = long["SKU"].astype(str)
     long["Marketplace Name"] = long["Marketplace Name"].astype(str)
     if not eu.empty:
@@ -272,16 +263,9 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
                           how="left").drop(columns=["Date"])
     else:
         long["eu_stock"] = np.nan
-    if not country.empty:
-        long["whs"] = long["Marketplace Name"].map(MARKETPLACE_TO_WAREHOUSE)
-        ct = country.rename(columns={"Location": "whs", "Date": "Period"})
-        long = long.merge(ct, on=["SKU", "whs", "Period"], how="left")
-        long = long.drop(columns=["whs"])
-    else:
-        long["local_stock"] = np.nan
 
     for col in ("units", "sales", "cm3", "fba", "expected", "avg_price",
-                "avg_cm3_pu", "eu_stock", "local_stock"):
+                "avg_cm3_pu", "eu_stock"):
         long[col] = long[col].astype("float32")
     for col in ("SKU", "Marketplace Name"):
         long[col] = long[col].astype("category")
@@ -302,8 +286,9 @@ def flag_oos(long: pd.DataFrame, min_demand: float) -> pd.DataFrame:
     has_future = long["has_future"].to_numpy(dtype=bool)
     recent = long["recent"].to_numpy(dtype=bool)
     eu_stock = long["eu_stock"].to_numpy()
-    local_stock = long["local_stock"].to_numpy()
 
+    # Pan-EU: a SKU is physically out of stock only when the whole EU network
+    # sellable balance is zero (local-warehouse zeros are served from the pool).
     phys_eu = ~np.isnan(eu_stock) & (eu_stock <= 0) & had_past
     oos_fba = fba_known & (fba == 0) & had_past
     oos_gap = (
@@ -312,11 +297,9 @@ def flag_oos(long: pd.DataFrame, min_demand: float) -> pd.DataFrame:
     )
     oos = phys_eu | oos_fba | oos_gap
 
-    local_zero = ~np.isnan(local_stock) & (local_stock <= 0)
     cause = np.where(
         phys_eu, "Physical (network)",
-        np.where(oos & local_zero, "Local / EFN stock-out",
-                 np.where(oos, "Marketplace gap", "")),
+        np.where(oos, "Marketplace gap", ""),
     )
 
     lost_units = np.where(oos, np.clip(expected - units, 0, None), 0.0)
