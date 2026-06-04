@@ -607,16 +607,17 @@ with tab1:
         "lost_rev": "Lost revenue (€)", "lost_cm3": "Lost CM3 (€)",
         "cur_stock": "Current FBA stock", "days_of_supply": "Days of supply",
     })
+    table = table.round(0)
     st.dataframe(
         table, width="stretch", hide_index=True, height=520,
         column_config={
-            "Lost revenue (€)": st.column_config.NumberColumn(format="euro"),
-            "Lost CM3 (€)": st.column_config.NumberColumn(format="euro"),
+            "Lost revenue (€)": st.column_config.NumberColumn(format="localized"),
+            "Lost CM3 (€)": st.column_config.NumberColumn(format="localized"),
             "Lost units": st.column_config.NumberColumn(format="localized"),
             "Current FBA stock": st.column_config.NumberColumn(format="localized"),
             "Days of supply": st.column_config.NumberColumn(format="localized"),
             "OOS rate %": st.column_config.ProgressColumn(
-                format="%.1f%%", min_value=0, max_value=100),
+                format="%.0f%%", min_value=0, max_value=100),
         },
     )
     st.download_button(
@@ -716,6 +717,7 @@ with tab3:
                     "avg_daily_demand", "days_of_supply"]].rename(columns={
             "cur_stock": "Current stock", "in_transit": "In transit",
             "avg_daily_demand": "Avg demand/day", "days_of_supply": "Days of supply"})
+        disp = disp.round(0)
         st.dataframe(
             disp, width="stretch", hide_index=True, height=460,
             column_config={
@@ -743,13 +745,14 @@ with tab4:
             "lost_cm3": "Lost CM3 (€)"})
         disp["Start"] = disp["Start"].dt.date
         disp["End"] = disp["End"].dt.date
+        disp = disp.round(0)
         st.caption(f"{fmt_num(len(disp))} discrete stock-out events · "
                    f"longest {int(ev['Days'].max())} days.")
         st.dataframe(
             disp, width="stretch", hide_index=True, height=520,
             column_config={
-                "Lost revenue (€)": st.column_config.NumberColumn(format="euro"),
-                "Lost CM3 (€)": st.column_config.NumberColumn(format="euro"),
+                "Lost revenue (€)": st.column_config.NumberColumn(format="localized"),
+                "Lost CM3 (€)": st.column_config.NumberColumn(format="localized"),
                 "Lost units": st.column_config.NumberColumn(format="localized")})
         st.download_button(
             "⬇️ Download events (CSV)", disp.to_csv(index=False).encode("utf-8"),
@@ -788,11 +791,12 @@ with tab5:
                       "rev_miss", "cm3_miss"]].rename(columns={
             "cool_days": "Cool-down days", "miss_units": "Units miss",
             "rev_miss": "Revenue miss (€)", "cm3_miss": "CM3 miss (€)"})
+        table = table.round(0)
         st.dataframe(
             table, width="stretch", hide_index=True, height=460,
             column_config={
-                "Revenue miss (€)": st.column_config.NumberColumn(format="euro"),
-                "CM3 miss (€)": st.column_config.NumberColumn(format="euro"),
+                "Revenue miss (€)": st.column_config.NumberColumn(format="localized"),
+                "CM3 miss (€)": st.column_config.NumberColumn(format="localized"),
                 "Units miss": st.column_config.NumberColumn(format="localized")})
         st.download_button(
             "⬇️ Download cooling-down (CSV)", table.to_csv(index=False).encode("utf-8"),
