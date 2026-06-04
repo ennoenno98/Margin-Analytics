@@ -67,6 +67,22 @@ Thresholds live at the top of `oos_analytics.py`
   (< days-of-supply threshold), units in transit, sorted replenish-first.
 - **Stock-out events** — every discrete stock-out collapsed into an event
   (start / end / duration / cause / lost €), with CSV export.
+- **Cooling down** — days the SKU was *deliberately throttled* (ad spend cut
+  and/or price raised) while stock was tight, to glide to the next shipment
+  instead of hard stocking out. Reports the **revenue miss** and **CM3 miss**
+  (the sales voluntarily forgone), per SKU, with CSV export.
+
+### Cooling down vs. stock-out (don't double-count)
+
+A deliberate PPC cut or price hike looks like a demand drop to the gap signal,
+so the model separates them. A day is tagged **Cooling down** (not an OOS loss)
+when, while days-of-supply is tight (default < 45), the SKU's **ad spend is cut
+to ≤ 50 % of its baseline** and/or its **price is ≥ 8 % above baseline**. Its
+impact is booked as *miss* (voluntary), kept apart from involuntary *lost*.
+Category priority per day: **Physical (network) > Cooling down > Marketplace
+gap**. Thresholds are tunable in the app. Caveat: ad-spend-cut detection only
+works from when Novadata began reporting Advertising Costs (~Feb 2026); the
+price-hike lever spans the full year.
 
 ## Refreshing the ledger (manual)
 

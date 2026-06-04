@@ -39,6 +39,13 @@ Lost units = expected daily demand − whatever still sold; valued at the SKU's
 trailing avg price (→ lost revenue) and avg CM3 per unit (→ lost CM3, the P&L
 impact).
 
+Separately, "Cooling down" days are when demand was *deliberately throttled*
+(ad spend cut and/or price raised) while stock was tight, to avoid a hard
+stock-out. Those are tagged distinctly and their forgone sales booked as
+revenue/CM3 *miss* (voluntary) rather than *lost* (involuntary), so the two are
+never double-counted. Category priority: Physical (network) > Cooling down >
+Marketplace gap.
+
 Run locally:
     pip install -r requirements.txt
     python novadata_weekly_export.py --once       # margin export
@@ -66,6 +73,14 @@ BASELINE_WINDOW = 90       # trailing window for expected demand / price / CM3
 DEFAULT_MIN_DEMAND = 3.0   # min expected units/day to infer a marketplace gap
 TAIL_DAYS = 21             # treat trailing zero-runs near "today" as ongoing OOS
 LOW_STOCK_DAYS = 21        # days-of-supply threshold for the low-stock risk view
+
+# "Cooling down" = deliberately throttling demand (cutting PPC and/or raising
+# price) while stock is tight, to glide to the next shipment instead of hard
+# stocking out (OOS hurts Amazon ranking). Defaults for detecting it:
+COOLDOWN_DOS = 45          # only when days-of-supply is at/below this (tight)
+COOLDOWN_PPC_CUT = 0.5     # ad spend <= this fraction of baseline = an ad cut
+COOLDOWN_PRICE_UP = 0.08   # price >= baseline x (1+this) = a deliberate hike
+COOLDOWN_MIN_PPC = 2.0     # ignore SKUs whose baseline ad spend < this (EUR/day)
 
 st.set_page_config(page_title="OOS Impact Analytics", page_icon="📦", layout="wide")
 
@@ -129,7 +144,7 @@ def load_margin(path: Path) -> pd.DataFrame:
     """Daily Novadata margin export, trimmed to what the OOS model needs."""
     KEEP = {
         "Period", "SKU", "Product", "Marketplace Name", "Brand",
-        "Units", "Product Sales", "Contribution Margin 3",
+        "Units", "Product Sales", "Contribution Margin 3", "Advertising Costs",
         "FBA Available", "Sales Velocity",
     }
     df = pd.read_csv(path, usecols=lambda c: c in KEEP)
@@ -140,6 +155,15 @@ def load_margin(path: Path) -> pd.DataFrame:
         df["CM3"] = pd.to_numeric(df["Contribution Margin 3"], errors="coerce",
                                   downcast="float")
         df = df.drop(columns=["Contribution Margin 3"])
+    # Advertising Costs is stored negative (a cost) and only reported from the
+    # date Novadata began emitting it (currently ~2026-02). Flip to positive
+    # ad spend; absent history simply yields zeros (no PPC-cut detection there).
+    if "Advertising Costs" in df.columns:
+        df["AdSpend"] = (-pd.to_numeric(df["Advertising Costs"], errors="coerce")
+                         ).clip(lower=0).astype("float32")
+        df = df.drop(columns=["Advertising Costs"])
+    else:
+        df["AdSpend"] = np.float32(0.0)
     for col in ("Units", "Product Sales", "FBA Available", "Sales Velocity"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce", downcast="float")
@@ -204,7 +228,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
 
     g = df.groupby(["Period"] + keys, observed=True, as_index=False).agg(
         Units=("Units", "sum"), Sales=("Sales", "sum"),
-        CM3=("CM3", "sum"), FBA=("FBA Available", "max"),
+        CM3=("CM3", "sum"), FBA=("FBA Available", "max"), PPC=("AdSpend", "sum"),
     )
     full_dates = pd.date_range(g["Period"].min(), g["Period"].max(), freq="D")
     asof = full_dates.max()
@@ -218,12 +242,19 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     sales = pivot("Sales", "sum").fillna(0.0)
     cm3 = pivot("CM3", "sum").fillna(0.0)
     fba = pivot("FBA", "max")  # NaN where stock unknown
+    ppc = pivot("PPC", "sum").fillna(0.0)
 
     pos = units > 0
     roll_units = units.rolling(BASELINE_WINDOW, min_periods=1).sum()
     roll_days = units.rolling(BASELINE_WINDOW, min_periods=1).count()
     roll_sales = sales.rolling(BASELINE_WINDOW, min_periods=1).sum()
     roll_cm3 = cm3.rolling(BASELINE_WINDOW, min_periods=1).sum()
+    # Ad-spend baseline = trailing avg over days that actually had spend; NaN
+    # before Novadata began reporting Advertising Costs (so no false ad-cuts).
+    roll_ppc = ppc.rolling(BASELINE_WINDOW, min_periods=1).sum()
+    roll_ppc_days = (ppc > 0).rolling(BASELINE_WINDOW, min_periods=1).sum()
+    base_ppc = (roll_ppc / roll_ppc_days.where(roll_ppc_days > 0)).ffill()
+    price = sales / units.where(units > 0)  # realised price/unit per day
 
     # expected = average units per CALENDAR day = the demand rate. ffill keeps
     # the pre-stock-out rate alive through a zero-run, so a multi-week stock-out
@@ -246,6 +277,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
         [melt(units, "units"), melt(sales, "sales"), melt(cm3, "cm3"),
          melt(fba, "fba"), melt(expected, "expected"),
          melt(avg_price, "avg_price"), melt(avg_cm3_pu, "avg_cm3_pu"),
+         melt(ppc, "ppc"), melt(base_ppc, "base_ppc"), melt(price, "price"),
          melt(had_past, "had_past"), melt(has_future, "has_future")],
         axis=1,
     ).reset_index().rename(columns={"level_0": "Period"})
@@ -258,14 +290,20 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     long["SKU"] = long["SKU"].astype(str)
     long["Marketplace Name"] = long["Marketplace Name"].astype(str)
     if not eu.empty:
-        long = long.merge(eu[["SKU", "Date", "eu_stock"]],
+        # Bring EU stock and a SKU-level days-of-supply (stock / trailing demand).
+        e = eu.sort_values("Date").copy()
+        e["avgship"] = e.groupby("SKU")["shipped"].transform(
+            lambda s: s.rolling(28, min_periods=5).mean())
+        e["dos"] = e["eu_stock"] / e["avgship"].where(e["avgship"] > 0)
+        long = long.merge(e[["SKU", "Date", "eu_stock", "dos"]],
                           left_on=["SKU", "Period"], right_on=["SKU", "Date"],
                           how="left").drop(columns=["Date"])
     else:
         long["eu_stock"] = np.nan
+        long["dos"] = np.nan
 
     for col in ("units", "sales", "cm3", "fba", "expected", "avg_price",
-                "avg_cm3_pu", "eu_stock"):
+                "avg_cm3_pu", "ppc", "base_ppc", "price", "eu_stock", "dos"):
         long[col] = long[col].astype("float32")
     for col in ("SKU", "Marketplace Name"):
         long[col] = long[col].astype("category")
@@ -276,8 +314,18 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     return long, meta, asof, eu
 
 
-def flag_oos(long: pd.DataFrame, min_demand: float) -> pd.DataFrame:
-    """Apply the hybrid OOS flag + cause + lost-impact columns (cheap)."""
+def flag_oos(long: pd.DataFrame, min_demand: float,
+             dos_th: float = COOLDOWN_DOS, ppc_cut: float = COOLDOWN_PPC_CUT,
+             price_up: float = COOLDOWN_PRICE_UP,
+             min_ppc: float = COOLDOWN_MIN_PPC) -> pd.DataFrame:
+    """Apply the hybrid OOS flag, the cooling-down flag, cause + impact (cheap).
+
+    Categories are mutually exclusive per day, in priority order:
+      Physical (network) > Cooling down > Marketplace gap.
+    OOS impact (lost_*) is *involuntary* lost sales; cooling-down impact
+    (rev_miss / cm3_miss) is the sales we *deliberately* forwent to stretch
+    stock — kept separate so the two are never double-counted.
+    """
     units = long["units"].to_numpy()
     fba = long["fba"].to_numpy()
     fba_known = long["fba_known"].to_numpy()
@@ -286,29 +334,48 @@ def flag_oos(long: pd.DataFrame, min_demand: float) -> pd.DataFrame:
     has_future = long["has_future"].to_numpy(dtype=bool)
     recent = long["recent"].to_numpy(dtype=bool)
     eu_stock = long["eu_stock"].to_numpy()
+    ap = long["avg_price"].to_numpy()
+    cm3pu = long["avg_cm3_pu"].to_numpy()
+    ppc = long["ppc"].to_numpy()
+    base_ppc = long["base_ppc"].to_numpy()
+    price = long["price"].to_numpy()
+    dos = long["dos"].to_numpy()
 
     # Pan-EU: a SKU is physically out of stock only when the whole EU network
     # sellable balance is zero (local-warehouse zeros are served from the pool).
     phys_eu = ~np.isnan(eu_stock) & (eu_stock <= 0) & had_past
-    oos_fba = fba_known & (fba == 0) & had_past
-    oos_gap = (
-        (units == 0) & (expected >= min_demand) & had_past
-        & (has_future | recent)
+
+    # Cooling down: a deliberate ad cut and/or price hike while stock is tight.
+    ad_cut = ~np.isnan(base_ppc) & (base_ppc > min_ppc) & (ppc <= base_ppc * (1 - ppc_cut))
+    hike = ~np.isnan(price) & (price >= ap * (1 + price_up))
+    low_stock = ~np.isnan(dos) & (dos < dos_th)
+    cooldown = (
+        (ad_cut | hike) & low_stock & (expected >= min_demand) & had_past & ~phys_eu
     )
-    oos = phys_eu | oos_fba | oos_gap
+
+    oos_fba = fba_known & (fba == 0) & had_past
+    oos_gap = (units == 0) & (expected >= min_demand) & had_past & (has_future | recent)
+    # Involuntary OOS excludes days we chose to throttle (those are cooling-down).
+    oos = (phys_eu | oos_fba | oos_gap) & ~cooldown
 
     cause = np.where(
         phys_eu, "Physical (network)",
-        np.where(oos, "Marketplace gap", ""),
+        np.where(cooldown, "Cooling down",
+                 np.where(oos, "Marketplace gap", "")),
     )
 
     lost_units = np.where(oos, np.clip(expected - units, 0, None), 0.0)
+    miss_units = np.where(cooldown, np.clip(expected - units, 0, None), 0.0)
     res = long.copy()
     res["oos"] = oos
+    res["cooldown"] = cooldown
     res["cause"] = cause
     res["lost_units"] = lost_units.astype("float32")
-    res["lost_rev"] = (lost_units * np.nan_to_num(long["avg_price"].to_numpy())).astype("float32")
-    res["lost_cm3"] = (lost_units * np.nan_to_num(long["avg_cm3_pu"].to_numpy())).astype("float32")
+    res["lost_rev"] = (lost_units * np.nan_to_num(ap)).astype("float32")
+    res["lost_cm3"] = (lost_units * np.nan_to_num(cm3pu)).astype("float32")
+    res["miss_units"] = miss_units.astype("float32")
+    res["rev_miss"] = (miss_units * np.nan_to_num(ap)).astype("float32")
+    res["cm3_miss"] = (miss_units * np.nan_to_num(cm3pu)).astype("float32")
     return res
 
 
@@ -408,13 +475,26 @@ min_demand = c3.slider(
 )
 search = c4.text_input("SKU or Product contains", "")
 
+with st.expander("Cooling-down detection settings"):
+    cc1, cc2, cc3 = st.columns(3)
+    cd_price = cc1.slider("Price hike vs baseline (%)", 2, 30,
+                          int(COOLDOWN_PRICE_UP * 100), 1) / 100
+    cd_ppc = cc2.slider("Ad-spend cut vs baseline (%)", 20, 90,
+                        int(COOLDOWN_PPC_CUT * 100), 5) / 100
+    cd_dos = cc3.slider("Only when days-of-supply below", 10, 90, COOLDOWN_DOS, 5)
+    st.caption("A day counts as 'cooling down' when the SKU is throttled (price "
+               "up by at least the first amount, and/or ad spend cut by at least "
+               "the second) while stock is this tight. Ad-cut detection only "
+               "applies from when Novadata began reporting Advertising Costs "
+               "(~Feb 2026); the price lever works across the full year.")
+
 if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
     start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
 else:
     start, end = long_all["Period"].min(), asof
 
 # ---------- Apply scope ----------
-scope = flag_oos(long_all, min_demand)
+scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc, price_up=cd_price)
 scope = scope[(scope["Period"] >= start) & (scope["Period"] <= end)]
 if market != "🌍 All countries":
     scope = scope[scope["Marketplace Name"] == market]
@@ -463,8 +543,9 @@ st.caption(
     "(€) forfeited while out of stock — the true P&L impact."
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Most affected SKUs", "Impact over time", "Inventory & risk", "Stock-out events"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Most affected SKUs", "Impact over time", "Inventory & risk",
+     "Stock-out events", "Cooling down"]
 )
 
 # ======================================================================
@@ -638,3 +719,50 @@ with tab4:
         st.download_button(
             "⬇️ Download events (CSV)", disp.to_csv(index=False).encode("utf-8"),
             file_name=f"oos_events_{start.date()}_{end.date()}.csv", mime="text/csv")
+
+# ======================================================================
+#  Tab 5 — Cooling down (deliberate demand throttling to avoid OOS)
+# ======================================================================
+with tab5:
+    st.caption(
+        "Days where the SKU was **deliberately throttled** — ad spend cut and/or "
+        "price raised — while stock was tight, to glide to the next shipment "
+        "instead of hard stocking out (OOS hurts Amazon ranking). The **miss** is "
+        "the sales/margin voluntarily forgone (expected demand − actual units, "
+        "valued at the normal price / CM3). Separate from involuntary OOS loss."
+    )
+    cd = scope[scope["cooldown"]]
+    if cd.empty:
+        st.info("No cooling-down days detected in the current scope. Loosen the "
+                "thresholds in 'Cooling-down detection settings' above.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("SKUs cooled down", f"{cd['SKU'].nunique():,}")
+        m2.metric("Revenue miss", eur(cd["rev_miss"].sum()))
+        m3.metric("CM3 miss", eur(cd["cm3_miss"].sum()))
+        m4.metric("Cool-down SKU-days", f"{len(cd):,}")
+
+        cagg = (
+            cd.groupby("SKU", observed=True)
+            .agg(cool_days=("Period", "nunique"), miss_units=("miss_units", "sum"),
+                 rev_miss=("rev_miss", "sum"), cm3_miss=("cm3_miss", "sum"))
+            .reset_index().sort_values("cm3_miss", ascending=False)
+        )
+        cagg["Product"] = cagg["SKU"].map(prod_map)
+        table = cagg[["SKU", "Product", "cool_days", "miss_units",
+                      "rev_miss", "cm3_miss"]].rename(columns={
+            "cool_days": "Cool-down days", "miss_units": "Units miss",
+            "rev_miss": "Revenue miss (€)", "cm3_miss": "CM3 miss (€)"})
+        st.dataframe(
+            table, width="stretch", hide_index=True, height=460,
+            column_config={
+                "Revenue miss (€)": st.column_config.NumberColumn(format="€%.0f"),
+                "CM3 miss (€)": st.column_config.NumberColumn(format="€%.0f"),
+                "Units miss": st.column_config.NumberColumn(format="%.0f")})
+        st.download_button(
+            "⬇️ Download cooling-down (CSV)", table.to_csv(index=False).encode("utf-8"),
+            file_name=f"oos_cooldown_{start.date()}_{end.date()}.csv", mime="text/csv")
+        st.caption(
+            "Note: ad-spend-cut detection only applies from when Novadata began "
+            "reporting Advertising Costs (~Feb 2026); price-hike detection spans "
+            "the full year. Tune sensitivity in the settings expander above.")
