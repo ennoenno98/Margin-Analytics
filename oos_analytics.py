@@ -73,11 +73,12 @@ BASELINE_WINDOW = 90       # trailing window for expected demand / price / CM3
 DEFAULT_MIN_DEMAND = 3.0   # min expected units/day to infer a marketplace gap
 TAIL_DAYS = 21             # treat trailing zero-runs near "today" as ongoing OOS
 LOW_STOCK_DAYS = 21        # days-of-supply threshold for the low-stock risk view
+OOS_DOS = 3                # reach (days-of-supply) below this counts as OOS
 
 # "Cooling down" = deliberately throttling demand (cutting PPC and/or raising
 # price) while stock is tight, to glide to the next shipment instead of hard
 # stocking out (OOS hurts Amazon ranking). Defaults for detecting it:
-COOLDOWN_DOS = 45          # only when days-of-supply is at/below this (tight)
+COOLDOWN_DOS = 30          # only when days-of-supply is at/below this (tight)
 COOLDOWN_PPC_CUT = 0.5     # ad spend <= this fraction of baseline = an ad cut
 COOLDOWN_PRICE_UP = 0.08   # price >= baseline x (1+this) = a deliberate hike
 COOLDOWN_MIN_PPC = 2.0     # ignore SKUs whose baseline ad spend < this (EUR/day)
@@ -317,7 +318,8 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
 def flag_oos(long: pd.DataFrame, min_demand: float,
              dos_th: float = COOLDOWN_DOS, ppc_cut: float = COOLDOWN_PPC_CUT,
              price_up: float = COOLDOWN_PRICE_UP,
-             min_ppc: float = COOLDOWN_MIN_PPC) -> pd.DataFrame:
+             min_ppc: float = COOLDOWN_MIN_PPC,
+             oos_dos: float = OOS_DOS) -> pd.DataFrame:
     """Apply the hybrid OOS flag, the cooling-down flag, cause + impact (cheap).
 
     Categories are mutually exclusive per day, in priority order:
@@ -344,24 +346,30 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     # Pan-EU: a SKU is physically out of stock only when the whole EU network
     # sellable balance is zero (local-warehouse zeros are served from the pool).
     phys_eu = ~np.isnan(eu_stock) & (eu_stock <= 0) & had_past
+    # Reach (days-of-supply) below the OOS threshold = effectively out of stock,
+    # even if the balance hasn't hit literally zero yet.
+    low_reach = ~np.isnan(dos) & (dos < oos_dos) & had_past
 
-    # Cooling down: a deliberate ad cut and/or price hike while stock is tight.
+    # Cooling down: a deliberate ad cut and/or price hike while stock is tight
+    # (reach below the cool-down threshold but not yet into the OOS zone).
     ad_cut = ~np.isnan(base_ppc) & (base_ppc > min_ppc) & (ppc <= base_ppc * (1 - ppc_cut))
     hike = ~np.isnan(price) & (price >= ap * (1 + price_up))
-    low_stock = ~np.isnan(dos) & (dos < dos_th)
+    cool_stock = ~np.isnan(dos) & (dos < dos_th) & (dos >= oos_dos)
     cooldown = (
-        (ad_cut | hike) & low_stock & (expected >= min_demand) & had_past & ~phys_eu
+        (ad_cut | hike) & cool_stock & (expected >= min_demand) & had_past
+        & ~phys_eu
     )
 
     oos_fba = fba_known & (fba == 0) & had_past
     oos_gap = (units == 0) & (expected >= min_demand) & had_past & (has_future | recent)
     # Involuntary OOS excludes days we chose to throttle (those are cooling-down).
-    oos = (phys_eu | oos_fba | oos_gap) & ~cooldown
+    oos = (phys_eu | low_reach | oos_fba | oos_gap) & ~cooldown
 
     cause = np.where(
         phys_eu, "Physical (network)",
-        np.where(cooldown, "Cooling down",
-                 np.where(oos, "Marketplace gap", "")),
+        np.where(low_reach, "Critically low (<%gd reach)" % oos_dos,
+                 np.where(cooldown, "Cooling down",
+                          np.where(oos, "Marketplace gap", ""))),
     )
 
     lost_units = np.where(oos, np.clip(expected - units, 0, None), 0.0)
@@ -475,18 +483,22 @@ min_demand = c3.slider(
 )
 search = c4.text_input("SKU or Product contains", "")
 
-with st.expander("Cooling-down detection settings"):
-    cc1, cc2, cc3 = st.columns(3)
-    cd_price = cc1.slider("Price hike vs baseline (%)", 2, 30,
+with st.expander("Stock-out & cooling-down thresholds"):
+    cc1, cc2, cc3, cc4 = st.columns(4)
+    oos_reach = cc1.slider("OOS when reach below (days)", 1, 14, OOS_DOS, 1,
+                           help="Reach (days-of-supply) below this counts as out "
+                                "of stock, even if the balance isn't literally 0.")
+    cd_dos = cc2.slider("Cool-down when reach below (days)", 5, 60, COOLDOWN_DOS, 5)
+    cd_price = cc3.slider("Price hike vs baseline (%)", 2, 30,
                           int(COOLDOWN_PRICE_UP * 100), 1) / 100
-    cd_ppc = cc2.slider("Ad-spend cut vs baseline (%)", 20, 90,
+    cd_ppc = cc4.slider("Ad-spend cut vs baseline (%)", 20, 90,
                         int(COOLDOWN_PPC_CUT * 100), 5) / 100
-    cd_dos = cc3.slider("Only when days-of-supply below", 10, 90, COOLDOWN_DOS, 5)
-    st.caption("A day counts as 'cooling down' when the SKU is throttled (price "
-               "up by at least the first amount, and/or ad spend cut by at least "
-               "the second) while stock is this tight. Ad-cut detection only "
-               "applies from when Novadata began reporting Advertising Costs "
-               "(~Feb 2026); the price lever works across the full year.")
+    st.caption("OOS = reach below the first threshold (or balance 0 / a demand "
+               "gap). 'Cooling down' = the SKU throttled (price up, and/or ad "
+               "spend cut) while reach is between the OOS and cool-down "
+               "thresholds. Ad-cut detection only applies from when Novadata "
+               "began reporting Advertising Costs (~Feb 2026); the price lever "
+               "works across the full year.")
 
 if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
     start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
@@ -494,7 +506,8 @@ else:
     start, end = long_all["Period"].min(), asof
 
 # ---------- Apply scope ----------
-scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc, price_up=cd_price)
+scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
+                 price_up=cd_price, oos_dos=oos_reach)
 scope = scope[(scope["Period"] >= start) & (scope["Period"] <= end)]
 if market != "🌍 All countries":
     scope = scope[scope["Marketplace Name"] == market]

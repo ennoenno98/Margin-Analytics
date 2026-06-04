@@ -75,12 +75,16 @@ Thresholds live at the top of `oos_analytics.py`
 ### Cooling down vs. stock-out (don't double-count)
 
 A deliberate PPC cut or price hike looks like a demand drop to the gap signal,
-so the model separates them. A day is tagged **Cooling down** (not an OOS loss)
-when, while days-of-supply is tight (default < 45), the SKU's **ad spend is cut
-to ≤ 50 % of its baseline** and/or its **price is ≥ 8 % above baseline**. Its
-impact is booked as *miss* (voluntary), kept apart from involuntary *lost*.
-Category priority per day: **Physical (network) > Cooling down > Marketplace
-gap**. Thresholds are tunable in the app. Caveat: ad-spend-cut detection only
+so the model separates them. Reach (days-of-supply) drives the split:
+
+- **reach < 3 days → OOS** ("Critically low") — effectively out of stock even
+  if the balance hasn't hit literally zero.
+- **3 ≤ reach < 30 days + throttled → Cooling down** — the SKU's **ad spend is
+  cut to ≤ 50 % of its baseline** and/or its **price is ≥ 8 % above baseline**.
+
+Cooling-down impact is booked as *miss* (voluntary), kept apart from involuntary
+*lost*. Category priority per day: **Physical (network) > Critically low (<3d) >
+Cooling down > Marketplace gap**. All thresholds are tunable in the app. Caveat: ad-spend-cut detection only
 works from when Novadata began reporting Advertising Costs (~Feb 2026); the
 price-hike lever spans the full year.
 
