@@ -678,7 +678,8 @@ with tab2:
         barmode="group", height=380, title=f"Lost impact by {freq_label.lower()}",
         yaxis=dict(title="€ lost"),
         yaxis2=dict(title="OOS SKU-days", overlaying="y", side="right", showgrid=False),
-        margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=1.12))
+        margin=dict(l=10, r=10, t=50, b=60),
+        legend=dict(orientation="h", yanchor="top", y=-0.2, x=0.5, xanchor="center"))
     st.plotly_chart(fig2, width="stretch")
 
     st.subheader("Stock-out calendar — top SKUs")
@@ -718,7 +719,8 @@ with tab2:
         height=380, title=f"{sel_sku} — sales, demand & stock (OOS days shaded)",
         yaxis=dict(title="Units / day"),
         yaxis2=dict(title="EU stock", overlaying="y", side="right", showgrid=False),
-        margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=1.12))
+        margin=dict(l=10, r=10, t=50, b=60),
+        legend=dict(orientation="h", yanchor="top", y=-0.2, x=0.5, xanchor="center"))
     st.plotly_chart(figd, width="stretch")
 
 # ======================================================================
