@@ -416,16 +416,39 @@ def _load_comments_from_gist(gist_id: str, token: str):
         return {}
 
 
-def _save_comments_to_gist(gist_id: str, token: str, comments: dict) -> bool:
+def _save_comments_to_gist(gist_id: str, token: str, comments: dict):
+    """Return (ok: bool, detail: str). Detail explains the HTTP failure when
+    it's not a 200 — so the UI status line can say WHY a write was rejected
+    instead of just 'failed'."""
     import requests
     body = {"files": {GIST_FILE: {"content": json.dumps(comments, indent=2, ensure_ascii=False)}}}
-    r = requests.patch(
-        f"https://api.github.com/gists/{gist_id}",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-        json=body,
-        timeout=10,
-    )
-    return r.status_code == 200
+    try:
+        r = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            json=body,
+            timeout=10,
+        )
+    except Exception as exc:
+        return False, f"network error: {exc!s}"
+    if r.status_code == 200:
+        return True, "ok"
+    # Common cases: 401 (bad token), 403 (token lacks Gists scope or wrong
+    # account), 404 (gist id wrong / not visible to this token), 422 (body).
+    msg = {
+        401: "401 — token rejected (invalid / expired)",
+        403: "403 — token doesn't have Gists: read & write, or doesn't own this Gist",
+        404: "404 — Gist not found by this token (wrong ID, or PAT belongs to a different user)",
+        422: "422 — Gist payload rejected",
+    }.get(r.status_code, f"HTTP {r.status_code}")
+    # Append the GitHub-reported message when available.
+    try:
+        body_msg = r.json().get("message")
+        if body_msg:
+            msg = f"{msg}: {body_msg}"
+    except Exception:
+        pass
+    return False, msg
 
 
 # Marker key used for legacy single-string comments migrated from the old
@@ -615,9 +638,10 @@ def save_comments(comments: dict) -> str:
         pass
     gist_id, token = _gist_config()
     if gist_id and token:
-        if _save_comments_to_gist(gist_id, token, clean):
+        ok, detail = _save_comments_to_gist(gist_id, token, clean)
+        if ok:
             return "synced to Gist ✓"
-        return "Gist write failed — session only ⚠"
+        return f"Gist write failed ({detail}) — session only ⚠"
     return "session only — configure GITHUB_TOKEN + COMMENTS_GIST_ID for persistence"
 
 
