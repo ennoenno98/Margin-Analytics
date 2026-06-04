@@ -1688,7 +1688,7 @@ with tab_overview:
     # without having to edit a comment first.
     status = st.session_state.get("comments_status")
     gist_id, token = _gist_config()
-    status_col, btn_col = st.columns([5, 1])
+    status_col, reload_col, test_col = st.columns([4, 1, 1])
     with status_col:
         if status:
             if "✓" in status:
@@ -1703,8 +1703,25 @@ with tab_overview:
                 "container reboots, set `GITHUB_TOKEN` and `COMMENTS_GIST_ID` "
                 "in the Streamlit Cloud secrets (see README)."
             )
-    with btn_col:
-        if gist_id and token and st.button("Test Gist", help="Try a read + write round-trip against the configured Gist and report the exact result."):
+    with reload_col:
+        if gist_id and token and st.button(
+            "↻ Reload",
+            help=(
+                "Re-fetch comments from the Gist now. Use this if you edited the "
+                "Gist directly (e.g. pasted in a JSON dump) and want the dashboard "
+                "to pick up the new content without rebooting."
+            ),
+            key="reload_comments_btn",
+        ):
+            st.session_state.pop("comments", None)
+            st.session_state.pop("comments_status", None)
+            st.rerun()
+    with test_col:
+        if gist_id and token and st.button(
+            "Test Gist",
+            help="Read + write round-trip against the configured Gist; reports the exact HTTP result.",
+            key="test_gist_btn",
+        ):
             data, read_detail = _load_comments_from_gist(gist_id, token)
             if data is None:
                 st.session_state["comments_status"] = f"Gist read failed ({read_detail}) ⚠"
