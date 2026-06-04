@@ -23,7 +23,7 @@ CHART = ROOT / "reports" / "_oos_sheet_example.png"
 # Model parameters (match oos_analytics.py defaults).
 W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 3.0, 30
 PPC_CUT, PRICE_UP, MIN_PPC = 0.5, 0.08, 2.0
-SKU, MKT = "VV-VITA-231", "amazon.de"
+SKU, MKT = "VV-VITA-311", "amazon.it"
 
 # ---------- compute the example SKU's daily series ----------
 mp = ROOT / "novadata_exports/margin_export_2026-06-03.csv.gz"
@@ -75,7 +75,7 @@ low_reach = (dos < OOS_DOS) & had
 ad_cut = (base_ppc > MIN_PPC) & (ppc <= base_ppc * (1 - PPC_CUT))
 hike = price.notna() & (price >= avg_price * (1 + PRICE_UP))
 cool_stock = (dos >= OOS_DOS) & (dos < CD_DOS)
-cooldown = (ad_cut | hike) & cool_stock & (expected >= MIND) & had & ~phys
+cooldown = (ad_cut | hike) & cool_stock & (units > 0) & (expected >= MIND) & had & ~phys
 oos_gap = (units == 0) & (expected >= MIND) & had & (fut | recent)
 oos = (phys | low_reach | oos_gap) & ~cooldown
 cat = np.where(phys, "Physical OOS",
@@ -201,8 +201,8 @@ E.append(mktable([
     ["Priority", "Label", "Condition", "Counts as"],
     ["1", "Physical OOS", "EU sellable balance = 0", "Lost (involuntary)"],
     ["2", "Critically low", "Reach < 3 days", "Lost (involuntary)"],
-    ["3", "Cooling down", "3 <= reach < 30 days AND throttled\n(price >= +8% and/or ad spend cut >= 50%)", "Miss (voluntary)"],
-    ["4", "Marketplace gap", "Units = 0 on a day enclosed by sales,\nlambda >= 3/day", "Lost (involuntary)"],
+    ["3", "Cooling down", "3 <= reach < 30 days, still selling (units > 0),\nthrottled (price >= +8% and/or ad cut >= 50%)", "Miss (voluntary)"],
+    ["4", "Marketplace gap", "Units = 0 on a day enclosed by sales,\nlambda >= 3/day (incl. throttles that hit 0)", "Lost (involuntary)"],
 ], col_w=[1.4*cm, 3.0*cm, 7.7*cm, 3.4*cm], fs=8))
 P("Guards: the SKU must already be selling (ignores pre-launch); a zero-run must "
   "be enclosed by later sales or be within the last 21 days (ignores discontinued "

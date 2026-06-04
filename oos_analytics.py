@@ -351,13 +351,15 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     low_reach = ~np.isnan(dos) & (dos < oos_dos) & had_past
 
     # Cooling down: a deliberate ad cut and/or price hike while stock is tight
-    # (reach below the cool-down threshold but not yet into the OOS zone).
+    # (reach in the cool-down band) AND the SKU is still selling. If a throttle
+    # pushes sales to zero it isn't "cooling down" — it's an effective stock-out,
+    # so units == 0 days fall through to the OOS branches below.
     ad_cut = ~np.isnan(base_ppc) & (base_ppc > min_ppc) & (ppc <= base_ppc * (1 - ppc_cut))
     hike = ~np.isnan(price) & (price >= ap * (1 + price_up))
     cool_stock = ~np.isnan(dos) & (dos < dos_th) & (dos >= oos_dos)
     cooldown = (
-        (ad_cut | hike) & cool_stock & (expected >= min_demand) & had_past
-        & ~phys_eu
+        (ad_cut | hike) & cool_stock & (units > 0) & (expected >= min_demand)
+        & had_past & ~phys_eu
     )
 
     oos_fba = fba_known & (fba == 0) & had_past
