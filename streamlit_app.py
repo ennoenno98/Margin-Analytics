@@ -398,6 +398,22 @@ def _save_comments_to_gist(gist_id: str, token: str, comments: dict) -> bool:
 # Marker key used for legacy single-string comments migrated from the old
 # flat-by-SKU schema. Rendered with a "[legacy]" prefix wherever shown.
 LEGACY_KEY = "_legacy"
+# Cross-country / global note slot, editable in the All-countries view.
+GLOBAL_KEY = "_all"
+
+FLAGS = {
+    "amazon.de": "🇩🇪",
+    "amazon.co.uk": "🇬🇧",
+    "amazon.fr": "🇫🇷",
+    "amazon.es": "🇪🇸",
+    "amazon.it": "🇮🇹",
+    "amazon.nl": "🇳🇱",
+    "amazon.ie": "🇮🇪",
+    "amazon.se": "🇸🇪",
+    "amazon.com.be": "🇧🇪",
+    "amazon.be": "🇧🇪",
+    "amazon.pl": "🇵🇱",
+}
 
 
 def _normalise_comments(raw: dict) -> dict:
@@ -436,19 +452,28 @@ def load_comments() -> dict:
 
 
 def _country_tag(marketplace: str) -> str:
-    """Short tag for display: 'amazon.de' → 'DE'."""
+    """Display tag with flag for a marketplace, e.g. 'amazon.de' → '🇩🇪 DE'."""
     if not marketplace or marketplace == LEGACY_KEY:
         return "*"
-    return marketplace.replace("amazon.", "").replace("co.uk", "uk").upper()
+    flag = FLAGS.get(marketplace, "")
+    code = marketplace.replace("amazon.", "").replace("co.uk", "uk").upper()
+    return f"{flag} {code}".strip()
+
+
+def global_note_for(sku: str, store: dict) -> str:
+    """Return the cross-country global note for a SKU (the '_all' slot)."""
+    return (store.get(sku) or {}).get(GLOBAL_KEY, "") or ""
 
 
 def comment_for_view(sku: str, marketplace: str, store: dict) -> str:
-    """Build the displayable Comments string for one SKU in a given view.
+    """Per-country Comments cell content for one SKU.
 
-    - Single-country view: return that country's note, with '[legacy] '
-      prefix if only a migrated legacy comment exists.
+    - Single-country view: return that country's note. Legacy migrated notes
+      fall through with a '[legacy] ' prefix when no country-specific note
+      has been written yet.
     - All-countries view (marketplace == None or '__all__'): concatenate
-      every per-country note prefixed by country tag, plus any legacy.
+      every per-country note, each prefixed by its flag tag (e.g.
+      '🇩🇪 DE: …  ·  🇫🇷 FR: …'). The global note has its own column.
     """
     entry = store.get(sku) or {}
     if not entry:
@@ -459,55 +484,82 @@ def comment_for_view(sku: str, marketplace: str, store: dict) -> str:
             return own
         legacy = entry.get(LEGACY_KEY)
         return f"[legacy] {legacy}" if legacy else ""
-    # All-countries: concatenate all known scopes
+    # All-countries: concatenate per-country notes, prefixed with flag tags.
+    # The GLOBAL_KEY note lives in its own column, so skip it here.
     parts = []
     for mp, note in entry.items():
-        if not note:
+        if not note or mp == GLOBAL_KEY:
             continue
         if mp == LEGACY_KEY:
-            parts.append(f"[*] {note}")
+            parts.append(f"[legacy] {note}")
         else:
-            parts.append(f"[{_country_tag(mp)}] {note}")
+            parts.append(f"{_country_tag(mp)}: {note}")
     return "  ·  ".join(parts)
 
 
-def persist_comment_edits(edited_skus, edited_comments, marketplace: str | None) -> bool:
-    """Diff Comments column against the store and persist per-(SKU, country).
+def _clean_text(value) -> str:
+    """Strip display chrome we auto-inject into Comments cells so it isn't
+    persisted back into storage."""
+    text = (str(value) if value is not None else "")
+    if "✱ ADJUSTED" in text and "|" in text:
+        text = text.split("|", 1)[1]
+    for prefix in ("[legacy] ", "🌍 "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text.strip()
 
-    The marketplace argument is the current view's marketplace; pass None /
-    '__all__' for the All-countries view (in which case the column is
-    read-only and we no-op).
+
+def persist_comment_edits(edited_skus, edited_comments=None, marketplace: str | None = None,
+                          edited_global=None) -> bool:
+    """Diff Comments / Global note columns against the store and persist.
+
+    - ``edited_comments`` (per-country column) is saved against the active
+      marketplace; passing None / '__all__' as marketplace makes this a no-op
+      so the cross-country merged cell stays read-only.
+    - ``edited_global`` (the GLOBAL_KEY '_all' slot) is editable in any view
+      and saves regardless of marketplace.
     """
-    if not marketplace or marketplace == "__all__":
-        return False  # All-countries view is read-only; ignore edits
     store: dict[str, dict[str, str]] = dict(st.session_state.get("comments", {}))
     changed = False
-    for sku, comment in zip(edited_skus, edited_comments):
-        text = (str(comment) if comment is not None else "")
-        # Strip the auto-injected '✱ ADJUSTED: ... |' prefix when persisting,
-        # so only the user's own note round-trips.
-        if "✱ ADJUSTED" in text and "|" in text:
-            text = text.split("|", 1)[1]
-        # Also strip a '[legacy] ' prefix — that's display chrome, not user input.
-        if text.startswith("[legacy] "):
-            text = text[len("[legacy] "):]
-        text = text.strip()
+    skus = list(edited_skus)
+    country_iter = list(edited_comments) if edited_comments is not None else [None] * len(skus)
+    global_iter = list(edited_global) if edited_global is not None else [None] * len(skus)
+
+    country_writable = bool(marketplace) and marketplace != "__all__"
+
+    for sku, country_text, global_text in zip(skus, country_iter, global_iter):
         entry = dict(store.get(sku, {}))
-        prev = entry.get(marketplace, "")
-        if text == prev:
-            continue
-        if text:
-            entry[marketplace] = text
-            # Once the user has written a country-specific note, clear the
-            # legacy slot so it doesn't keep prefixing the cell.
-            entry.pop(LEGACY_KEY, None)
-        else:
-            entry.pop(marketplace, None)
-        if entry:
-            store[sku] = entry
-        elif sku in store:
-            del store[sku]
-        changed = True
+        sku_changed = False
+
+        if country_writable and edited_comments is not None:
+            text = _clean_text(country_text)
+            prev = entry.get(marketplace, "")
+            if text != prev:
+                if text:
+                    entry[marketplace] = text
+                    entry.pop(LEGACY_KEY, None)
+                else:
+                    entry.pop(marketplace, None)
+                sku_changed = True
+
+        if edited_global is not None:
+            text = _clean_text(global_text)
+            prev = entry.get(GLOBAL_KEY, "")
+            if text != prev:
+                if text:
+                    entry[GLOBAL_KEY] = text
+                else:
+                    entry.pop(GLOBAL_KEY, None)
+                sku_changed = True
+
+        if sku_changed:
+            if entry:
+                store[sku] = entry
+            elif sku in store:
+                del store[sku]
+            changed = True
+
     if changed:
         st.session_state["comments"] = store
         try:
@@ -1293,6 +1345,12 @@ with tab_overview:
         comment_for_view(sku, comment_scope, st.session_state["comments"])
         for sku in filtered["SKU"]
     ]
+    # Cross-country / global note (always per-SKU, editable in All countries
+    # mode, shown in country views for context).
+    filtered["Global note"] = [
+        global_note_for(sku, st.session_state["comments"])
+        for sku in filtered["SKU"]
+    ]
     # Surface manual-adjustment notes from adjustments.json so adjusted rows
     # are visibly marked in the table.
     if adj_notes:
@@ -1316,7 +1374,7 @@ with tab_overview:
     }
 
     display_cols = [
-        "SKU", "Product", "Comments", "Cluster",
+        "SKU", "Product", "Comments", "Global note", "Cluster",
         "Units", "Product Sales", "Rev Δ 4w %",
         "CM1%", "CM2%", "CM3%", "Δ CM3 vs prior", "P&L Impact",
         "Sponsored Spend",
@@ -1465,9 +1523,18 @@ with tab_overview:
                         )),
         "Product Full": dict(hide=True),
         "Comments": dict(
-            editable=not is_all_countries, width=300,
-            headerName=("Comments (all countries — read-only)" if is_all_countries else "Comments ✏"),
+            editable=not is_all_countries, width=280,
+            headerName=(
+                f"Comments — all countries (read-only)" if is_all_countries
+                else f"Comments — {_country_tag(marketplace)} ✏"
+            ),
             cellStyle=_style({"backgroundColor": "#FFFDE7"}),
+            wrapText=True, autoHeight=True,
+        ),
+        "Global note": dict(
+            editable=True, width=240,
+            headerName="🌍 Global note ✏",
+            cellStyle=_style({"backgroundColor": "#E8F0FF"}),
             wrapText=True, autoHeight=True,
         ),
         "Cluster": dict(width=230, cellStyle=style_cluster_full),
@@ -1528,8 +1595,13 @@ with tab_overview:
     # Persist any comment changes back to comments.json / session.
     # All-countries view is read-only (the cell is a concatenation of every
     # country's note); persist_comment_edits will no-op in that case.
-    if "Comments" in edited.columns and "SKU" in edited.columns:
-        persist_comment_edits(edited["SKU"], edited["Comments"], comment_scope)
+    if "SKU" in edited.columns:
+        persist_comment_edits(
+            edited["SKU"],
+            edited_comments=edited["Comments"] if "Comments" in edited.columns else None,
+            marketplace=comment_scope,
+            edited_global=edited["Global note"] if "Global note" in edited.columns else None,
+        )
 
     # Always show a small status line so the user knows whether edits persist.
     status = st.session_state.get("comments_status")
@@ -1814,13 +1886,17 @@ with tab_slow:
                 comment_for_view(sku, slow_scope, st.session_state["comments"])
                 for sku in slow["SKU"]
             ]
+            slow["Global note"] = [
+                global_note_for(sku, st.session_state["comments"])
+                for sku in slow["SKU"]
+            ]
 
             show_cols = [c for c in [
                 "SKU", "Product", "Cluster",
                 "FBA Available", "Sales Velocity", "Days of Supply",
                 "Avg unit price", "Tied-up value",
                 "Product Sales", "Units", "CM3%",
-                "Comments",
+                "Comments", "Global note",
             ] if c in slow.columns]
 
             slow_view = slow[show_cols].reset_index(drop=True)
@@ -1844,8 +1920,8 @@ with tab_slow:
                     "Units": st.column_config.NumberColumn("Units", format="%d", disabled=True),
                     "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
                     "Comments": st.column_config.TextColumn(
-                        ("Comments (all countries — read-only)"
-                         if is_all_countries else "Comments ✏"),
+                        (f"Comments — all countries (read-only)" if is_all_countries
+                         else f"Comments — {_country_tag(marketplace)} ✏"),
                         help=(
                             "Read-only in All countries view (concatenated note from every "
                             "marketplace). Pick a single country to edit." if is_all_countries
@@ -1853,14 +1929,24 @@ with tab_slow:
                         disabled=is_all_countries,
                         width="medium",
                     ),
+                    "Global note": st.column_config.TextColumn(
+                        "🌍 Global note ✏",
+                        help="Cross-country note for this SKU (visible in every view, edit anywhere).",
+                        disabled=False,
+                        width="medium",
+                    ),
                 },
             )
 
-            # Persist any comment edits made here through the shared helper —
-            # so notes typed on Slow movers immediately appear on Overview and
-            # vice versa, all backed by the same Gist/local file.
-            if "Comments" in slow_edited.columns and "SKU" in slow_edited.columns:
-                persist_comment_edits(slow_edited["SKU"], slow_edited["Comments"], slow_scope)
+            # Persist any comment edits (per-country AND global) through the
+            # shared helper so the Overview tab sees the same store.
+            if "SKU" in slow_edited.columns:
+                persist_comment_edits(
+                    slow_edited["SKU"],
+                    edited_comments=slow_edited["Comments"] if "Comments" in slow_edited.columns else None,
+                    marketplace=slow_scope,
+                    edited_global=slow_edited["Global note"] if "Global note" in slow_edited.columns else None,
+                )
 
             st.download_button(
                 "Download slow movers (CSV)",
