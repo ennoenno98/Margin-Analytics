@@ -583,18 +583,29 @@ agg["Status"] = np.where(
 )
 agg = agg.sort_values("lost_cm3", ascending=False)
 
-# ---------- KPI tiles ----------
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("SKUs affected", fmt_num(agg["SKU"].nunique()))
-k2.metric("Lost revenue", eur(agg["lost_rev"].sum()))
-k3.metric("Lost CM3 (P&L impact)", eur(agg["lost_cm3"].sum()))
-k4.metric("Lost units", fmt_num(agg["lost_units"].sum()))
-phys_days = int((oos_rows["cause"] == "Physical (network)").sum())
-k5.metric("Physical stock-out days", fmt_num(phys_days))
+# ---------- KPI tiles (split: involuntary OOS vs voluntary cooling-down) ----------
+cd_rows = scope[scope["cooldown"]]
+
+st.markdown("**🔴 Out of stock — involuntary (lost)**")
+o1, o2, o3, o4 = st.columns(4)
+o1.metric("SKUs affected", fmt_num(agg["SKU"].nunique()))
+o2.metric("Lost revenue", eur(agg["lost_rev"].sum()))
+o3.metric("Lost CM3 (P&L impact)", eur(agg["lost_cm3"].sum()))
+o4.metric("OOS SKU-days", fmt_num(len(oos_rows)))
+
+st.markdown("**🟣 Cooling down — voluntary throttle (miss)**")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("SKUs cooled down", fmt_num(cd_rows["SKU"].nunique()))
+c2.metric("Miss revenue", eur(cd_rows["rev_miss"].sum()))
+c3.metric("Miss CM3", eur(cd_rows["cm3_miss"].sum()))
+c4.metric("Cool-down SKU-days", fmt_num(len(cd_rows)))
+
 st.caption(
     f"Data through **{asof.date()}** · scope **{start.date()} → {end.date()}** "
-    f"· marketplace **{market}**. Lost CM3 is the estimated contribution margin "
-    "(€) forfeited while out of stock — the true P&L impact."
+    f"· marketplace **{market}**. *Lost* = sales forfeited while out of stock "
+    "(involuntary); *Miss* = sales given up by deliberately throttling demand "
+    "(price up / ad cut) to avoid OOS. Both valued as contribution margin (CM3) "
+    "— the true P&L impact."
 )
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
