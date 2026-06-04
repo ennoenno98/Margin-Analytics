@@ -1,0 +1,29 @@
+{
+  "_meta": {
+    "purpose": "Override the Product column with an English title per SKU. Loaded at runtime by streamlit_app.py:load_data() and applied to every row whose SKU appears as a key here. Anything not listed keeps the title Novadata's export carries (which may be German / Italian / Spanish / French / Dutch depending on the listing's primary marketplace).",
+    "how_to_add": "Open this file and append entries to the 'titles' object. The key is the SKU code as it appears in the dashboard; the value is the English product name to display. Push the change and the dashboard picks it up on the next reboot."
+  },
+  "titles": {
+    "VV-VITA-90":    "Vegavero Beta Carotene 7mg | High Strength | 180 Capsules",
+    "VV-VITA-101":   "Vegavero Rhodiola Rosea Forte | Premium Extract",
+    "VV-VITA-119":   "Vegavero Magnesium + Potassium | Premium Citrate | Additive-Free",
+    "VV-VITA-127":   "Vegavero Saffron Supplement 90 mg | High Strength Saffron Extract",
+    "VV-VITA-203":   "Vegavero Vegan GABA Complex 1000 mg | with L-Theanine + Vitamin B6",
+    "VV-VITA-208":   "Vegavero Organic Horse Chestnut Extract | with Red Vine Leaf",
+    "VV-VITA-216":   "Vegavero Kudzu 6000 mg | Quit Smoking & Hangover Remedy",
+    "VV-VITA-222":   "Vegavero Organic Black Cumin Oil | 1000 mg | Nigella Sativa",
+    "VV-VITA-231":   "Vegavero Myo-Inositol & D-Chiro Complex | Complete Formula",
+    "VV-VITA-243":   "Vegavero Advanced Multi Magnesium Complex | with 4X Chelated Magnesium",
+    "VV-VITA-257":   "Vegavero Organic Lecithin Oil | 1800 mg | 120 Capsules",
+    "VV-VITA-266":   "Vegavero Organic Moringa Oleifera Tablets | 2000 mg | 180 Tablets",
+    "VV-VITA-276":   "Vegavero Circulation Booster | Diosmin, Hesperidin, Rutin",
+    "VV-VITA-314":   "Vegavero Glycine Powder 1000 g | 100% Pure Amino Acid",
+    "VV-VITA-320":   "Vegavero Vegan Collagen Capsules",
+    "VV-VITA-355":   "Vegavero L-Glutathione Complex | with Glycine, PureWay-C Vitamin",
+    "VV-VITA-364":   "Vegavero Organic Astaxanthin 8 mg | Natural Antioxidant Supplement",
+    "VV-VITA-370":   "Vegavero Magnesium Bisglycinate | 400 mg Elemental Magnesium",
+    "VV-VITA-381":   "Vegavero Myo-Inositol Powder 4000 mg | Inositol PCOS Supplement",
+    "BJ-E223-8EKW":  "Vegavero Organic Moringa Oleifera | 600 mg | 270 Capsules",
+    "2R-49NC-R697":  "Vegavero MSM Powder | 1 kg | 99.9% Pure Methylsulfonylmethane"
+  }
+}

@@ -221,6 +221,18 @@ def load_data(path: Path) -> pd.DataFrame:
     if drop:
         df = df.drop(columns=drop)
 
+    # Override Product titles with the English version from
+    # product_titles_en.json (anything not listed keeps the original Novadata
+    # title). Applied BEFORE category conversion so the assignment doesn't
+    # force a dtype change.
+    titles_en = load_product_titles_en()
+    if titles_en and "Product" in df.columns:
+        en_mapped = df["SKU"].map(titles_en)
+        mask = en_mapped.notna()
+        if mask.any():
+            df["Product"] = df["Product"].astype("object")  # release category if any
+            df.loc[mask, "Product"] = en_mapped[mask]
+
     # Categorize low-cardinality strings (only the ones we never groupby on)
     # and use pyarrow-backed StringDtype for the rest (SKU, Marketplace Name).
     # Together this cuts the dataframe from ~500 MB → ~40 MB on the real data.
@@ -283,6 +295,27 @@ def tier_1_to_3(values: pd.Series) -> pd.Series:
 
 COMMENTS_PATH = REPO_ROOT / "comments.json"
 ADJUSTMENTS_PATH = REPO_ROOT / "adjustments.json"
+PRODUCT_TITLES_EN_PATH = REPO_ROOT / "product_titles_en.json"
+
+
+@st.cache_data(show_spinner=False)
+def load_product_titles_en() -> dict[str, str]:
+    """SKU → English product title overrides loaded from product_titles_en.json.
+
+    Novadata returns one Product title per SKU (in the seller's source
+    language), so we override at load_data time when an English title is
+    available. Anything not listed keeps its original Novadata title.
+    """
+    if not PRODUCT_TITLES_EN_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(PRODUCT_TITLES_EN_PATH.read_text())
+    except Exception:
+        return {}
+    titles = raw.get("titles") if isinstance(raw, dict) else raw
+    if not isinstance(titles, dict):
+        return {}
+    return {str(k): str(v) for k, v in titles.items() if v and str(v).strip()}
 
 
 # ---------- Manual one-off adjustments ----------
@@ -1163,7 +1196,7 @@ with tab_overview:
                     "Sales (€)": "€{:,.0f}",
                     "P&L Impact (€)": "€{:,.0f}",
                     "Ad spend (€)": "€{:,.0f}",
-                    "Country CM3 %": "{:.1f}%",
+                    "Country CM3 %": "{:.0f}%",
                     "Units": "{:,.0f}",
                     "SKUs": "{:,.0f}",
                 }, na_rep="—").apply(
@@ -1316,14 +1349,14 @@ with tab_overview:
         d1.metric("SKUs in cluster", f"{len(filtered):,}")
         d2.metric("Total sales (€)", f"{filtered['Product Sales'].sum():,.0f}")
         avg_cm3_c = filtered["CM3%"].mean()
-        d3.metric("Avg CM3 %", f"{avg_cm3_c:.1f}" if pd.notna(avg_cm3_c) else "—")
+        d3.metric("Avg CM3 %", f"{avg_cm3_c:.0f}" if pd.notna(avg_cm3_c) else "—")
         d4.metric("Total units", f"{filtered['Units'].sum():,.0f}")
         avg_mom_c = filtered["Rev Δ 4w %"].mean() if "Rev Δ 4w %" in filtered.columns else pd.NA
-        d5.metric("Avg Rev Δ 4w %", f"{avg_mom_c:+.1f}%" if pd.notna(avg_mom_c) else "—")
+        d5.metric("Avg Rev Δ 4w %", f"{avg_mom_c:+.0f}%" if pd.notna(avg_mom_c) else "—")
 
     toggle_col1, toggle_col2 = st.columns(2)
     below_target_only = toggle_col1.checkbox(
-        f"Show only SKUs with CM3% below {target_cm3:.1f}%", value=False
+        f"Show only SKUs with CM3% below {target_cm3:.0f}%", value=False
     )
     show_inventory = toggle_col2.toggle(
         "Show inventory columns",
@@ -1397,11 +1430,11 @@ with tab_overview:
 
     fmt_euro = JsCode("function(p){return p.value==null?'—':'€'+Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
     fmt_int = JsCode("function(p){return p.value==null?'—':Number(p.value).toLocaleString('de-DE',{maximumFractionDigits:0});}")
-    fmt_pct = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(1)+'%';}")
-    fmt_pct_signed = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(1)+'%';}")
-    fmt_pp = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(1)+' pp';}")
-    fmt_float2 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(2);}")
-    fmt_float1 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(1);}")
+    fmt_pct = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(0)+'%';}")
+    fmt_pct_signed = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(0)+'%';}")
+    fmt_pp = JsCode("function(p){if(p.value==null)return '—';var s=p.value>=0?'+':'';return s+Number(p.value).toFixed(0)+' pp';}")
+    fmt_float2 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(0);}")
+    fmt_float1 = JsCode("function(p){return p.value==null?'—':Number(p.value).toFixed(0);}")
 
     style_cm3 = JsCode(
         f"function(p){{if(p.value==null)return null;"
@@ -1713,7 +1746,7 @@ with tab_trend:
         line.update_xaxes(title=freq_label.capitalize())
         line.add_hline(
             y=target_cm3, line_dash="dot", line_color="#d32f2f",
-            annotation_text=f"Target {target_cm3:.1f}%", annotation_position="top right",
+            annotation_text=f"Target {target_cm3:.0f}%", annotation_position="top right",
         )
         st.plotly_chart(line, width="stretch")
 
@@ -1733,11 +1766,11 @@ with tab_trend:
 
             m1, m2, m3 = st.columns(3)
             m1.metric("📈 Rising margins", f"{n_rise:,}",
-                      help=f"CM3% improved by ≥ {threshold_pp:.1f} pp over the window.")
+                      help=f"CM3% improved by ≥ {threshold_pp:.0f} pp over the window.")
             m2.metric("➡️ Neutral margins", f"{n_neutral:,}",
-                      help=f"CM3% changed by less than ±{threshold_pp:.1f} pp.")
+                      help=f"CM3% changed by less than ±{threshold_pp:.0f} pp.")
             m3.metric("📉 Declining margins", f"{n_decline:,}",
-                      help=f"CM3% dropped by ≥ {threshold_pp:.1f} pp over the window.")
+                      help=f"CM3% dropped by ≥ {threshold_pp:.0f} pp over the window.")
 
             # Distribution bar
             dist = pd.DataFrame({
@@ -1795,9 +1828,9 @@ with tab_trend:
                     st.dataframe(
                         sub[show_cols].style.format({
                             "Product Sales": "€{:,.0f}",
-                            "Start CM3%": "{:.1f}%",
-                            "End CM3%": "{:.1f}%",
-                            "Change": "{:+.1f} pp",
+                            "Start CM3%": "{:.0f}%",
+                            "End CM3%": "{:.0f}%",
+                            "Change": "{:+.0f} pp",
                             "Points": "{:.0f}",
                         }, na_rep="—"),
                         width="stretch", hide_index=True,
@@ -1875,7 +1908,7 @@ with tab_slow:
                       f"€{tied:,.0f}" if pd.notna(tied) and tied > 0 else "—",
                       help="FBA Available × avg unit price (sales / units over the selected period).")
             avg_cm3_slow = pd.to_numeric(slow.get("CM3%"), errors="coerce").mean()
-            k4.metric("Avg CM3 %", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—")
+            k4.metric("Avg CM3 %", f"{avg_cm3_slow:.0f}%" if pd.notna(avg_cm3_slow) else "—")
 
             # Pull current comments (same store the Overview tab edits) so any
             # note added here ↔ shows up on the other tab automatically.
@@ -1909,16 +1942,16 @@ with tab_slow:
                     "Product": st.column_config.TextColumn("Product", disabled=True, width="large"),
                     "Cluster": st.column_config.TextColumn("Cluster", disabled=True),
                     "FBA Available": st.column_config.NumberColumn("FBA Avail.", format="%d", disabled=True),
-                    "Sales Velocity": st.column_config.NumberColumn("Velocity / d", format="%.1f", disabled=True),
+                    "Sales Velocity": st.column_config.NumberColumn("Velocity / d", format="%d", disabled=True),
                     "Days of Supply": st.column_config.NumberColumn(
                         "Days of Supply", format="%d", disabled=True,
                         help=f"Orange ≥ {dos_threshold} d (your threshold); red ≥ {dos_threshold*2} d (critical).",
                     ),
-                    "Avg unit price": st.column_config.NumberColumn("Avg unit price", format="€%.2f", disabled=True),
+                    "Avg unit price": st.column_config.NumberColumn("Avg unit price", format="€%d", disabled=True),
                     "Tied-up value": st.column_config.NumberColumn("Tied-up value", format="€%d", disabled=True),
                     "Product Sales": st.column_config.NumberColumn("Sales (€)", format="€%d", disabled=True),
                     "Units": st.column_config.NumberColumn("Units", format="%d", disabled=True),
-                    "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
+                    "CM3%": st.column_config.NumberColumn("CM3 %", format="%d%%", disabled=True),
                     "Comments": st.column_config.TextColumn(
                         (f"Comments — all countries (read-only)" if is_all_countries
                          else f"Comments — {_country_tag(marketplace)} ✏"),

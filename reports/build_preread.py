@@ -112,7 +112,7 @@ def eur(x):
 
 
 def pct(x):
-    return f"{x:.1f}%" if pd.notna(x) else "—"
+    return f"{x:.0f}%" if pd.notna(x) else "—"
 
 
 def _spread_adjustments_to_daily(win: pd.DataFrame, adjustments: dict,
@@ -254,7 +254,7 @@ def chart_matrix(tb):
         for vi in range(3):
             ax.text(vi, mi - 0.16, f"{int(n_grid[mi,vi])} SKUs", ha="center", va="center", fontsize=9, color="#111")
             ax.text(vi, mi + 0.06, f"€{sales_grid[mi,vi]/1000:,.0f}k", ha="center", va="center", fontsize=11, fontweight="bold", color="#111")
-            ax.text(vi, mi + 0.28, f"{cm3_grid[mi,vi]:.1f}% CM3", ha="center", va="center", fontsize=9, color="#222")
+            ax.text(vi, mi + 0.28, f"{cm3_grid[mi,vi]:.0f}% CM3", ha="center", va="center", fontsize=9, color="#222")
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cb.set_label("Blended CM3%")
     ax.set_title("Margin × Sales matrix — sales and blended CM3% per segment", fontsize=11, fontweight="bold", pad=10)
     fig.tight_layout()
@@ -268,7 +268,7 @@ def chart_portfolio(port):
     ax.plot(x, port["CM3%"], marker="o", color="#205F2A", linewidth=2.6, markersize=9,
             markerfacecolor="#205F2A", markeredgecolor="#FFFBF2")
     for xi, yi in zip(x, port["CM3%"]):
-        ax.annotate(f"{yi:.1f}%", (xi, yi), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=10, fontweight="bold")
+        ax.annotate(f"{yi:.0f}%", (xi, yi), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=10, fontweight="bold")
     ax.axhline(19.7, ls=":", color="#C62828", lw=1.4)
     ax.text(len(x) - 1, 19.7, " Target 19.7%", color="#C62828", va="bottom", ha="right", fontsize=8)
     ax.set_ylabel("Portfolio CM3%"); ax.grid(axis="y", alpha=0.3)
@@ -400,7 +400,7 @@ def build():
     E.append(Image(str(m_png), width=16.5 * cm, height=10.5 * cm))
     E.append(Spacer(1, 6))
     E.append(Paragraph(
-        f"Tier cut-offs (terciles): margin at {d['cm3_cuts'][0]:.1f}% and {d['cm3_cuts'][1]:.1f}% CM3; "
+        f"Tier cut-offs (terciles): margin at {d['cm3_cuts'][0]:.0f}% and {d['cm3_cuts'][1]:.0f}% CM3; "
         f"sales at {eur(d['sales_cuts'][0])} and {eur(d['sales_cuts'][1])} over the three months.", small))
     E.append(PageBreak())
 
@@ -497,7 +497,7 @@ def build():
                 pct(r.get("CM1%")), pct(r.get("CM2%")),
                 pct(r["Start CM3%"]),
                 pct(r["End CM3%"]),
-                f"{r['Change']:+.1f}",
+                f"{r['Change']:+.0f}",
             ])
         t = Table(data, colWidths=[6.0 * cm, 2.1 * cm, 1.4 * cm, 1.4 * cm,
                                    1.6 * cm, 1.6 * cm, 1.4 * cm])
@@ -566,7 +566,7 @@ def build():
             data.append([
                 str(r.get("Product") or r["SKU"])[:36],
                 f"{int(r['fba']):,}" if pd.notna(r['fba']) else "—",
-                f"{r['vel']:.1f}" if pd.notna(r['vel']) and r['vel'] > 0 else "—",
+                f"{r['vel']:.0f}" if pd.notna(r['vel']) and r['vel'] > 0 else "—",
                 f"{int(r['dos']):,}" if pd.notna(r['dos']) else "—",
                 eur(r['tied_up']) if pd.notna(r['tied_up']) else "—",
                 eur(r['Product Sales']) if pd.notna(r.get('Product Sales')) else "—",
