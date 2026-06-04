@@ -3,6 +3,11 @@
 Interactive, password-gated Streamlit dashboard for Amazon margin
 monitoring, fed by a weekly Novadata export committed to this repo.
 
+> **Sibling app:** [OOS Impact Analytics](README_OOS.md) (`oos_analytics.py`)
+> tracks out-of-stock impact over the year — estimated lost revenue & CM3 per
+> SKU — by combining the Amazon FBA Inventory Ledger with this margin export.
+> It deploys as its own Streamlit app from the same repo.
+
 ## Pieces
 
 | Path | Role |
