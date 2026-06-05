@@ -16,32 +16,30 @@ It combines two Amazon sources:
 | Source | Path | Gives |
 | --- | --- | --- |
 | **FBA Inventory Ledger** | `amazon_ledger/inventory_ledger_*.csv.gz` | Real daily warehouse balance + customer shipments per SKU. The seller runs **Pan-EU**, so stock is pooled across the network → physical OOS only when the whole EU balance hits zero. Powers true physical stock-outs, actual demand, days-of-supply / low-stock risk. |
-| **Novadata margin export** | `novadata_exports/margin_export_*.csv.gz` | Per-SKU per-marketplace daily Units / Sales / CM3 → marketplace-level lost sales and the price + margin per unit to value lost units in €. |
+| **Novadata margin export** | `novadata_exports/margin_export_*.csv.gz` | Daily Units / Sales / CM3 per SKU, **pooled EU-wide** (Pan-EU — not split by country) → the demand rate and the price + margin per unit to value lost units in €. |
 
-**Why hybrid?** With Pan-EU pooling the network is almost never at literally
-zero stock (≈ a few dozen SKU-days a year), so a "balance == 0" rule alone
-barely fires. The bulk of real lost sales happens at the **marketplace** level
-(a SKU that normally sells in DE suddenly goes quiet) — which the Novadata
-signal catches. The ledger then confirms the physical truth and powers the
-forward-looking risk view.
+**Why hybrid + EU-pooled?** The account runs **Pan-EU**, so demand and stock are
+pooled across marketplaces — splitting λ by country understates true demand, so
+everything is computed at **SKU / EU level** (one row per SKU per day). With
+pooling the network is rarely at literally zero stock, so a "balance == 0" rule
+alone barely fires; the reach and demand-gap signals carry most of the load, and
+the ledger powers the forward-looking risk view.
 
 ### How OOS is defined
 
-A SKU × marketplace is **out of stock** on a day when **any** of:
+A SKU is **out of stock** on a day when **any** of:
 
 1. **Physical (network):** EU sellable balance == 0 in the ledger.
-2. **FBA snapshot:** Novadata `FBA Available` == 0.
-3. **Marketplace gap:** `Units == 0` on a day *enclosed by sales* (not a
-   pre-launch / discontinued tail), for a SKU whose demand rate clears
+2. **Critically low (<3d):** reach (days-of-supply) below 3 — effectively out
+   even if the balance isn't literally zero.
+3. **Demand gap (EU):** EU `Units == 0` on a day *enclosed by sales* (not a
+   pre-launch / discontinued tail), for a SKU whose EU demand rate clears
    **Min demand (units/day)** — high enough that selling nothing is a genuine
-   anomaly (this filter is what stops a thin marketplace's normal no-sale days
-   from being mistaken for stock-outs).
+   anomaly (this stops slow movers' normal no-sale days being mistaken for
+   stock-outs).
 
-Each OOS day is tagged with its **cause**: *Physical (network)* when the EU pool
-is empty, otherwise *Marketplace gap* — sales stopped in that marketplace
-despite EU stock (offer suppression, buy-box loss, listing issue, …). Under
-Pan-EU an empty *local* warehouse is not a stock-out (the pool fulfils it), so
-there's no separate local cause.
+Cause priority: **Physical (network) > Critically low (<3d) > Cooling down >
+Demand gap (EU)**.
 
 ### How impact is valued
 
@@ -86,7 +84,7 @@ so the model separates them. Reach (days-of-supply) drives the split:
 
 Cooling-down impact is booked as *miss* (voluntary), kept apart from involuntary
 *lost*. Category priority per day: **Physical (network) > Critically low (<3d) >
-Cooling down > Marketplace gap**. All thresholds are tunable in the app. Caveat: ad-spend-cut detection only
+Cooling down > Demand gap (EU)**. All thresholds are tunable in the app. Caveat: ad-spend-cut detection only
 works from when Novadata began reporting Advertising Costs (~Feb 2026); the
 price-hike lever spans the full year.
 

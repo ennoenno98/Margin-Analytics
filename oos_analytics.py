@@ -22,29 +22,29 @@ HYBRID data model — it combines two Amazon sources:
      below.
 
   2. Novadata daily margin export  (novadata_exports/margin_export_*.csv.gz)
-     Per-SKU per-marketplace daily Units / Sales / CM3. Gives marketplace-level
-     lost sales (a SKU that normally sells in DE suddenly goes quiet) and the
-     price + contribution margin per unit needed to value lost units in €.
+     Daily Units / Sales / CM3 per SKU. The account runs Pan-EU, so these are
+     pooled EU-wide per SKU (not split by country — a per-country split
+     understates true demand). Gives the demand rate and the price + CM3 per
+     unit needed to value lost units in €.
 
-A SKU×marketplace is OUT OF STOCK on a day when EITHER:
-  * the EU network sellable balance is 0 (real physical stock-out — ledger), OR
-  * FBA Available is 0 (Novadata snapshot), OR
-  * the marketplace went quiet: Units == 0 on a day enclosed by sales, for a
-    SKU whose demand rate is high enough that selling nothing is a real anomaly.
-Each OOS day is tagged with its cause: "Physical (network)" when the EU pool is
-empty, otherwise "Marketplace gap" (sales stopped despite EU stock — offer
-suppression, buy-box loss, listing issue, …).
+Everything is computed at SKU / EU level (one row per SKU per day). A SKU is
+OUT OF STOCK on a day when ANY of:
+  * the EU sellable balance is 0 (real physical stock-out — ledger), OR
+  * reach (days-of-supply) < 3 (critically low — effectively out), OR
+  * EU units == 0 on a day enclosed by sales, with the EU demand rate high
+    enough that selling nothing is a real anomaly (a demand gap).
+Cause priority: Physical (network) > Critically low (<3d) > Cooling down >
+Demand gap (EU).
 
 Lost units = expected daily demand − whatever still sold; valued at the SKU's
 trailing avg price (→ lost revenue) and avg CM3 per unit (→ lost CM3, the P&L
 impact).
 
 Separately, "Cooling down" days are when demand was *deliberately throttled*
-(ad spend cut and/or price raised) while stock was tight, to avoid a hard
-stock-out. Those are tagged distinctly and their forgone sales booked as
-revenue/CM3 *miss* (voluntary) rather than *lost* (involuntary), so the two are
-never double-counted. Category priority: Physical (network) > Cooling down >
-Marketplace gap.
+(ad spend cut and/or price raised) while stock was tight and the SKU was still
+selling (units > 0), to avoid a hard stock-out. Their forgone sales are booked
+as revenue/CM3 *miss* (voluntary) rather than *lost* (involuntary), so the two
+are never double-counted.
 
 Run locally:
     pip install -r requirements.txt
@@ -213,19 +213,18 @@ def load_ledger(path: Path | None):
 
 @st.cache_data(show_spinner="Computing stock-out history…")
 def compute_oos_long(margin_path: Path, ledger_path: Path | None):
-    """Build the per-day OOS panel from both sources.
+    """Build the per-day OOS panel at SKU / EU-pooled level.
 
-    Returns (long, meta, asof, eu):
-      long : one row per (Period, SKU, Marketplace Name) for every active
-             product-day, with the demand baseline, raw signals and the merged
-             ledger stock columns. flag_oos() turns this into OOS flags cheaply.
-      meta : per-SKU lookup (Product, Brand).
-      asof : most recent date.
-      eu   : EU-pooled ledger panel (for the inventory & risk view).
+    The account runs Pan-EU, so demand and stock are pooled across marketplaces:
+    the demand rate (lambda), price, CM3 and ad-spend baselines are all computed
+    on EU-wide totals per SKU, not split by country (a per-country split
+    understates true demand). One row per (Period, SKU).
+
+    Returns (long, meta, asof, eu).
     """
     df = load_margin(margin_path)
     eu = load_ledger(ledger_path)
-    keys = ["SKU", "Marketplace Name"]
+    keys = ["SKU"]
 
     g = df.groupby(["Period"] + keys, observed=True, as_index=False).agg(
         Units=("Units", "sum"), Sales=("Sales", "sum"),
@@ -270,7 +269,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     has_future = pos[::-1].cummax()[::-1]
 
     def melt(frame: pd.DataFrame, name: str) -> pd.Series:
-        s = frame.stack(["SKU", "Marketplace Name"], future_stack=True)
+        s = frame.stack("SKU", future_stack=True)
         s.name = name
         return s
 
@@ -289,7 +288,6 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
 
     # --- Merge the EU-pooled Amazon ledger stock signal ---
     long["SKU"] = long["SKU"].astype(str)
-    long["Marketplace Name"] = long["Marketplace Name"].astype(str)
     if not eu.empty:
         # Bring EU stock and a SKU-level days-of-supply (stock / trailing demand).
         e = eu.sort_values("Date").copy()
@@ -306,8 +304,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     for col in ("units", "sales", "cm3", "fba", "expected", "avg_price",
                 "avg_cm3_pu", "ppc", "base_ppc", "price", "eu_stock", "dos"):
         long[col] = long[col].astype("float32")
-    for col in ("SKU", "Marketplace Name"):
-        long[col] = long[col].astype("category")
+    long["SKU"] = long["SKU"].astype("category")
 
     info = df[["SKU", "Product", "Brand"]].dropna(subset=["SKU"]).copy()
     info["SKU"] = info["SKU"].astype(str)
@@ -371,7 +368,7 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
         phys_eu, "Physical (network)",
         np.where(low_reach, "Critically low (<%gd reach)" % oos_dos,
                  np.where(cooldown, "Cooling down",
-                          np.where(oos, "Marketplace gap", ""))),
+                          np.where(oos, "Demand gap (EU)", ""))),
     )
 
     lost_units = np.where(oos, np.clip(expected - units, 0, None), 0.0)
@@ -433,18 +430,15 @@ def load_english_titles(path: Path) -> pd.Series:
 
 
 def stockout_events(scope: pd.DataFrame) -> pd.DataFrame:
-    """Collapse consecutive OOS days into events per SKU×marketplace."""
+    """Collapse consecutive OOS days into events per SKU (EU level)."""
     d = scope[scope["oos"]].copy()
     if d.empty:
         return pd.DataFrame()
-    d = d.sort_values(["SKU", "Marketplace Name", "Period"])
-    keys = ["SKU", "Marketplace Name"]
-    gap = d.groupby(keys, observed=True)["Period"].diff().dt.days.fillna(1)
-    d["event_id"] = (gap > 1).groupby(
-        [d["SKU"].values, d["Marketplace Name"].values]
-    ).cumsum().values
+    d = d.sort_values(["SKU", "Period"])
+    gap = d.groupby("SKU", observed=True)["Period"].diff().dt.days.fillna(1)
+    d["event_id"] = (gap > 1).groupby(d["SKU"].values).cumsum().values
     ev = (
-        d.groupby(keys + ["event_id"], observed=True)
+        d.groupby(["SKU", "event_id"], observed=True)
         .agg(Start=("Period", "min"), End=("Period", "max"),
              Days=("Period", "count"),
              lost_units=("lost_units", "sum"), lost_rev=("lost_rev", "sum"),
@@ -481,8 +475,9 @@ require_login()
 st.title("📦 OOS Impact Analytics")
 st.caption(
     "Tracks Amazon out-of-stock impact over the year — estimated lost revenue "
-    "& contribution margin per SKU. Hybrid of the FBA Inventory Ledger (real "
-    "stock) and the Novadata margin export (marketplace sales & €)."
+    "& contribution margin per SKU. Pan-EU: demand (λ) and stock are pooled "
+    "EU-wide per SKU, not split by country. Hybrid of the FBA Inventory Ledger "
+    "(real stock) and the Novadata margin export (sales & €)."
 )
 
 margin_path = latest_export(EXPORTS_DIR)
@@ -510,17 +505,16 @@ if ledger_path is None:
     )
 
 # ---------- Filter bar ----------
-markets = sorted(long_all["Marketplace Name"].dropna().unique().tolist())
-c1, c2, c3, c4 = st.columns([1.2, 1.6, 1, 1.4])
-market = c1.selectbox("Marketplace", ["🌍 All countries"] + markets, index=0)
+c2, c3, c4 = st.columns([1.6, 1, 1.4])
 min_date, max_date = long_all["Period"].min().date(), asof.date()
 date_range = c2.date_input("Date range", value=(min_date, max_date),
                            min_value=min_date, max_value=max_date)
 min_demand = c3.slider(
     "Min demand (units/day)", 1.0, 10.0, DEFAULT_MIN_DEMAND, 0.5,
-    help="A zero-sales day is only treated as a marketplace stock-out when the "
-         "SKU's expected demand rate clears this — high enough that selling "
-         "nothing is a real anomaly. Physical (ledger) stock-outs always count.",
+    help="A zero-sales day is only treated as a demand-gap stock-out when the "
+         "SKU's EU-wide expected demand rate clears this — high enough that "
+         "selling nothing is a real anomaly. Physical (ledger) stock-outs and "
+         "critically-low reach always count.",
 )
 search = c4.text_input("SKU or Product contains", "")
 
@@ -550,8 +544,6 @@ else:
 scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
                  price_up=cd_price, oos_dos=oos_reach)
 scope = scope[(scope["Period"] >= start) & (scope["Period"] <= end)]
-if market != "🌍 All countries":
-    scope = scope[scope["Marketplace Name"] == market]
 if search.strip():
     s = search.strip().lower()
     skus = scope["SKU"].astype(str).str.lower()
@@ -572,7 +564,7 @@ agg = (
 active = scope.groupby("SKU", observed=True)["Period"].nunique().rename("active_days")
 agg = agg.merge(active, on="SKU", how="left")
 agg["oos_rate"] = (agg["oos_days"] / agg["active_days"] * 100).round(1)
-agg["Product"] = agg["SKU"].map(prod_map)
+agg["Product"] = agg["SKU"].map(prod_short)
 agg["Brand"] = agg["SKU"].map(brand_map)
 agg["cur_stock"] = agg["SKU"].map(inv_stock)
 agg["days_of_supply"] = agg["SKU"].map(inv_dos).round(0)
@@ -602,7 +594,7 @@ c4.metric("Cool-down SKU-days", fmt_num(len(cd_rows)))
 
 st.caption(
     f"Data through **{asof.date()}** · scope **{start.date()} → {end.date()}** "
-    f"· marketplace **{market}**. *Lost* = sales forfeited while out of stock "
+    "· EU-pooled (Pan-EU). *Lost* = sales forfeited while out of stock "
     "(involuntary); *Miss* = sales given up by deliberately throttling demand "
     "(price up / ad cut) to avoid OOS. Both valued as contribution margin (CM3) "
     "— the true P&L impact."
@@ -698,10 +690,6 @@ with tab2:
     st.subheader("SKU drill-down")
     sel_sku = st.selectbox("SKU", agg["SKU"].tolist(), key="drill")
     drill = scope[scope["SKU"] == sel_sku].sort_values("Period")
-    if market == "🌍 All countries" and drill["Marketplace Name"].nunique() > 1:
-        mkts = sorted(drill["Marketplace Name"].dropna().unique().tolist())
-        sel_mkt = st.selectbox("Marketplace", mkts, key="drillmkt")
-        drill = drill[drill["Marketplace Name"] == sel_mkt]
     d = drill.groupby("Period", observed=True).agg(
         units=("units", "sum"), expected=("expected", "mean"),
         eu_stock=("eu_stock", "max"), oos=("oos", "max")).reset_index()
@@ -732,7 +720,7 @@ with tab3:
                 "enable days-of-supply and low-stock risk. See README_OOS.md.")
     else:
         risk = inv.copy()
-        risk["Product"] = risk["SKU"].map(prod_map)
+        risk["Product"] = risk["SKU"].map(prod_short)
         if search.strip():
             s = search.strip().lower()
             risk = risk[risk["SKU"].str.lower().str.contains(s)
@@ -768,11 +756,11 @@ with tab4:
     if ev.empty:
         st.info("No stock-out events in the current scope.")
     else:
-        ev["Product"] = ev["SKU"].map(prod_map)
+        ev["Product"] = ev["SKU"].map(prod_short)
         ev = ev.sort_values("lost_cm3", ascending=False)
-        disp = ev[["SKU", "Product", "Marketplace Name", "cause", "Start", "End",
+        disp = ev[["SKU", "Product", "cause", "Start", "End",
                    "Days", "lost_units", "lost_rev", "lost_cm3"]].rename(columns={
-            "Marketplace Name": "Marketplace", "cause": "Cause",
+            "cause": "Cause",
             "lost_units": "Lost units", "lost_rev": "Lost revenue (€)",
             "lost_cm3": "Lost CM3 (€)"})
         disp["Start"] = disp["Start"].dt.date
@@ -818,7 +806,7 @@ with tab5:
                  rev_miss=("rev_miss", "sum"), cm3_miss=("cm3_miss", "sum"))
             .reset_index().sort_values("cm3_miss", ascending=False)
         )
-        cagg["Product"] = cagg["SKU"].map(prod_map)
+        cagg["Product"] = cagg["SKU"].map(prod_short)
         table = cagg[["SKU", "Product", "cool_days", "miss_units",
                       "rev_miss", "cm3_miss"]].rename(columns={
             "cool_days": "Cool-down days", "miss_units": "Units miss",

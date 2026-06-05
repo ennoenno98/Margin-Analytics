@@ -23,7 +23,7 @@ CHART = ROOT / "reports" / "_oos_sheet_example.png"
 # Model parameters (match oos_analytics.py defaults).
 W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 3.0, 30
 PPC_CUT, PRICE_UP, MIN_PPC = 0.5, 0.08, 2.0
-SKU, MKT = "VV-VITA-311", "amazon.it"
+SKU = "VV-VITA-231"   # analysed EU-wide (Pan-EU), pooling all marketplaces
 
 # ---------- compute the example SKU's daily series ----------
 mp = ROOT / "novadata_exports/margin_export_2026-06-03.csv.gz"
@@ -40,7 +40,7 @@ df["AdSpend"] = (-df["Advertising Costs"]).clip(lower=0)
 
 full = pd.date_range(df.Period.min(), df.Period.max(), freq="D")
 asof = full.max()
-d = df[(df.SKU == SKU) & (df["Marketplace Name"] == MKT)].set_index("Period")
+d = df[df.SKU == SKU].groupby("Period")[["Units", "Sales", "CM3", "AdSpend"]].sum()
 units = d["Units"].reindex(full).fillna(0.0)
 sales = d["Sales"].reindex(full).fillna(0.0)
 cm3 = d["CM3"].reindex(full).fillna(0.0)
@@ -81,7 +81,7 @@ oos = (phys | low_reach | oos_gap) & ~cooldown
 cat = np.where(phys, "Physical OOS",
       np.where(low_reach, "Critically low (<3d)",
       np.where(cooldown, "Cooling down",
-      np.where(oos, "Marketplace gap", "—"))))
+      np.where(oos, "Demand gap (EU)", "—"))))
 lost_u = np.where(oos, np.clip(expected - units, 0, None), 0.0)
 miss_u = np.where(cooldown, np.clip(expected - units, 0, None), 0.0)
 panel = pd.DataFrame({
@@ -93,7 +93,7 @@ panel = pd.DataFrame({
 
 # annual summary (this SKU x marketplace)
 summ = dict(
-    oos_days=int((panel["label"].isin(["Physical OOS", "Critically low (<3d)", "Marketplace gap"])).sum()),
+    oos_days=int((panel["label"].isin(["Physical OOS", "Critically low (<3d)", "Demand gap (EU)"])).sum()),
     cool_days=int((panel["label"] == "Cooling down").sum()),
     lost_rev=panel.lost_rev.sum(), lost_cm3=panel.lost_cm3.sum(),
     miss_rev=panel.miss_rev.sum(), miss_cm3=panel.miss_cm3.sum(),
@@ -101,7 +101,7 @@ summ = dict(
 title_en = pd.read_csv(ROOT / "product_titles_en.csv", dtype=str).set_index("SKU")["Title"].get(SKU, SKU)
 
 # ---------- chart: auto-pick the ~75-day window that best shows BOTH ----------
-OOS_LBLS = ["Physical OOS", "Critically low (<3d)", "Marketplace gap"]
+OOS_LBLS = ["Physical OOS", "Critically low (<3d)", "Demand gap (EU)"]
 is_oos = panel["label"].isin(OOS_LBLS).astype(int)
 is_cd = (panel["label"] == "Cooling down").astype(int)
 ro = is_oos.rolling(75, min_periods=1).sum()
@@ -110,7 +110,7 @@ score = pd.concat([ro, rc], axis=1).min(axis=1)   # window with both present
 w_end = score.idxmax(); w_start = w_end - pd.Timedelta(days=74)
 win = pd.date_range(w_start, w_end)
 p = panel.reindex(win)
-w_oos = int(p["label"].isin(["Physical OOS", "Critically low (<3d)", "Marketplace gap"]).sum())
+w_oos = int(p["label"].isin(["Physical OOS", "Critically low (<3d)", "Demand gap (EU)"]).sum())
 w_cd = int((p["label"] == "Cooling down").sum())
 w_hi, w_lo, w_reach = p.eu_stock.max(), p.eu_stock.min(), p.dos.min()
 cdw = p[p["label"] == "Cooling down"]
@@ -128,14 +128,14 @@ fig, ax = plt.subplots(figsize=(9, 3.4))
 ax.bar(win, p.units.values, color="#2a9d8f", label="Units sold/day")
 ax.plot(win, p["exp"].values, color="#264653", lw=1.6, ls=":", label="Expected demand (lambda)")
 shade = {"Physical OOS": "#b00020", "Critically low (<3d)": "#d32f2f",
-         "Marketplace gap": "#f4a261", "Cooling down": "#9b5de5"}
+         "Demand gap (EU)": "#f4a261", "Cooling down": "#9b5de5"}
 for c, col in shade.items():
     for x in win[p["label"].values == c]:
         ax.axvspan(x - pd.Timedelta(hours=12), x + pd.Timedelta(hours=12), color=col, alpha=0.18, lw=0)
 ax2 = ax.twinx()
 ax2.plot(win, p.eu_stock.values, color="#8d99ae", lw=1.6, label="EU stock (ledger)")
 ax.set_ylabel("Units / day"); ax2.set_ylabel("EU sellable stock")
-ax.set_title(f"{SKU} ({title_en}) — {MKT}: {w_start:%d %b} – {w_end:%d %b %Y}")
+ax.set_title(f"{SKU} ({title_en}) — EU pooled: {w_start:%d %b} – {w_end:%d %b %Y}")
 h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
 ax.legend(h1 + h2, l1 + l2, loc="upper center", fontsize=7.5, ncol=3)
 fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(CHART, dpi=150); plt.close(fig)
@@ -183,7 +183,7 @@ def mktable(rows, col_w=None, header=True, fs=8.2, hl=None):
 P("OOS Impact Analytics — Methodology Sheet", H1)
 P("How the dashboard detects out-of-stock and demand-throttling events and "
   "values their revenue / contribution-margin impact. Worked example: "
-  f"<b>{SKU} — {title_en}</b> ({MKT}). Prepared for review.", small)
+  f"<b>{SKU} — {title_en}</b>, analysed EU-wide (Pan-EU). Prepared for review.", small)
 gap()
 
 P("1. Data sources", H2)
@@ -213,7 +213,7 @@ E.append(mktable([
     ["1", "Physical OOS", "EU sellable balance = 0", "Lost (involuntary)"],
     ["2", "Critically low", "Reach < 3 days", "Lost (involuntary)"],
     ["3", "Cooling down", "3 <= reach < 30 days, still selling (units > 0),\nthrottled (price >= +8% and/or ad cut >= 50%)", "Miss (voluntary)"],
-    ["4", "Marketplace gap", "Units = 0 on a day enclosed by sales,\nlambda >= 3/day (incl. throttles that hit 0)", "Lost (involuntary)"],
+    ["4", "Demand gap (EU)", "Units = 0 on a day enclosed by sales,\nlambda >= 3/day (incl. throttles that hit 0)", "Lost (involuntary)"],
 ], col_w=[1.4*cm, 3.0*cm, 7.7*cm, 3.4*cm], fs=8))
 P("Guards: the SKU must already be selling (ignores pre-launch); a zero-run must "
   "be enclosed by later sales or be within the last 21 days (ignores discontinued "
@@ -234,7 +234,7 @@ P("On any flagged day: <b>missed units = max(lambda - actual units, 0)</b> "
 gap()
 
 P("5. Worked example", H2)
-P(f"<b>{SKU} — {title_en}</b>, {MKT}. Full year on this marketplace: "
+P(f"<b>{SKU} — {title_en}</b>, EU-wide (Pan-EU pooled). Full year: "
   f"<b>{summ['oos_days']} OOS days</b> (lost €{eu_(summ['lost_rev'])} revenue / "
   f"€{eu_(summ['lost_cm3'])} CM3) and <b>{summ['cool_days']} cooling-down days</b> "
   f"(miss €{eu_(summ['miss_rev'])} revenue / €{eu_(summ['miss_cm3'])} CM3).")
