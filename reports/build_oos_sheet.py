@@ -113,6 +113,17 @@ p = panel.reindex(win)
 w_oos = int(p["label"].isin(["Physical OOS", "Critically low (<3d)", "Marketplace gap"]).sum())
 w_cd = int((p["label"] == "Cooling down").sum())
 w_hi, w_lo, w_reach = p.eu_stock.max(), p.eu_stock.min(), p.dos.min()
+cdw = p[p["label"] == "Cooling down"]
+cd_price = cdw["price"].median() if len(cdw) else float("nan")
+cd_units = cdw["units"].median() if len(cdw) else 0.0
+base_pr = avg_price.reindex(win).median()
+lam_w = p["exp"].median()
+# price + ad spend just BEFORE the throttle vs DURING it
+cd0 = cdw.index.min() if len(cdw) else win[0]
+pre = pd.date_range(cd0 - pd.Timedelta(days=30), cd0 - pd.Timedelta(days=1))
+pre_price = price.reindex(pre).dropna().median()
+pre_ppc = ppc.reindex(pre).mean()
+cd_ppc = ppc.reindex(cdw.index).mean() if len(cdw) else 0.0
 fig, ax = plt.subplots(figsize=(9, 3.4))
 ax.bar(win, p.units.values, color="#2a9d8f", label="Units sold/day")
 ax.plot(win, p["exp"].values, color="#264653", lw=1.6, ls=":", label="Expected demand (lambda)")
@@ -137,7 +148,7 @@ ex = pd.concat([
     exw[exw["label"] == "—"].iloc[::15].head(4),
 ]).drop_duplicates().sort_index()
 rows = [["Date", "Units", "λ", "EU stk", "Reach", "Price", "Category", "Lost €", "Miss €"]]
-for dt, r in ex.head(22).iterrows():
+for dt, r in ex.head(15).iterrows():
     rows.append([dt.strftime("%m-%d"), f"{r.units:.0f}", f"{r['exp']:.0f}",
                  f"{r.eu_stock:.0f}", ("%.0f" % r.dos) if pd.notna(r.dos) else "–",
                  ("%.2f" % r.price) if pd.notna(r.price) else "–", r["label"],
@@ -237,6 +248,19 @@ P(f"Highlighted window {w_start:%d %b %Y} – {w_end:%d %b %Y}: EU stock ranged 
   "genuine stock-out as reach collapsed. Note the balance rarely hits literally "
   "zero, so the <b>reach &lt; 3</b> rule, not a balance-of-zero rule, is what "
   "catches the hard stock-out.")
+gap(0.15)
+P("<b>What \"cooling down\" means here.</b> On the purple days the SKU kept "
+  "selling (units &gt; 0) but demand was deliberately damped to stretch the "
+  f"remaining stock to the next shipment. <b>Before cooling down</b> it sold at "
+  f"~€{pre_price:.2f} with ~€{eu_(pre_ppc)}/day of ad spend; <b>during the "
+  f"throttle</b> the price was lifted to ~€{cd_price:.2f} and ad spend cut to "
+  f"~€{eu_(cd_ppc)}/day. Sales fell to about {cd_units:.0f}/day versus the "
+  f"expected ~{lam_w:.0f}/day, and that gap is booked as a <b>voluntary miss</b> "
+  "— a pricing / advertising choice to protect availability and the listing's "
+  "ranking — not a lost stock-out. Crucially the SKU keeps selling: the moment a "
+  "throttle pushes sales to zero it is no longer cooling down and counts as OOS "
+  "(lost). Cooling down trades a little volume now (the miss) to avoid the larger "
+  "ranking and lost-sales hit of a full stock-out.")
 gap(0.15)
 P("Representative days (Lost/Miss shown as CM3 €):", small)
 E.append(mktable(rows, col_w=[1.5*cm, 1.2*cm, 1.0*cm, 1.4*cm, 1.3*cm, 1.4*cm,
