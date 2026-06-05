@@ -108,6 +108,17 @@ ro = is_oos.rolling(75, min_periods=1).sum()
 rc = is_cd.rolling(75, min_periods=1).sum()
 score = pd.concat([ro, rc], axis=1).min(axis=1)   # window with both present
 w_end = score.idxmax(); w_start = w_end - pd.Timedelta(days=74)
+# Extend the window to show the first restock after the stock-out episode.
+oos_in = panel["label"].isin(OOS_LBLS)
+fo = oos_in[(oos_in.index >= w_start) & oos_in]
+first_oos = fo.index.min() if len(fo) else pd.NaT
+restock_day = None
+if pd.notna(first_oos):
+    jumps = panel["eu_stock"].diff().loc[first_oos: first_oos + pd.Timedelta(days=60)]
+    if len(jumps) and jumps.max() > 0:
+        restock_day = jumps.idxmax()
+        w_start = min(w_start, first_oos - pd.Timedelta(days=7))
+        w_end = min(asof, max(w_end, restock_day + pd.Timedelta(days=14)))
 win = pd.date_range(w_start, w_end)
 p = panel.reindex(win)
 w_oos = int(p["label"].isin(["Physical OOS", "Critically low (<3d)", "Demand gap (EU)"]).sum())
@@ -140,15 +151,16 @@ h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels(
 ax.legend(h1 + h2, l1 + l2, loc="upper center", fontsize=7.5, ncol=3)
 fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(CHART, dpi=150); plt.close(fig)
 
-# representative rows: ensure both cooling-down and OOS days are shown
+# representative rows: cooling-down + OOS days + the first restock days
 exw = panel.reindex(win)
-ex = pd.concat([
-    exw[exw["label"] == "Cooling down"].head(8),
-    exw[exw["label"].isin(OOS_LBLS)].head(10),
-    exw[exw["label"] == "—"].iloc[::15].head(4),
-]).drop_duplicates().sort_index()
+parts = [exw[exw["label"] == "Cooling down"].head(5),
+         exw[exw["label"].isin(OOS_LBLS)].head(6)]
+if restock_day is not None:
+    parts.append(panel.reindex(pd.date_range(restock_day - pd.Timedelta(days=1),
+                                             restock_day + pd.Timedelta(days=3))))
+ex = pd.concat(parts).drop_duplicates().sort_index()
 rows = [["Date", "Units", "λ", "EU stk", "Reach", "Price", "Category", "Lost €", "Miss €"]]
-for dt, r in ex.head(15).iterrows():
+for dt, r in ex.head(16).iterrows():
     rows.append([dt.strftime("%m-%d"), f"{r.units:.0f}", f"{r['exp']:.0f}",
                  f"{r.eu_stock:.0f}", ("%.0f" % r.dos) if pd.notna(r.dos) else "–",
                  ("%.2f" % r.price) if pd.notna(r.price) else "–", r["label"],
@@ -240,6 +252,10 @@ P(f"<b>{SKU} — {title_en}</b>, EU-wide (Pan-EU pooled). Full year: "
   f"(miss €{eu_(summ['miss_rev'])} revenue / €{eu_(summ['miss_cm3'])} CM3).")
 E.append(Image(str(CHART), width=16.5*cm, height=6.2*cm))
 gap(0.15)
+restock_txt = (f" Stock was replenished on <b>{restock_day:%d %b}</b> "
+               "(EU balance jumps in the chart), after which sales recover and "
+               "the flags clear — the table's last rows show those first "
+               "restock days.") if restock_day is not None else ""
 P(f"Highlighted window {w_start:%d %b %Y} – {w_end:%d %b %Y}: EU stock ranged "
   f"from ~{eu_(w_hi)} down to ~{eu_(w_lo)} units and reach bottomed at "
   f"~{w_reach:.0f} day(s). In this window the model flagged <b>{w_oos} OOS day(s)</b> "
@@ -247,7 +263,7 @@ P(f"Highlighted window {w_start:%d %b %Y} – {w_end:%d %b %Y}: EU stock ranged 
   "was throttled (price up / ad spend cut) while stock was tight, then went into "
   "genuine stock-out as reach collapsed. Note the balance rarely hits literally "
   "zero, so the <b>reach &lt; 3</b> rule, not a balance-of-zero rule, is what "
-  "catches the hard stock-out.")
+  "catches the hard stock-out." + restock_txt)
 gap(0.15)
 P("<b>What \"cooling down\" means here.</b> On the purple days the SKU kept "
   "selling (units &gt; 0) but demand was deliberately damped to stretch the "
