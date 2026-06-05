@@ -27,8 +27,11 @@ HYBRID data model — it combines two Amazon sources:
      understates true demand). Gives the demand rate and the price + CM3 per
      unit needed to value lost units in €.
 
-Everything is computed at SKU / EU level (one row per SKU per day). A SKU is
-OUT OF STOCK on a day when ANY of:
+Two independent regions are tracked, switchable in the dashboard: **EU** (the
+Pan-EU pool — all marketplaces except amazon.co.uk) and **GB** (the separate
+post-Brexit UK warehouse — amazon.co.uk). Within each region everything is
+computed at SKU level (one row per SKU per day). A SKU is OUT OF STOCK on a day
+when ANY of:
   * the EU sellable balance is 0 (real physical stock-out — ledger), OR
   * reach (days-of-supply) < 3 (critically low — effectively out), OR
   * EU units == 0 on a day enclosed by sales, with the EU demand rate high
@@ -177,15 +180,15 @@ def load_margin(path: Path) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_ledger(path: Path | None):
-    """Amazon FBA Inventory Ledger → EU-pooled daily panel.
+    """Amazon FBA Inventory Ledger → daily stock panel per SKU and region.
 
-    Returns one row per (SKU, Date) — sellable EU network balance, units
-    shipped to customers (demand) and units in transit. The seller runs Pan-EU,
-    so availability is pooled across the network: a SKU is physically out of
-    stock only when the *whole* EU sellable balance hits zero. Empty if no
-    ledger file is present (the tool then degrades to Novadata signals only).
+    Returns one row per (SKU, region, Date) — sellable balance, units shipped
+    (demand) and units in transit. Region is **EU** (the Pan-EU pool) or **GB**
+    (the separate post-Brexit warehouse), kept apart so each is its own pool.
+    Empty if no ledger file is present.
     """
-    empty_eu = pd.DataFrame(columns=["SKU", "Date", "eu_stock", "shipped", "in_transit"])
+    empty_eu = pd.DataFrame(
+        columns=["SKU", "region", "Date", "eu_stock", "shipped", "in_transit"])
     if path is None:
         return empty_eu
     KEEP = {
@@ -199,11 +202,11 @@ def load_ledger(path: Path | None):
     for c in ("Ending Warehouse Balance", "Customer Shipments",
               "In Transit Between Warehouses"):
         led[c] = pd.to_numeric(led.get(c), errors="coerce").fillna(0.0)
-    # GB is a separate (post-Brexit) warehouse, NOT part of the Pan-EU pool, so
-    # exclude it from the EU stock figures.
-    led = led[(led["Disposition"] == "SELLABLE") & (led.get("Location") != "GB")]
+    led = led[led["Disposition"] == "SELLABLE"].copy()
+    # GB is a separate (post-Brexit) warehouse, NOT part of the Pan-EU pool.
+    led["region"] = np.where(led.get("Location") == "GB", "GB", "EU")
 
-    eu = led.groupby(["SKU", "Date"], as_index=False).agg(
+    eu = led.groupby(["SKU", "region", "Date"], as_index=False).agg(
         eu_stock=("Ending Warehouse Balance", "sum"),
         shipped=("Customer Shipments", "sum"),
         in_transit=("In Transit Between Warehouses", "sum"),
@@ -215,21 +218,22 @@ def load_ledger(path: Path | None):
 
 @st.cache_data(show_spinner="Computing stock-out history…")
 def compute_oos_long(margin_path: Path, ledger_path: Path | None):
-    """Build the per-day OOS panel at SKU / EU-pooled level.
+    """Build the per-day OOS panel at SKU level, split into two regions.
 
-    The account runs Pan-EU, so demand and stock are pooled across marketplaces:
-    the demand rate (lambda), price, CM3 and ad-spend baselines are all computed
-    on EU-wide totals per SKU, not split by country (a per-country split
-    understates true demand). One row per (Period, SKU).
+    Demand and stock are pooled within each region — **EU** (the Pan-EU pool, all
+    marketplaces except amazon.co.uk) and **GB** (the separate post-Brexit
+    warehouse, amazon.co.uk). Within a region the demand rate (lambda), price,
+    CM3 and ad-spend baselines are computed on the pooled totals per SKU. One
+    row per (Period, SKU, region).
 
     Returns (long, meta, asof, eu).
     """
     df = load_margin(margin_path)
-    # GB is a separate warehouse outside Pan-EU — drop amazon.co.uk demand so EU
-    # λ and EU stock stay consistent (GB is excluded from both).
-    df = df[df["Marketplace Name"] != "amazon.co.uk"]
+    # Region split: GB (amazon.co.uk) is its own pool, everything else is EU.
+    df["region"] = np.where(
+        df["Marketplace Name"].astype(str) == "amazon.co.uk", "GB", "EU")
     eu = load_ledger(ledger_path)
-    keys = ["SKU"]
+    keys = ["SKU", "region"]
 
     g = df.groupby(["Period"] + keys, observed=True, as_index=False).agg(
         Units=("Units", "sum"), Sales=("Sales", "sum"),
@@ -274,7 +278,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     has_future = pos[::-1].cummax()[::-1]
 
     def melt(frame: pd.DataFrame, name: str) -> pd.Series:
-        s = frame.stack("SKU", future_stack=True)
+        s = frame.stack(["SKU", "region"], future_stack=True)
         s.name = name
         return s
 
@@ -291,16 +295,17 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     long["recent"] = long["Period"] >= (asof - pd.Timedelta(days=TAIL_DAYS))
     long["fba_known"] = long["fba"].notna()
 
-    # --- Merge the EU-pooled Amazon ledger stock signal ---
+    # --- Merge the region's ledger stock + days-of-supply (per SKU × region) ---
     long["SKU"] = long["SKU"].astype(str)
+    long["region"] = long["region"].astype(str)
     if not eu.empty:
-        # Bring EU stock and a SKU-level days-of-supply (stock / trailing demand).
         e = eu.sort_values("Date").copy()
-        e["avgship"] = e.groupby("SKU")["shipped"].transform(
+        e["avgship"] = e.groupby(["SKU", "region"])["shipped"].transform(
             lambda s: s.rolling(28, min_periods=5).mean())
         e["dos"] = e["eu_stock"] / e["avgship"].where(e["avgship"] > 0)
-        long = long.merge(e[["SKU", "Date", "eu_stock", "dos"]],
-                          left_on=["SKU", "Period"], right_on=["SKU", "Date"],
+        long = long.merge(e[["SKU", "region", "Date", "eu_stock", "dos"]],
+                          left_on=["SKU", "region", "Period"],
+                          right_on=["SKU", "region", "Date"],
                           how="left").drop(columns=["Date"])
     else:
         long["eu_stock"] = np.nan
@@ -309,7 +314,8 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     for col in ("units", "sales", "cm3", "fba", "expected", "avg_price",
                 "avg_cm3_pu", "ppc", "base_ppc", "price", "eu_stock", "dos"):
         long[col] = long[col].astype("float32")
-    long["SKU"] = long["SKU"].astype("category")
+    for col in ("SKU", "region"):
+        long[col] = long[col].astype("category")
 
     info = df[["SKU", "Product", "Brand"]].dropna(subset=["SKU"]).copy()
     info["SKU"] = info["SKU"].astype(str)
@@ -456,16 +462,16 @@ def stockout_events(scope: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def inventory_status(eu: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
-    """Current stock + days-of-supply per SKU from the EU-pooled ledger."""
+    """Current stock + days-of-supply per SKU × region from the ledger."""
     if eu.empty:
         return pd.DataFrame()
     eu = eu.sort_values("Date")
-    last = eu.groupby("SKU").agg(cur_stock=("eu_stock", "last"),
-                                 in_transit=("in_transit", "last"),
-                                 last_date=("Date", "max")).reset_index()
+    last = eu.groupby(["SKU", "region"]).agg(
+        cur_stock=("eu_stock", "last"), in_transit=("in_transit", "last"),
+        last_date=("Date", "max")).reset_index()
     recent = eu[eu["Date"] >= (eu["Date"].max() - pd.Timedelta(days=30))]
-    demand = recent.groupby("SKU")["shipped"].mean().rename("avg_daily_demand")
-    out = last.merge(demand, on="SKU", how="left")
+    demand = recent.groupby(["SKU", "region"])["shipped"].mean().rename("avg_daily_demand")
+    out = last.merge(demand, on=["SKU", "region"], how="left")
     out["days_of_supply"] = (
         out["cur_stock"] / out["avg_daily_demand"].where(out["avg_daily_demand"] > 0)
     )
@@ -499,8 +505,6 @@ if not en_titles.empty:
 prod_short = prod_map.map(short_product)   # readable names for tables
 brand_map = meta.set_index("SKU")["Brand"]
 inv = inventory_status(eu, asof)
-inv_stock = inv.set_index("SKU")["cur_stock"] if not inv.empty else pd.Series(dtype=float)
-inv_dos = inv.set_index("SKU")["days_of_supply"] if not inv.empty else pd.Series(dtype=float)
 
 if ledger_path is None:
     st.warning(
@@ -510,18 +514,30 @@ if ledger_path is None:
     )
 
 # ---------- Filter bar ----------
-c2, c3, c4 = st.columns([1.6, 1, 1.4])
+REGION_LABEL = {"EU": "🇪🇺 EU (Pan-EU)", "GB": "🇬🇧 GB (UK warehouse)"}
+regions = [r for r in ["EU", "GB"] if r in set(long_all["region"].unique())]
+c1, c2, c3, c4 = st.columns([1.1, 1.5, 1, 1.3])
+region = c1.selectbox("Region", regions, index=0,
+                      format_func=lambda r: REGION_LABEL.get(r, r),
+                      help="EU = the Pan-EU pool (all marketplaces except "
+                           "amazon.co.uk). GB = the separate UK warehouse "
+                           "(amazon.co.uk). They are tracked as independent pools.")
 min_date, max_date = long_all["Period"].min().date(), asof.date()
 date_range = c2.date_input("Date range", value=(min_date, max_date),
                            min_value=min_date, max_value=max_date)
 min_demand = c3.slider(
     "Min demand (units/day)", 1.0, 10.0, DEFAULT_MIN_DEMAND, 0.5,
     help="A zero-sales day is only treated as a demand-gap stock-out when the "
-         "SKU's EU-wide expected demand rate clears this — high enough that "
+         "SKU's pooled expected demand rate clears this — high enough that "
          "selling nothing is a real anomaly. Physical (ledger) stock-outs and "
          "critically-low reach always count.",
 )
 search = c4.text_input("SKU or Product contains", "")
+
+# Region-scoped current-stock lookups for the ranking / status columns.
+inv_r = inv[inv["region"] == region] if not inv.empty else inv
+inv_stock = inv_r.set_index("SKU")["cur_stock"] if not inv_r.empty else pd.Series(dtype=float)
+inv_dos = inv_r.set_index("SKU")["days_of_supply"] if not inv_r.empty else pd.Series(dtype=float)
 
 with st.expander("Stock-out & cooling-down thresholds"):
     cc1, cc2, cc3, cc4 = st.columns(4)
@@ -548,7 +564,8 @@ else:
 # ---------- Apply scope ----------
 scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
                  price_up=cd_price, oos_dos=oos_reach)
-scope = scope[(scope["Period"] >= start) & (scope["Period"] <= end)]
+scope = scope[(scope["region"] == region)
+              & (scope["Period"] >= start) & (scope["Period"] <= end)]
 if search.strip():
     s = search.strip().lower()
     skus = scope["SKU"].astype(str).str.lower()
@@ -599,7 +616,7 @@ c4.metric("Cool-down SKU-days", fmt_num(len(cd_rows)))
 
 st.caption(
     f"Data through **{asof.date()}** · scope **{start.date()} → {end.date()}** "
-    "· EU-pooled (Pan-EU). *Lost* = sales forfeited while out of stock "
+    f"· region **{REGION_LABEL.get(region, region)}**. *Lost* = sales forfeited while out of stock "
     "(involuntary); *Miss* = sales given up by deliberately throttling demand "
     "(price up / ad cut) to avoid OOS. Both valued as contribution margin (CM3) "
     "— the true P&L impact."
@@ -720,11 +737,11 @@ with tab2:
 #  Tab 3 — Inventory & risk (ledger-driven)
 # ======================================================================
 with tab3:
-    if inv.empty:
+    if inv_r.empty:
         st.info("Upload an Amazon FBA Inventory Ledger to `amazon_ledger/` to "
                 "enable days-of-supply and low-stock risk. See README_OOS.md.")
     else:
-        risk = inv.copy()
+        risk = inv_r.copy()
         risk["Product"] = risk["SKU"].map(prod_short)
         if search.strip():
             s = search.strip().lower()

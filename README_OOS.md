@@ -56,6 +56,10 @@ Thresholds live at the top of `oos_analytics.py`
 
 ## The dashboard
 
+A **Region** toggle at the top switches between **🇪🇺 EU** (the Pan-EU pool) and
+**🇬🇧 GB** (the separate UK warehouse / amazon.co.uk) — each tracked as an
+independent pool (own stock, demand λ, reach and impact).
+
 - **Most affected SKUs** — KPI tiles + a ranked table (lost revenue / lost CM3,
   OOS days, OOS rate, current stock & days-of-supply) and a top-N bar chart.
 - **Impact over time** — lost € + OOS-days by month/quarter, a SKU × month
