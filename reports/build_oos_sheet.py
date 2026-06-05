@@ -162,7 +162,7 @@ if restock_day is not None:
                                              restock_day + pd.Timedelta(days=3))))
 ex = pd.concat(parts).drop_duplicates().sort_index()
 rows = [["Date", "Units", "λ", "EU stk", "Reach", "Price", "Category", "Lost €", "Miss €"]]
-for dt, r in ex.head(16).iterrows():
+for dt, r in ex.head(12).iterrows():
     rows.append([dt.strftime("%m-%d"), f"{r.units:.0f}", f"{r['exp']:.0f}",
                  f"{r.eu_stock:.0f}", ("%.0f" % r.dos) if pd.notna(r.dos) else "–",
                  ("%.2f" % r.price) if pd.notna(r.price) else "–", r["label"],
