@@ -285,7 +285,15 @@ E.append(mktable(rows, col_w=[1.5*cm, 1.2*cm, 1.0*cm, 1.4*cm, 1.3*cm, 1.4*cm,
                               4.0*cm, 1.5*cm, 1.5*cm], fs=7.6))
 gap()
 
-P("6. Caveats", H2)
+P("6. Caveats &amp; rules", H2)
+P("<b>Available stock</b> = on-hand sellable + units in transit between FCs, so a "
+  "Pan-EU redistribution (e.g. a bulk receipt landing at the Poland hub, then "
+  "moving to other FCs over ~1-3 weeks) is not read as a stock-out. <b>Customer "
+  "returns do not end a stock-out</b> — once OOS, a SKU stays OOS through "
+  "return-driven balance blips until a genuine inbound Receipt or sales recover "
+  "to &gt;= half of expected. <b>GB</b> is a separate (non-Pan-EU) warehouse, "
+  "analysed on its own.", small)
+gap(0.1)
 P("Impact figures are estimates (assume the SKU would have sold at its recent "
   "rate). Ad-spend-cut detection only applies from when Novadata began reporting "
   "Advertising Costs (~Feb 2026); the price-hike lever spans the full year. Reach "
