@@ -566,23 +566,35 @@ if ledger_path is None:
 # ---------- Filter bar ----------
 REGION_LABEL = {"EU": "🇪🇺 EU (Pan-EU)", "GB": "🇬🇧 GB (UK warehouse)"}
 regions = [r for r in ["EU", "GB"] if r in set(long_all["region"].unique())]
-c1, c2, c3, c4 = st.columns([1.1, 1.5, 1, 1.3])
+c1, c2, c3, c4, c5 = st.columns([1.1, 0.95, 1.2, 0.9, 1.25])
 region = c1.selectbox("Region", regions, index=0,
                       format_func=lambda r: REGION_LABEL.get(r, r),
                       help="EU = the Pan-EU pool (all marketplaces except "
                            "amazon.co.uk). GB = the separate UK warehouse "
                            "(amazon.co.uk). They are tracked as independent pools.")
-min_date, max_date = long_all["Period"].min().date(), asof.date()
-date_range = c2.date_input("Date range", value=(min_date, max_date),
-                           min_value=min_date, max_value=max_date)
-min_demand = c3.slider(
+pmin, pmax = long_all["Period"].min(), asof
+ptype = c2.selectbox("Period", ["Full range", "Quarter", "Month"], index=0)
+if ptype == "Month":
+    opts = list(pd.period_range(pmin, pmax, freq="M"))[::-1]
+    sel = c3.selectbox("Month", opts, index=0, format_func=lambda p: p.strftime("%b %Y"))
+    start, end = sel.start_time, sel.end_time
+elif ptype == "Quarter":
+    opts = list(pd.period_range(pmin, pmax, freq="Q"))[::-1]
+    sel = c3.selectbox("Quarter", opts, index=0,
+                       format_func=lambda p: f"{p.year} Q{p.quarter}")
+    start, end = sel.start_time, sel.end_time
+else:
+    c3.selectbox("Bucket", ["— full range —"], disabled=True)
+    start, end = pmin, pmax
+start, end = max(start, pmin), min(end, pmax)
+min_demand = c4.slider(
     "Min demand (units/day)", 1.0, 10.0, DEFAULT_MIN_DEMAND, 0.5,
     help="A zero-sales day is only treated as a demand-gap stock-out when the "
          "SKU's pooled expected demand rate clears this — high enough that "
          "selling nothing is a real anomaly. Physical (ledger) stock-outs and "
          "critically-low reach always count.",
 )
-search = c4.text_input("SKU or Product contains", "")
+search = c5.text_input("SKU or Product contains", "")
 
 # Region-scoped current-stock lookups for the ranking / status columns.
 inv_r = inv[inv["region"] == region] if not inv.empty else inv
@@ -605,11 +617,6 @@ with st.expander("Stock-out & cooling-down thresholds"):
                "thresholds. Ad-cut detection only applies from when Novadata "
                "began reporting Advertising Costs (~Feb 2026); the price lever "
                "works across the full year.")
-
-if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-    start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
-else:
-    start, end = long_all["Period"].min(), asof
 
 # ---------- Apply scope ----------
 scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
