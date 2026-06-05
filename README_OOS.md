@@ -15,7 +15,7 @@ It combines two Amazon sources:
 
 | Source | Path | Gives |
 | --- | --- | --- |
-| **FBA Inventory Ledger** | `amazon_ledger/inventory_ledger_*.csv.gz` | Real daily warehouse balance + customer shipments per SKU. The seller runs **Pan-EU**, so stock is pooled across the network → physical OOS only when the whole EU balance hits zero. Powers true physical stock-outs, actual demand, days-of-supply / low-stock risk. |
+| **FBA Inventory Ledger** | `amazon_ledger/inventory_ledger_*.csv.gz` | Real daily warehouse balance + customer shipments per SKU. The seller runs **Pan-EU**, so stock is pooled across the network → physical OOS only when the whole EU balance hits zero. **GB is a separate (post-Brexit) warehouse, excluded from the EU pool — and amazon.co.uk demand is excluded from EU λ** so the two stay consistent. Powers true physical stock-outs, actual demand, days-of-supply / low-stock risk. |
 | **Novadata margin export** | `novadata_exports/margin_export_*.csv.gz` | Daily Units / Sales / CM3 per SKU, **pooled EU-wide** (Pan-EU — not split by country) → the demand rate and the price + margin per unit to value lost units in €. |
 
 **Why hybrid + EU-pooled?** The account runs **Pan-EU**, so demand and stock are

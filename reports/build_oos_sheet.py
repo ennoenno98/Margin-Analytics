@@ -23,7 +23,7 @@ CHART = ROOT / "reports" / "_oos_sheet_example.png"
 # Model parameters (match oos_analytics.py defaults).
 W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 3.0, 30
 PPC_CUT, PRICE_UP, MIN_PPC = 0.5, 0.08, 2.0
-SKU = "VV-VITA-231"   # analysed EU-wide (Pan-EU), pooling all marketplaces
+SKU = "VV-VITA-39"   # analysed EU-wide (Pan-EU), pooling all marketplaces
 
 # ---------- compute the example SKU's daily series ----------
 mp = ROOT / "novadata_exports/margin_export_2026-06-03.csv.gz"
@@ -37,6 +37,7 @@ for c in ("Units", "Product Sales", "Advertising Costs"):
     df[c] = pd.to_numeric(df[c], errors="coerce")
 df = df.rename(columns={"Product Sales": "Sales"})
 df["AdSpend"] = (-df["Advertising Costs"]).clip(lower=0)
+df = df[df["Marketplace Name"] != "amazon.co.uk"]  # GB separate, not Pan-EU
 
 full = pd.date_range(df.Period.min(), df.Period.max(), freq="D")
 asof = full.max()
@@ -56,12 +57,12 @@ had = pos.cummax(); fut = pos[::-1].cummax()[::-1]
 recent = pd.Series(full >= (asof - pd.Timedelta(days=TAIL)), index=full)
 
 # ledger EU stock + reach (SKU level)
-LK = {"Date", "MSKU", "Disposition", "Ending Warehouse Balance", "Customer Shipments"}
+LK = {"Date", "MSKU", "Location", "Disposition", "Ending Warehouse Balance", "Customer Shipments"}
 led = pd.read_csv(lp, usecols=lambda c: c in LK)
 led["Date"] = pd.to_datetime(led["Date"], format="%m/%d/%Y", errors="coerce")
 for c in ("Ending Warehouse Balance", "Customer Shipments"):
     led[c] = pd.to_numeric(led[c], errors="coerce").fillna(0)
-led = led[(led.Disposition == "SELLABLE") & (led.MSKU == SKU)]
+led = led[(led.Disposition == "SELLABLE") & (led.MSKU == SKU) & (led.Location != "GB")]
 eu = led.groupby("Date").agg(eu_stock=("Ending Warehouse Balance", "sum"),
                              shp=("Customer Shipments", "sum"))
 eu["shipped"] = (-eu["shp"]).clip(lower=0)

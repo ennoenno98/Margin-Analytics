@@ -199,7 +199,9 @@ def load_ledger(path: Path | None):
     for c in ("Ending Warehouse Balance", "Customer Shipments",
               "In Transit Between Warehouses"):
         led[c] = pd.to_numeric(led.get(c), errors="coerce").fillna(0.0)
-    led = led[led["Disposition"] == "SELLABLE"]
+    # GB is a separate (post-Brexit) warehouse, NOT part of the Pan-EU pool, so
+    # exclude it from the EU stock figures.
+    led = led[(led["Disposition"] == "SELLABLE") & (led.get("Location") != "GB")]
 
     eu = led.groupby(["SKU", "Date"], as_index=False).agg(
         eu_stock=("Ending Warehouse Balance", "sum"),
@@ -223,6 +225,9 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     Returns (long, meta, asof, eu).
     """
     df = load_margin(margin_path)
+    # GB is a separate warehouse outside Pan-EU — drop amazon.co.uk demand so EU
+    # λ and EU stock stay consistent (GB is excluded from both).
+    df = df[df["Marketplace Name"] != "amazon.co.uk"]
     eu = load_ledger(ledger_path)
     keys = ["SKU"]
 
