@@ -188,19 +188,20 @@ def load_ledger(path: Path | None):
     Empty if no ledger file is present.
     """
     empty_eu = pd.DataFrame(
-        columns=["SKU", "region", "Date", "eu_stock", "shipped", "in_transit"])
+        columns=["SKU", "region", "Date", "eu_stock", "shipped", "in_transit",
+                 "receipts"])
     if path is None:
         return empty_eu
     KEEP = {
         "Date", "MSKU", "Location", "Disposition",
         "Ending Warehouse Balance", "Customer Shipments",
-        "In Transit Between Warehouses",
+        "In Transit Between Warehouses", "Receipts",
     }
     led = pd.read_csv(path, usecols=lambda c: c in KEEP)
     led["Date"] = pd.to_datetime(led["Date"], format="%m/%d/%Y", errors="coerce")
     led = led.rename(columns={"MSKU": "SKU"})
     for c in ("Ending Warehouse Balance", "Customer Shipments",
-              "In Transit Between Warehouses"):
+              "In Transit Between Warehouses", "Receipts"):
         led[c] = pd.to_numeric(led.get(c), errors="coerce").fillna(0.0)
     led = led[led["Disposition"] == "SELLABLE"].copy()
     # GB is a separate (post-Brexit) warehouse, NOT part of the Pan-EU pool.
@@ -210,6 +211,7 @@ def load_ledger(path: Path | None):
         eu_stock=("Ending Warehouse Balance", "sum"),
         shipped=("Customer Shipments", "sum"),
         in_transit=("In Transit Between Warehouses", "sum"),
+        receipts=("Receipts", "sum"),   # genuine inbound (NOT customer returns)
     )
     eu["shipped"] = (-eu["shipped"]).clip(lower=0)  # outbound is negative
     eu["SKU"] = eu["SKU"].astype(str)
@@ -303,16 +305,18 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
         e["avgship"] = e.groupby(["SKU", "region"])["shipped"].transform(
             lambda s: s.rolling(28, min_periods=5).mean())
         e["dos"] = e["eu_stock"] / e["avgship"].where(e["avgship"] > 0)
-        long = long.merge(e[["SKU", "region", "Date", "eu_stock", "dos"]],
+        long = long.merge(e[["SKU", "region", "Date", "eu_stock", "dos", "receipts"]],
                           left_on=["SKU", "region", "Period"],
                           right_on=["SKU", "region", "Date"],
                           how="left").drop(columns=["Date"])
     else:
         long["eu_stock"] = np.nan
         long["dos"] = np.nan
+        long["receipts"] = np.nan
 
     for col in ("units", "sales", "cm3", "fba", "expected", "avg_price",
-                "avg_cm3_pu", "ppc", "base_ppc", "price", "eu_stock", "dos"):
+                "avg_cm3_pu", "ppc", "base_ppc", "price", "eu_stock", "dos",
+                "receipts"):
         long[col] = long[col].astype("float32")
     for col in ("SKU", "region"):
         long[col] = long[col].astype("category")
@@ -320,6 +324,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     info = df[["SKU", "Product", "Brand"]].dropna(subset=["SKU"]).copy()
     info["SKU"] = info["SKU"].astype(str)
     meta = info.drop_duplicates(subset=["SKU"], keep="last")
+    long = long.sort_values(["SKU", "region", "Period"]).reset_index(drop=True)
     return long, meta, asof, eu
 
 
@@ -373,18 +378,39 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     oos_fba = fba_known & (fba == 0) & had_past
     oos_gap = (units == 0) & (expected >= min_demand) & had_past & (has_future | recent)
     # Involuntary OOS excludes days we chose to throttle (those are cooling-down).
-    oos = (phys_eu | low_reach | oos_fba | oos_gap) & ~cooldown
+    raw_oos = (phys_eu | low_reach | oos_fba | oos_gap) & ~cooldown
+
+    res = long.copy()
+    res["raw_oos"] = raw_oos
+
+    # --- Keep an OOS episode open through return-driven blips ---
+    # Customer returns trickle back into the warehouse and can nudge the sellable
+    # balance / reach up mid-stock-out, spuriously breaking the OOS run (or even
+    # tripping a cooling-down flag). A real recovery is a genuine inbound
+    # *Receipt*, not a return — so once a SKU is OOS it stays OOS until the next
+    # Receipts restock, as long as stock is still depleted.
+    receipts = long["receipts"].to_numpy()
+    restock = ~np.isnan(receipts) & (receipts >= np.maximum(10.0, expected))
+    res["_restock"] = restock
+    grp = [res["SKU"].values, res["region"].values]
+    last_oos = res["Period"].where(res["raw_oos"]).groupby(grp).ffill()
+    last_rs = res["Period"].where(res["_restock"]).groupby(grp).ffill()
+    oos_open = (last_oos.notna() & (last_rs.isna() | (last_oos > last_rs))).to_numpy()
+    # Only bridge days where sales are still suppressed (the OOS symptom) — so a
+    # genuine recovery (sales back near λ) ends the episode even before a Receipt.
+    filled = oos_open & ~np.isnan(dos) & (units < 0.5 * expected) & had_past
+    oos = raw_oos | filled
+    cooldown = cooldown & ~oos          # a throttle inside an OOS episode is OOS
 
     cause = np.where(
         phys_eu, "Physical (network)",
-        np.where(low_reach, "Critically low (<%gd reach)" % oos_dos,
+        np.where(oos & ~np.isnan(dos) & (dos < oos_dos), "Critically low (<%gd reach)" % oos_dos,
                  np.where(cooldown, "Cooling down",
                           np.where(oos, "Demand gap (EU)", ""))),
     )
 
     lost_units = np.where(oos, np.clip(expected - units, 0, None), 0.0)
     miss_units = np.where(cooldown, np.clip(expected - units, 0, None), 0.0)
-    res = long.copy()
     res["oos"] = oos
     res["cooldown"] = cooldown
     res["cause"] = cause
@@ -394,7 +420,7 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     res["miss_units"] = miss_units.astype("float32")
     res["rev_miss"] = (miss_units * np.nan_to_num(ap)).astype("float32")
     res["cm3_miss"] = (miss_units * np.nan_to_num(cm3pu)).astype("float32")
-    return res
+    return res.drop(columns=["raw_oos", "_restock"])
 
 
 # ---------- Helpers ----------

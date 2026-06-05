@@ -88,7 +88,16 @@ so the model separates them. Reach (days-of-supply) drives the split:
 
 Cooling-down impact is booked as *miss* (voluntary), kept apart from involuntary
 *lost*. Category priority per day: **Physical (network) > Critically low (<3d) >
-Cooling down > Demand gap (EU)**. All thresholds are tunable in the app. Caveat: ad-spend-cut detection only
+Cooling down > Demand gap (EU)**. All thresholds are tunable in the app.
+
+**Returns don't end a stock-out.** Customer returns trickle back into the
+warehouse and can nudge the sellable balance/reach up mid-stock-out, which would
+otherwise break the OOS run (or trip a spurious cooling-down flag). So once a SKU
+is OOS it stays OOS — through return-driven blips — until either a genuine
+inbound **Receipt** arrives or sales recover to ≥ ½·λ. Receipts (real inbound)
+and Customer Returns are separate ledger columns, so the two are told apart.
+
+Caveat: ad-spend-cut detection only
 works from when Novadata began reporting Advertising Costs (~Feb 2026); the
 price-hike lever spans the full year.
 
