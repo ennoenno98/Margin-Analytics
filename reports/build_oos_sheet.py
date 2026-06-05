@@ -22,8 +22,8 @@ CHART = ROOT / "reports" / "_oos_sheet_example.png"
 
 # Model parameters (match oos_analytics.py defaults).
 W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 3.0, 30
-PPC_CUT, PRICE_UP, MIN_PPC = 0.5, 0.08, 2.0
-SKU = "VV-VITA-39"   # analysed EU-wide (Pan-EU), pooling all marketplaces
+PPC_CUT, PRICE_UP, MIN_PPC = 0.7, 0.15, 2.0
+SKU = "VV-VITA-142"   # analysed EU-wide (Pan-EU), pooling all marketplaces
 
 # ---------- compute the example SKU's daily series ----------
 mp = ROOT / "novadata_exports/margin_export_2026-06-03.csv.gz"
@@ -298,7 +298,7 @@ P("Impact figures are estimates (assume the SKU would have sold at its recent "
   "rate). Ad-spend-cut detection only applies from when Novadata began reporting "
   "Advertising Costs (~Feb 2026); the price-hike lever spans the full year. Reach "
   "is EU-pooled, so reach-based rules need ledger coverage for the SKU. All "
-  "thresholds (3/day, reach 3 & 30, +8%, -50%) are tunable in the dashboard.", small)
+  "thresholds (3/day, reach 3 & 30, +15%, -70%) are tunable in the dashboard.", small)
 
 doc.build(E)
 print("WROTE", OUT, OUT.stat().st_size, "bytes |", summ)

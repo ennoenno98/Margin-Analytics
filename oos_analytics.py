@@ -82,8 +82,8 @@ OOS_DOS = 3                # reach (days-of-supply) below this counts as OOS
 # price) while stock is tight, to glide to the next shipment instead of hard
 # stocking out (OOS hurts Amazon ranking). Defaults for detecting it:
 COOLDOWN_DOS = 30          # only when days-of-supply is at/below this (tight)
-COOLDOWN_PPC_CUT = 0.5     # ad spend <= this fraction of baseline = an ad cut
-COOLDOWN_PRICE_UP = 0.08   # price >= baseline x (1+this) = a deliberate hike
+COOLDOWN_PPC_CUT = 0.7     # ad spend <= this fraction below baseline = an ad cut
+COOLDOWN_PRICE_UP = 0.15   # price >= baseline x (1+this) = a deliberate hike
 COOLDOWN_MIN_PPC = 2.0     # ignore SKUs whose baseline ad spend < this (EUR/day)
 
 st.set_page_config(page_title="OOS Impact Analytics", page_icon="📦", layout="wide")

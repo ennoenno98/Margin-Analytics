@@ -82,8 +82,8 @@ so the model separates them. Reach (days-of-supply) drives the split:
 - **reach < 3 days → OOS** ("Critically low") — effectively out of stock even
   if the balance hasn't hit literally zero.
 - **3 ≤ reach < 30 days + throttled + still selling → Cooling down** — the
-  SKU's **ad spend is cut to ≤ 50 % of its baseline** and/or its **price is
-  ≥ 8 % above baseline**, while it still sells (units > 0). If a throttle pushes
+  SKU's **ad spend is cut by ≥ 70 % vs its baseline** and/or its **price is
+  ≥ 15 % above baseline**, while it still sells (units > 0). If a throttle pushes
   sales to **zero** it's not cooling down — it counts as OOS (lost), not miss.
 
 Cooling-down impact is booked as *miss* (voluntary), kept apart from involuntary
