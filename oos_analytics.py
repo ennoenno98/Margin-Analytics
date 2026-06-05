@@ -182,10 +182,11 @@ def load_margin(path: Path) -> pd.DataFrame:
 def load_ledger(path: Path | None):
     """Amazon FBA Inventory Ledger → daily stock panel per SKU and region.
 
-    Returns one row per (SKU, region, Date) — sellable balance, units shipped
-    (demand) and units in transit. Region is **EU** (the Pan-EU pool) or **GB**
-    (the separate post-Brexit warehouse), kept apart so each is its own pool.
-    Empty if no ledger file is present.
+    Returns one row per (SKU, region, Date). `eu_stock` is **available** stock =
+    on-hand sellable + units in transit between FCs (so a Pan-EU redistribution
+    isn't read as a stock drop); `in_transit` and `on_hand` are also kept.
+    Region is **EU** (the Pan-EU pool) or **GB** (the separate post-Brexit
+    warehouse), kept apart so each is its own pool. Empty if no ledger present.
     """
     empty_eu = pd.DataFrame(
         columns=["SKU", "region", "Date", "eu_stock", "shipped", "in_transit",
@@ -208,12 +209,16 @@ def load_ledger(path: Path | None):
     led["region"] = np.where(led.get("Location") == "GB", "GB", "EU")
 
     eu = led.groupby(["SKU", "region", "Date"], as_index=False).agg(
-        eu_stock=("Ending Warehouse Balance", "sum"),
-        shipped=("Customer Shipments", "sum"),
+        on_hand=("Ending Warehouse Balance", "sum"),
         in_transit=("In Transit Between Warehouses", "sum"),
+        shipped=("Customer Shipments", "sum"),
         receipts=("Receipts", "sum"),   # genuine inbound (NOT customer returns)
     )
     eu["shipped"] = (-eu["shipped"]).clip(lower=0)  # outbound is negative
+    # "Available" stock = on-hand sellable + units in transit between FCs, so a
+    # Pan-EU redistribution (units leaving one FC, in transit to another) is not
+    # mistaken for a stock drop / stock-out.
+    eu["eu_stock"] = eu["on_hand"] + eu["in_transit"]
     eu["SKU"] = eu["SKU"].astype(str)
     return eu
 
@@ -826,14 +831,14 @@ with tab3:
         st.subheader(f"Stock-out risk — replenish first (as of {asof.date()})")
         disp = low[["SKU", "Product", "cur_stock", "in_transit",
                     "avg_daily_demand", "days_of_supply"]].rename(columns={
-            "cur_stock": "Current stock", "in_transit": "In transit",
+            "cur_stock": "Available stock", "in_transit": "of which in transit",
             "avg_daily_demand": "Avg demand/day", "days_of_supply": "Days of supply"})
         disp = disp.round(0)
         st.dataframe(
             disp, width="stretch", hide_index=True, height=460,
             column_config={
-                "Current stock": st.column_config.NumberColumn(format="localized"),
-                "In transit": st.column_config.NumberColumn(format="localized"),
+                "Available stock": st.column_config.NumberColumn(format="localized"),
+                "of which in transit": st.column_config.NumberColumn(format="localized"),
                 "Avg demand/day": st.column_config.NumberColumn(format="localized"),
                 "Days of supply": st.column_config.NumberColumn(format="localized")})
         st.caption("Days of supply = current EU sellable stock ÷ trailing 30-day "

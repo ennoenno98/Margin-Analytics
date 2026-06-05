@@ -57,16 +57,17 @@ had = pos.cummax(); fut = pos[::-1].cummax()[::-1]
 recent = pd.Series(full >= (asof - pd.Timedelta(days=TAIL)), index=full)
 
 # ledger EU stock + reach (SKU level)
-LK = {"Date", "MSKU", "Location", "Disposition", "Ending Warehouse Balance", "Customer Shipments"}
+LK = {"Date", "MSKU", "Location", "Disposition", "Ending Warehouse Balance", "Customer Shipments", "In Transit Between Warehouses"}
 led = pd.read_csv(lp, usecols=lambda c: c in LK)
 led["Date"] = pd.to_datetime(led["Date"], format="%m/%d/%Y", errors="coerce")
-for c in ("Ending Warehouse Balance", "Customer Shipments"):
+for c in ("Ending Warehouse Balance", "Customer Shipments", "In Transit Between Warehouses"):
     led[c] = pd.to_numeric(led[c], errors="coerce").fillna(0)
 led = led[(led.Disposition == "SELLABLE") & (led.MSKU == SKU) & (led.Location != "GB")]
-eu = led.groupby("Date").agg(eu_stock=("Ending Warehouse Balance", "sum"),
+eu = led.groupby("Date").agg(on_hand=("Ending Warehouse Balance", "sum"),
+                             it=("In Transit Between Warehouses", "sum"),
                              shp=("Customer Shipments", "sum"))
 eu["shipped"] = (-eu["shp"]).clip(lower=0)
-eu_stock = eu["eu_stock"].reindex(full).ffill()
+eu_stock = (eu["on_hand"] + eu["it"]).reindex(full).ffill()  # available = on-hand + in-transit
 avgship = eu["shipped"].reindex(full).rolling(28, min_periods=5).mean()
 dos = eu_stock / avgship.where(avgship > 0)
 
