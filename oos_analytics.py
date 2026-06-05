@@ -579,19 +579,26 @@ region = c1.selectbox("Region", regions, index=0,
                            "(amazon.co.uk). They are tracked as independent pools.")
 pmin, pmax = long_all["Period"].min(), asof
 ptype = c2.selectbox("Period", ["Full range", "Quarter", "Month"], index=0)
+sel_periods, sel_freq = None, None
 if ptype == "Month":
     opts = list(pd.period_range(pmin, pmax, freq="M"))[::-1]
-    sel = c3.selectbox("Month", opts, index=0, format_func=lambda p: p.strftime("%b %Y"))
-    start, end = sel.start_time, sel.end_time
+    chosen = c3.multiselect("Months", opts, default=[opts[0]],
+                            format_func=lambda p: p.strftime("%b %Y"))
+    sel_freq = "M"
 elif ptype == "Quarter":
     opts = list(pd.period_range(pmin, pmax, freq="Q"))[::-1]
-    sel = c3.selectbox("Quarter", opts, index=0,
-                       format_func=lambda p: f"{p.year} Q{p.quarter}")
-    start, end = sel.start_time, sel.end_time
+    chosen = c3.multiselect("Quarters", opts, default=[opts[0]],
+                            format_func=lambda p: f"{p.year} Q{p.quarter}")
+    sel_freq = "Q"
 else:
-    c3.selectbox("Bucket", ["— full range —"], disabled=True)
+    c3.multiselect("Bucket", ["— full range —"], default=[], disabled=True)
+    chosen = []
+if chosen:
+    sel_periods = set(chosen)
+    start = min(p.start_time for p in chosen)
+    end = min(max(p.end_time for p in chosen), pmax)
+else:
     start, end = pmin, pmax
-start, end = max(start, pmin), min(end, pmax)
 min_demand = c4.slider(
     "Min demand (units/day)", 1.0, 10.0, DEFAULT_MIN_DEMAND, 0.5,
     help="A zero-sales day is only treated as a demand-gap stock-out when the "
@@ -626,8 +633,11 @@ with st.expander("Stock-out & cooling-down thresholds"):
 # ---------- Apply scope ----------
 scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
                  price_up=cd_price, oos_dos=oos_reach)
-scope = scope[(scope["region"] == region)
-              & (scope["Period"] >= start) & (scope["Period"] <= end)]
+scope = scope[scope["region"] == region]
+if sel_periods is not None:
+    scope = scope[scope["Period"].dt.to_period(sel_freq).isin(sel_periods)]
+else:
+    scope = scope[(scope["Period"] >= start) & (scope["Period"] <= end)]
 if search.strip():
     s = search.strip().lower()
     skus = scope["SKU"].astype(str).str.lower()
@@ -684,9 +694,8 @@ st.caption(
     "— the true P&L impact."
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Most affected SKUs", "Impact over time", "Inventory & risk",
-     "Stock-out events", "Cooling down"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Most affected SKUs", "Impact over time", "Stock-out events", "Cooling down"]
 )
 
 # ======================================================================
@@ -752,18 +761,23 @@ with tab2:
     ts["bucket"] = ts["Period"].dt.to_period(per).dt.to_timestamp()
     by_bucket = ts.groupby("bucket", observed=True).agg(
         lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum"),
-        oos_days=("Period", "count")).reset_index()
+        oos_days=("Period", "count")).reset_index().sort_values("bucket")
+    # Categorical x labels — avoids plotly's nanosecond datetime axis when only
+    # one or a few buckets are in scope.
+    by_bucket["label"] = (by_bucket["bucket"].dt.strftime("%b %Y") if per == "M"
+                          else by_bucket["bucket"].dt.to_period("Q").astype(str))
 
     fig2 = go.Figure()
-    fig2.add_bar(x=by_bucket["bucket"], y=by_bucket["lost_rev"],
+    fig2.add_bar(x=by_bucket["label"], y=by_bucket["lost_rev"],
                  name="Lost revenue (€)", marker_color="#f4a261")
-    fig2.add_bar(x=by_bucket["bucket"], y=by_bucket["lost_cm3"],
+    fig2.add_bar(x=by_bucket["label"], y=by_bucket["lost_cm3"],
                  name="Lost CM3 (€)", marker_color="#d32f2f")
-    fig2.add_trace(go.Scatter(x=by_bucket["bucket"], y=by_bucket["oos_days"],
+    fig2.add_trace(go.Scatter(x=by_bucket["label"], y=by_bucket["oos_days"],
                               name="OOS SKU-days", yaxis="y2",
                               mode="lines+markers", line=dict(color="#264653")))
     fig2.update_layout(
         barmode="group", height=380, title=f"Lost impact by {freq_label.lower()}",
+        xaxis=dict(type="category"),
         yaxis=dict(title="€ lost"),
         yaxis2=dict(title="OOS SKU-days", overlaying="y", side="right", showgrid=False),
         margin=dict(l=10, r=10, t=50, b=60),
@@ -778,76 +792,16 @@ with tab2:
         pv = hm.pivot_table(index="SKU", columns="bucket", values="Period",
                             aggfunc="count", observed=True).reindex(top_skus)
         pv.columns = [c.strftime("%b %y") for c in pv.columns]
+        pv.index = [f"{s} · {prod_short.get(s, '')}"[:32] for s in pv.index]
         figh = px.imshow(pv, color_continuous_scale="Reds", aspect="auto",
                          labels=dict(color="OOS days"))
         figh.update_layout(height=max(300, 24 * n_heat), margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(figh, width="stretch")
 
-    st.subheader("SKU drill-down")
-    sel_sku = st.selectbox("SKU", agg["SKU"].tolist(), key="drill")
-    drill = scope[scope["SKU"] == sel_sku].sort_values("Period")
-    d = drill.groupby("Period", observed=True).agg(
-        units=("units", "sum"), expected=("expected", "mean"),
-        eu_stock=("eu_stock", "max"), oos=("oos", "max")).reset_index()
-    figd = go.Figure()
-    figd.add_bar(x=d["Period"], y=d["units"], name="Units sold", marker_color="#2a9d8f")
-    figd.add_trace(go.Scatter(x=d["Period"], y=d["expected"], name="Expected demand",
-                              mode="lines", line=dict(color="#264653", dash="dot")))
-    if d["eu_stock"].notna().any():
-        figd.add_trace(go.Scatter(x=d["Period"], y=d["eu_stock"], name="EU stock (ledger)",
-                                  yaxis="y2", mode="lines", line=dict(color="#8d99ae")))
-    for dd in d[d["oos"]]["Period"]:
-        figd.add_vrect(x0=dd - pd.Timedelta(hours=12), x1=dd + pd.Timedelta(hours=12),
-                       fillcolor="#d32f2f", opacity=0.12, line_width=0)
-    figd.update_layout(
-        height=380, title=f"{sel_sku} — sales, demand & stock (OOS days shaded)",
-        yaxis=dict(title="Units / day"),
-        yaxis2=dict(title="EU stock", overlaying="y", side="right", showgrid=False),
-        margin=dict(l=10, r=10, t=50, b=60),
-        legend=dict(orientation="h", yanchor="top", y=-0.2, x=0.5, xanchor="center"))
-    st.plotly_chart(figd, width="stretch")
-
 # ======================================================================
-#  Tab 3 — Inventory & risk (ledger-driven)
+#  Tab 3 — Stock-out events
 # ======================================================================
 with tab3:
-    if inv_r.empty:
-        st.info("Upload an Amazon FBA Inventory Ledger to `amazon_ledger/` to "
-                "enable days-of-supply and low-stock risk. See README_OOS.md.")
-    else:
-        risk = inv_r.copy()
-        risk["Product"] = risk["SKU"].map(prod_short)
-        if search.strip():
-            s = search.strip().lower()
-            risk = risk[risk["SKU"].str.lower().str.contains(s)
-                        | risk["Product"].astype(str).str.lower().str.contains(s, na=False)]
-        low = risk[(risk["days_of_supply"] < LOW_STOCK_DAYS)
-                   | (risk["cur_stock"] <= 0)].sort_values("days_of_supply")
-        r1, r2, r3 = st.columns(3)
-        r1.metric("SKUs currently out of stock", fmt_num(int((risk["cur_stock"] <= 0).sum())))
-        r2.metric(f"Low stock (< {LOW_STOCK_DAYS}d supply)",
-                  fmt_num(int((risk["days_of_supply"] < LOW_STOCK_DAYS).sum())))
-        r3.metric("Units in transit (sel.)", fmt_num(risk["in_transit"].sum()))
-        st.subheader(f"Stock-out risk — replenish first (as of {asof.date()})")
-        disp = low[["SKU", "Product", "cur_stock", "in_transit",
-                    "avg_daily_demand", "days_of_supply"]].rename(columns={
-            "cur_stock": "Available stock", "in_transit": "of which in transit",
-            "avg_daily_demand": "Avg demand/day", "days_of_supply": "Days of supply"})
-        disp = disp.round(0)
-        st.dataframe(
-            disp, width="stretch", hide_index=True, height=460,
-            column_config={
-                "Available stock": st.column_config.NumberColumn(format="localized"),
-                "of which in transit": st.column_config.NumberColumn(format="localized"),
-                "Avg demand/day": st.column_config.NumberColumn(format="localized"),
-                "Days of supply": st.column_config.NumberColumn(format="localized")})
-        st.caption("Days of supply = current EU sellable stock ÷ trailing 30-day "
-                   "average units shipped. Sorted lowest-first.")
-
-# ======================================================================
-#  Tab 4 — Stock-out events
-# ======================================================================
-with tab4:
     ev = stockout_events(scope)
     if ev.empty:
         st.info("No stock-out events in the current scope.")
@@ -875,9 +829,9 @@ with tab4:
             file_name=f"oos_events_{start.date()}_{end.date()}.csv", mime="text/csv")
 
 # ======================================================================
-#  Tab 5 — Cooling down (deliberate demand throttling to avoid OOS)
+#  Tab 4 — Cooling down (deliberate demand throttling to avoid OOS)
 # ======================================================================
-with tab5:
+with tab4:
     st.caption(
         "Days where the SKU was **deliberately throttled** — ad spend cut and/or "
         "price raised — while stock was tight, to glide to the next shipment "
