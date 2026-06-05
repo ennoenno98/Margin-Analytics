@@ -478,8 +478,32 @@ def inventory_status(eu: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
     return out
 
 
-# ======================================================================
-#  App
+def sku_timeline_fig(d: pd.DataFrame, title: str) -> go.Figure:
+    """Methodology-style timeline for one SKU: units/day + expected demand (λ)
+    + stock (ledger), with OOS days shaded red and cooling-down days purple."""
+    d = d.sort_values("Period")
+    fig = go.Figure()
+    fig.add_bar(x=d["Period"], y=d["units"], name="Units sold/day",
+                marker_color="#2a9d8f")
+    fig.add_trace(go.Scatter(x=d["Period"], y=d["expected"], name="Expected demand (λ)",
+                             mode="lines", line=dict(color="#264653", dash="dot")))
+    if d["eu_stock"].notna().any():
+        fig.add_trace(go.Scatter(x=d["Period"], y=d["eu_stock"], name="Stock (ledger)",
+                                 yaxis="y2", mode="lines", line=dict(color="#8d99ae")))
+    half = pd.Timedelta(hours=12)
+    for dd in d.loc[d["oos"], "Period"]:
+        fig.add_vrect(x0=dd - half, x1=dd + half, fillcolor="#d32f2f",
+                      opacity=0.13, line_width=0, layer="below")
+    for dd in d.loc[d["cooldown"], "Period"]:
+        fig.add_vrect(x0=dd - half, x1=dd + half, fillcolor="#9b5de5",
+                      opacity=0.13, line_width=0, layer="below")
+    fig.update_layout(
+        height=360, title=title, bargap=0,
+        yaxis=dict(title="Units / day"),
+        yaxis2=dict(title="Stock", overlaying="y", side="right", showgrid=False),
+        margin=dict(l=10, r=10, t=50, b=60),
+        legend=dict(orientation="h", yanchor="top", y=-0.2, x=0.5, xanchor="center"))
+    return fig
 # ======================================================================
 require_login()
 
@@ -642,6 +666,18 @@ with tab1:
     fig.update_layout(height=max(320, 26 * top_n), margin=dict(l=10, r=10, t=50, b=10))
     fig.update_traces(marker_color="#d32f2f")
     st.plotly_chart(fig, width="stretch")
+
+    # Drill-down: pick one of the top SKUs → stock / demand / OOS timeline.
+    sel = st.selectbox(
+        "Show timeline for a top SKU", top["SKU"].tolist(),
+        format_func=lambda s: f"{s} · {prod_short.get(s, '')}", key="t1_sku")
+    legend = ("🔴 red = out of stock · 🟣 purple = cooling down · "
+              "dotted = expected demand (λ) · grey = stock")
+    st.caption(legend)
+    st.plotly_chart(
+        sku_timeline_fig(scope[scope["SKU"] == sel],
+                         f"{sel} — {prod_short.get(sel, '')} ({REGION_LABEL.get(region, region)})"),
+        width="stretch")
 
     table = agg[[
         "SKU", "Product", "Brand", "Status", "oos_days", "oos_rate",
