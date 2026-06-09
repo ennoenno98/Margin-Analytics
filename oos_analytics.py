@@ -49,6 +49,13 @@ selling (units > 0), to avoid a hard stock-out. Their forgone sales are booked
 as revenue/CM3 *miss* (voluntary) rather than *lost* (involuntary), so the two
 are never double-counted.
 
+"Heating up" days are the *ramp-up after a SKU returns* (from a cooling-down or
+a stock-out): ad spend is pushed back up and/or price cut (only if we'd raised
+it) to rebuild sales. It costs us twice — ramp-up lost sales (still below
+baseline λ while recovering) + the extra ad spend over baseline — tracked
+separately. A stock-out isn't required; heat-up can follow a cooling-down
+directly. Thresholds are provisional, pending Logistics/Ops input.
+
 Run locally:
     pip install -r requirements.txt
     python novadata_weekly_export.py --once       # margin export
@@ -85,6 +92,14 @@ COOLDOWN_DOS = 30          # only when days-of-supply is at/below this (tight)
 COOLDOWN_PPC_CUT = 0.7     # ad spend <= this fraction below baseline = an ad cut
 COOLDOWN_PRICE_UP = 0.15   # price >= baseline x (1+this) = a deliberate hike
 COOLDOWN_MIN_PPC = 2.0     # ignore SKUs whose baseline ad spend < this (EUR/day)
+
+# "Heating up" = ramp-up after a SKU returns (from cooling-down or stock-out):
+# we lower price (only if we'd raised it) and/or push ad spend to rebuild sales.
+# It costs us twice — ramp-up lost sales (still below baseline) + extra ad spend.
+HEATUP_AD_UP = 0.50        # ad spend >= baseline x (1+this) = a ramp-up push
+HEATUP_PRICE_DOWN = 0.10   # price <= baseline x (1-this) = a re-stimulation cut
+HEATUP_WINDOW = 28         # recovery window (days) after the disruption
+HEATUP_RECOVERED = 0.9     # sales back to this x baseline = ramp-up over
 
 st.set_page_config(page_title="OOS Impact Analytics", page_icon="📦", layout="wide")
 
@@ -337,7 +352,9 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
              dos_th: float = COOLDOWN_DOS, ppc_cut: float = COOLDOWN_PPC_CUT,
              price_up: float = COOLDOWN_PRICE_UP,
              min_ppc: float = COOLDOWN_MIN_PPC,
-             oos_dos: float = OOS_DOS) -> pd.DataFrame:
+             oos_dos: float = OOS_DOS,
+             heat_ad_up: float = HEATUP_AD_UP, heat_price_down: float = HEATUP_PRICE_DOWN,
+             heat_win: int = HEATUP_WINDOW) -> pd.DataFrame:
     """Apply the hybrid OOS flag, the cooling-down flag, cause + impact (cheap).
 
     Categories are mutually exclusive per day, in priority order:
@@ -407,17 +424,40 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     oos = raw_oos | filled
     cooldown = cooldown & ~oos          # a throttle inside an OOS episode is OOS
 
+    # --- Heating up: the ramp-up after a SKU returns (from a cooling-down or a
+    # stock-out). We push ad spend back up and/or drop price (only if we had
+    # raised it) to rebuild sales. Two costs: ramp-up lost sales (still below
+    # baseline λ) + the extra ad spend. Detected within heat_win days after a
+    # disruption (OOS or cooling-down), while back in stock and still ramping.
+    disruption = res["Period"].where(oos | cooldown).groupby(grp).ffill()
+    since_disrupt = (res["Period"] - disruption).dt.days
+    recovery_ctx = (disruption.notna() & (since_disrupt >= 1)
+                    & (since_disrupt <= heat_win)).to_numpy()
+    last_hike = res["Period"].where(pd.Series(hike, index=res.index)).groupby(grp).ffill()
+    prior_hike = (last_hike.notna()
+                  & ((res["Period"] - last_hike).dt.days <= heat_win)).to_numpy()
+    ad_boost = ~np.isnan(base_ppc) & (base_ppc > min_ppc) & (ppc >= base_ppc * (1 + heat_ad_up))
+    price_drop = ~np.isnan(price) & (price <= ap * (1 - heat_price_down)) & prior_hike
+    heating = (
+        (ad_boost | price_drop) & recovery_ctx & ~oos & ~cooldown & ~phys_eu
+        & had_past & (units > 0) & (units < HEATUP_RECOVERED * expected)
+    )
+
     cause = np.where(
         phys_eu, "Physical (network)",
         np.where(oos & ~np.isnan(dos) & (dos < oos_dos), "Critically low (<%gd reach)" % oos_dos,
                  np.where(cooldown, "Cooling down",
-                          np.where(oos, "Demand gap (EU)", ""))),
+                          np.where(oos, "Demand gap (EU)",
+                                   np.where(heating, "Heating up", "")))),
     )
 
     lost_units = np.where(oos, np.clip(expected - units, 0, None), 0.0)
     miss_units = np.where(cooldown, np.clip(expected - units, 0, None), 0.0)
+    ramp_units = np.where(heating, np.clip(expected - units, 0, None), 0.0)
+    extra_ad = np.where(heating, np.clip(ppc - np.nan_to_num(base_ppc), 0, None), 0.0)
     res["oos"] = oos
     res["cooldown"] = cooldown
+    res["heating"] = heating
     res["cause"] = cause
     res["lost_units"] = lost_units.astype("float32")
     res["lost_rev"] = (lost_units * np.nan_to_num(ap)).astype("float32")
@@ -425,6 +465,10 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     res["miss_units"] = miss_units.astype("float32")
     res["rev_miss"] = (miss_units * np.nan_to_num(ap)).astype("float32")
     res["cm3_miss"] = (miss_units * np.nan_to_num(cm3pu)).astype("float32")
+    res["ramp_units"] = ramp_units.astype("float32")
+    res["ramp_rev"] = (ramp_units * np.nan_to_num(ap)).astype("float32")
+    res["ramp_cm3"] = (ramp_units * np.nan_to_num(cm3pu)).astype("float32")
+    res["extra_ad"] = extra_ad.astype("float32")
     return res.drop(columns=["raw_oos", "_restock"])
 
 
@@ -613,26 +657,34 @@ inv_r = inv[inv["region"] == region] if not inv.empty else inv
 inv_stock = inv_r.set_index("SKU")["cur_stock"] if not inv_r.empty else pd.Series(dtype=float)
 inv_dos = inv_r.set_index("SKU")["days_of_supply"] if not inv_r.empty else pd.Series(dtype=float)
 
-with st.expander("Stock-out & cooling-down thresholds"):
+with st.expander("Stock-out, cooling-down & heating-up thresholds"):
     cc1, cc2, cc3, cc4 = st.columns(4)
     oos_reach = cc1.slider("OOS when reach below (days)", 1, 14, OOS_DOS, 1,
                            help="Reach (days-of-supply) below this counts as out "
                                 "of stock, even if the balance isn't literally 0.")
     cd_dos = cc2.slider("Cool-down when reach below (days)", 5, 60, COOLDOWN_DOS, 5)
-    cd_price = cc3.slider("Price hike vs baseline (%)", 2, 30,
+    cd_price = cc3.slider("Cool-down: price hike vs baseline (%)", 2, 30,
                           int(COOLDOWN_PRICE_UP * 100), 1) / 100
-    cd_ppc = cc4.slider("Ad-spend cut vs baseline (%)", 20, 90,
+    cd_ppc = cc4.slider("Cool-down: ad-spend cut vs baseline (%)", 20, 90,
                         int(COOLDOWN_PPC_CUT * 100), 5) / 100
+    hc1, hc2, hc3 = st.columns(3)
+    heat_ad = hc1.slider("Heat-up: ad-spend up vs baseline (%)", 10, 200,
+                         int(HEATUP_AD_UP * 100), 10) / 100
+    heat_pr = hc2.slider("Heat-up: price cut vs baseline (%)", 2, 30,
+                         int(HEATUP_PRICE_DOWN * 100), 1) / 100
+    heat_win = hc3.slider("Heat-up window after return (days)", 7, 60, HEATUP_WINDOW, 7)
     st.caption("OOS = reach below the first threshold (or balance 0 / a demand "
-               "gap). 'Cooling down' = the SKU throttled (price up, and/or ad "
-               "spend cut) while reach is between the OOS and cool-down "
-               "thresholds. Ad-cut detection only applies from when Novadata "
-               "began reporting Advertising Costs (~Feb 2026); the price lever "
-               "works across the full year.")
+               "gap). 'Cooling down' = throttled (price up and/or ad cut) while "
+               "stock is tight. 'Heating up' = the ramp-up after a SKU returns — "
+               "ad spend pushed up and/or price cut (only if we'd raised it) — "
+               "booked as ramp-up lost sales + extra ad spend. Ad-based signals "
+               "only apply from when Novadata began reporting Advertising Costs "
+               "(~Feb 2026); price signals span the full year.")
 
 # ---------- Apply scope ----------
 scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
-                 price_up=cd_price, oos_dos=oos_reach)
+                 price_up=cd_price, oos_dos=oos_reach,
+                 heat_ad_up=heat_ad, heat_price_down=heat_pr, heat_win=heat_win)
 scope = scope[scope["region"] == region]
 if sel_periods is not None:
     scope = scope[scope["Period"].dt.to_period(sel_freq).isin(sel_periods)]
@@ -686,16 +738,25 @@ c2.metric("Miss revenue", eur(cd_rows["rev_miss"].sum()))
 c3.metric("Miss CM3", eur(cd_rows["cm3_miss"].sum()))
 c4.metric("Cool-down SKU-days", fmt_num(len(cd_rows)))
 
+heat_rows = scope[scope["heating"]]
+st.markdown("**🔥 Heating up — ramp-up after return (lost sales + extra ad spend)**")
+h1, h2, h3, h4 = st.columns(4)
+h1.metric("SKUs heating up", fmt_num(heat_rows["SKU"].nunique()))
+h2.metric("Ramp-up lost CM3", eur(heat_rows["ramp_cm3"].sum()))
+h3.metric("Extra ad spend", eur(heat_rows["extra_ad"].sum()))
+h4.metric("Heat-up SKU-days", fmt_num(len(heat_rows)))
+
 st.caption(
     f"Data through **{asof.date()}** · scope **{start.date()} → {end.date()}** "
-    f"· region **{REGION_LABEL.get(region, region)}**. *Lost* = sales forfeited while out of stock "
-    "(involuntary); *Miss* = sales given up by deliberately throttling demand "
-    "(price up / ad cut) to avoid OOS. Both valued as contribution margin (CM3) "
-    "— the true P&L impact."
+    f"· region **{REGION_LABEL.get(region, region)}**. *Lost* = sales forfeited while out of stock; "
+    "*Miss* = sales given up by deliberately throttling to avoid OOS; *Ramp-up "
+    "lost + extra ad spend* = the cost of bringing a SKU back after it returns. "
+    "All valued as contribution margin (CM3) / € — the true P&L impact."
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Most affected SKUs", "Impact over time", "Stock-out events", "Cooling down"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Most affected SKUs", "Impact over time", "Stock-out events",
+     "Cooling down", "Heating up"]
 )
 
 # ======================================================================
@@ -875,3 +936,55 @@ with tab4:
             "Note: ad-spend-cut detection only applies from when Novadata began "
             "reporting Advertising Costs (~Feb 2026); price-hike detection spans "
             "the full year. Tune sensitivity in the settings expander above.")
+
+# ======================================================================
+#  Tab 5 — Heating up (ramp-up after a SKU returns)
+# ======================================================================
+with tab5:
+    st.caption(
+        "The **ramp-up after a SKU returns** (from a cooling-down or a stock-out): "
+        "we push ad spend back up and/or cut price (only if we'd raised it) to "
+        "rebuild momentum. Two costs: **ramp-up lost sales** (sales still below "
+        "baseline λ while recovering) and the **extra ad spend** vs the normal "
+        "baseline. A stock-out isn't required — heat-up can follow a cooling-down "
+        "directly."
+    )
+    hu = scope[scope["heating"]]
+    if hu.empty:
+        st.info("No heating-up days detected in the current scope. Loosen the "
+                "heat-up thresholds in the settings expander above.")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("SKUs heating up", fmt_num(hu["SKU"].nunique()))
+        m2.metric("Ramp-up lost revenue", eur(hu["ramp_rev"].sum()))
+        m3.metric("Ramp-up lost CM3", eur(hu["ramp_cm3"].sum()))
+        m4.metric("Extra ad spend", eur(hu["extra_ad"].sum()))
+
+        hagg = (
+            hu.groupby("SKU", observed=True)
+            .agg(heat_days=("Period", "nunique"), ramp_units=("ramp_units", "sum"),
+                 ramp_rev=("ramp_rev", "sum"), ramp_cm3=("ramp_cm3", "sum"),
+                 extra_ad=("extra_ad", "sum"))
+            .reset_index().sort_values("ramp_cm3", ascending=False)
+        )
+        hagg["Product"] = hagg["SKU"].map(prod_short)
+        table = hagg[["SKU", "Product", "heat_days", "ramp_units",
+                      "ramp_rev", "ramp_cm3", "extra_ad"]].rename(columns={
+            "heat_days": "Heat-up days", "ramp_units": "Ramp-up lost units",
+            "ramp_rev": "Ramp-up lost rev (€)", "ramp_cm3": "Ramp-up lost CM3 (€)",
+            "extra_ad": "Extra ad spend (€)"})
+        table = table.round(0)
+        st.dataframe(
+            table, width="stretch", hide_index=True, height=460,
+            column_config={
+                "Ramp-up lost rev (€)": st.column_config.NumberColumn(format="localized"),
+                "Ramp-up lost CM3 (€)": st.column_config.NumberColumn(format="localized"),
+                "Ramp-up lost units": st.column_config.NumberColumn(format="localized"),
+                "Extra ad spend (€)": st.column_config.NumberColumn(format="localized")})
+        st.download_button(
+            "⬇️ Download heating-up (CSV)", table.to_csv(index=False).encode("utf-8"),
+            file_name=f"oos_heatup_{start.date()}_{end.date()}.csv", mime="text/csv")
+        st.caption(
+            "Thresholds are provisional (defaults: ad +50%, price −10%, "
+            "28-day window) — pending Logistics/Ops input. Ad-spend signals need "
+            "Advertising Costs data (~Feb 2026 onward).")

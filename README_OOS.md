@@ -73,6 +73,12 @@ independent pool (own stock, demand λ, reach and impact).
   and/or price raised) while stock was tight, to glide to the next shipment
   instead of hard stocking out. Reports the **revenue miss** and **CM3 miss**
   (the sales voluntarily forgone), per SKU, with CSV export.
+- **Heating up** — the **ramp-up after a SKU returns** (from cooling-down or a
+  stock-out): ad spend pushed up and/or price cut (only if previously raised)
+  to rebuild momentum. Reports **ramp-up lost sales** (still below baseline λ
+  while recovering) + the **extra ad spend** vs baseline. Defaults: ad +50%,
+  price −10%, 28-day window — *provisional, pending Logistics/Ops input*; all
+  tunable in the app.
 
 ### Cooling down vs. stock-out (don't double-count)
 
