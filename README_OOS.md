@@ -60,13 +60,12 @@ A **Region** toggle at the top switches between **🇪🇺 EU** (the Pan-EU pool
 **🇬🇧 GB** (the separate UK warehouse / amazon.co.uk) — each tracked as an
 independent pool (own stock, demand λ, reach and impact).
 
-- **Most affected SKUs** — KPI tiles + a ranked table (lost revenue / lost CM3,
-  OOS days, OOS rate, current stock & days-of-supply) and a top-N bar chart.
-- **Impact over time** — lost € + OOS-days by month/quarter, a SKU × month
-  stock-out heatmap, and a single-SKU drill-down (units vs expected demand vs
-  EU stock, OOS days shaded).
-- **Inventory & risk** — ledger-driven: SKUs currently out of stock, low-stock
-  (< days-of-supply threshold), units in transit, sorted replenish-first.
+- **Most affected SKUs** — a headline **OOS-impact-over-time** chart (lost
+  revenue + lost CM3 + # SKUs out of stock, by month/quarter), KPI tiles, a
+  ranked table, a top-N bar chart and a per-SKU timeline drill-down.
+- **Stock-out calendar** — a SKU × month heatmap of stock-out days.
+- **Country overview** — the Pan-EU OOS loss **allocated per country** by each
+  SKU's sales share per marketplace (same OOS events; loss split where it sells).
 - **Stock-out events** — every discrete stock-out collapsed into an event
   (start / end / duration / cause / lost €), with CSV export.
 - **Cooling down** — days the SKU was *deliberately throttled* (ad spend cut

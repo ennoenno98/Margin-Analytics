@@ -101,6 +101,14 @@ HEATUP_PRICE_DOWN = 0.10   # price <= baseline x (1-this) = a re-stimulation cut
 HEATUP_WINDOW = 28         # recovery window (days) after the disruption
 HEATUP_RECOVERED = 0.9     # sales back to this x baseline = ramp-up over
 
+# Marketplace -> country label (for the country breakdown).
+MKT_COUNTRY = {
+    "amazon.de": "🇩🇪 Germany", "amazon.fr": "🇫🇷 France", "amazon.it": "🇮🇹 Italy",
+    "amazon.es": "🇪🇸 Spain", "amazon.nl": "🇳🇱 Netherlands",
+    "amazon.com.be": "🇧🇪 Belgium", "amazon.ie": "🇮🇪 Ireland",
+    "amazon.se": "🇸🇪 Sweden", "amazon.co.uk": "🇬🇧 United Kingdom",
+}
+
 st.set_page_config(page_title="OOS Impact Analytics", page_icon="📦", layout="wide")
 
 
@@ -754,15 +762,41 @@ st.caption(
     "All valued as contribution margin (CM3) / € — the true P&L impact."
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Most affected SKUs", "Impact over time", "Stock-out events",
-     "Cooling down", "Heating up"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Most affected SKUs", "Stock-out calendar", "Stock-out events",
+     "Cooling down", "Heating up", "Country overview"]
 )
 
 # ======================================================================
 #  Tab 1 — Most affected SKUs
 # ======================================================================
 with tab1:
+    # Headline: OOS (involuntary) impact over time — lost €, CM3 & # SKUs OOS.
+    ovb = st.radio("Bucket", ["Month", "Quarter"], horizontal=True, key="ov_bucket")
+    operf = "M" if ovb == "Month" else "Q"
+    ot = oos_rows.copy()
+    ot["bucket"] = ot["Period"].dt.to_period(operf).dt.to_timestamp()
+    ob = ot.groupby("bucket", observed=True).agg(
+        lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum"),
+        oos_skus=("SKU", "nunique")).reset_index().sort_values("bucket")
+    ob["label"] = (ob["bucket"].dt.strftime("%b %Y") if operf == "M"
+                   else ob["bucket"].dt.to_period("Q").astype(str))
+    figO = go.Figure()
+    figO.add_bar(x=ob["label"], y=ob["lost_rev"], name="Lost revenue (€)", marker_color="#f4a261")
+    figO.add_bar(x=ob["label"], y=ob["lost_cm3"], name="Lost CM3 (€)", marker_color="#d32f2f")
+    figO.add_trace(go.Scatter(x=ob["label"], y=ob["oos_skus"], name="# SKUs out of stock",
+                              yaxis="y2", mode="lines+markers",
+                              line=dict(color="#264653", width=3)))
+    figO.update_layout(
+        barmode="group", height=420,
+        title="🔴 Out-of-stock impact over time — lost revenue, lost CM3 & SKUs affected",
+        xaxis=dict(type="category"), yaxis=dict(title="€ lost"),
+        yaxis2=dict(title="# SKUs OOS", overlaying="y", side="right", showgrid=False),
+        margin=dict(l=10, r=10, t=50, b=60),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, x=0.5, xanchor="center"))
+    st.plotly_chart(figO, width="stretch")
+    st.divider()
+
     top_n = st.slider("Show top N SKUs by lost CM3", 5, 50, 15, key="topn")
     top = agg.head(top_n)
     fig = px.bar(
@@ -816,34 +850,10 @@ with tab1:
 #  Tab 2 — Impact over time
 # ======================================================================
 with tab2:
-    freq_label = st.radio("Bucket", ["Month", "Quarter"], horizontal=True)
+    freq_label = st.radio("Bucket", ["Month", "Quarter"], horizontal=True, key="cal_bucket")
     per = "M" if freq_label == "Month" else "Q"
     ts = oos_rows.copy()
     ts["bucket"] = ts["Period"].dt.to_period(per).dt.to_timestamp()
-    by_bucket = ts.groupby("bucket", observed=True).agg(
-        lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum"),
-        oos_days=("Period", "count")).reset_index().sort_values("bucket")
-    # Categorical x labels — avoids plotly's nanosecond datetime axis when only
-    # one or a few buckets are in scope.
-    by_bucket["label"] = (by_bucket["bucket"].dt.strftime("%b %Y") if per == "M"
-                          else by_bucket["bucket"].dt.to_period("Q").astype(str))
-
-    fig2 = go.Figure()
-    fig2.add_bar(x=by_bucket["label"], y=by_bucket["lost_rev"],
-                 name="Lost revenue (€)", marker_color="#f4a261")
-    fig2.add_bar(x=by_bucket["label"], y=by_bucket["lost_cm3"],
-                 name="Lost CM3 (€)", marker_color="#d32f2f")
-    fig2.add_trace(go.Scatter(x=by_bucket["label"], y=by_bucket["oos_days"],
-                              name="OOS SKU-days", yaxis="y2",
-                              mode="lines+markers", line=dict(color="#264653")))
-    fig2.update_layout(
-        barmode="group", height=380, title=f"Lost impact by {freq_label.lower()}",
-        xaxis=dict(type="category"),
-        yaxis=dict(title="€ lost"),
-        yaxis2=dict(title="OOS SKU-days", overlaying="y", side="right", showgrid=False),
-        margin=dict(l=10, r=10, t=50, b=60),
-        legend=dict(orientation="h", yanchor="top", y=-0.2, x=0.5, xanchor="center"))
-    st.plotly_chart(fig2, width="stretch")
 
     st.subheader("Stock-out calendar — top SKUs")
     n_heat = st.slider("SKUs in heatmap", 5, 40, 15, key="heat")
@@ -988,3 +998,64 @@ with tab5:
             "Thresholds are provisional (defaults: ad +50%, price −10%, "
             "28-day window) — pending Logistics/Ops input. Ad-spend signals need "
             "Advertising Costs data (~Feb 2026 onward).")
+
+# ======================================================================
+#  Tab 6 — Country overview (allocate Pan-EU OOS loss to countries)
+# ======================================================================
+with tab6:
+    st.caption(
+        "OOS impact (lost revenue & CM3) **allocated to each country** by the "
+        "SKU's sales share per marketplace. Same Pan-EU OOS events as the rest "
+        "of the tool — each SKU's loss is split across the countries where it "
+        "sells, in proportion to its sales there over the selected period."
+    )
+    mg = load_margin(margin_path)
+    mg = mg[mg["Marketplace Name"] != "amazon.co.uk"] if region == "EU" \
+        else mg[mg["Marketplace Name"] == "amazon.co.uk"]
+    if sel_periods is not None:
+        mg = mg[mg["Period"].dt.to_period(sel_freq).isin(sel_periods)]
+    else:
+        mg = mg[(mg["Period"] >= start) & (mg["Period"] <= end)]
+    mg = mg.copy()
+    mg["SKU"] = mg["SKU"].astype(str)
+    sales_by = mg.groupby(["SKU", "Marketplace Name"], observed=True)["Sales"].sum().reset_index()
+    tot = sales_by.groupby("SKU")["Sales"].transform("sum")
+    sales_by["share"] = sales_by["Sales"] / tot.where(tot > 0)
+    alloc = sales_by.merge(agg[["SKU", "lost_rev", "lost_cm3"]], on="SKU", how="inner")
+    alloc = alloc[alloc["share"] > 0]
+    alloc["c_rev"] = alloc["lost_rev"] * alloc["share"]
+    alloc["c_cm3"] = alloc["lost_cm3"] * alloc["share"]
+    if alloc.empty:
+        st.info("No allocatable OOS loss in the current scope.")
+    else:
+        country = (alloc.groupby("Marketplace Name", observed=True)
+                   .agg(lost_rev=("c_rev", "sum"), lost_cm3=("c_cm3", "sum"),
+                        oos_skus=("SKU", "nunique")).reset_index()
+                   .sort_values("lost_cm3", ascending=False))
+        country["Country"] = country["Marketplace Name"].map(MKT_COUNTRY).fillna(
+            country["Marketplace Name"])
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Countries", fmt_num(len(country)))
+        k2.metric("Lost revenue (allocated)", eur(country["lost_rev"].sum()))
+        k3.metric("Lost CM3 (allocated)", eur(country["lost_cm3"].sum()))
+        figc = px.bar(country.sort_values("lost_cm3"), x="lost_cm3", y="Country",
+                      orientation="h", labels={"lost_cm3": "Lost CM3 (€)", "Country": ""},
+                      title="OOS lost CM3 by country (allocated by sales share)")
+        figc.update_traces(marker_color="#d32f2f")
+        figc.update_layout(height=max(300, 40 * len(country)),
+                           margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(figc, width="stretch")
+        disp = country[["Country", "oos_skus", "lost_rev", "lost_cm3"]].rename(columns={
+            "oos_skus": "OOS SKUs", "lost_rev": "Lost revenue (€)",
+            "lost_cm3": "Lost CM3 (€)"})
+        disp = disp.round(0)
+        st.dataframe(
+            disp, width="stretch", hide_index=True, height=380,
+            column_config={
+                "Lost revenue (€)": st.column_config.NumberColumn(format="localized"),
+                "Lost CM3 (€)": st.column_config.NumberColumn(format="localized")})
+        st.download_button(
+            "⬇️ Download country breakdown (CSV)", disp.to_csv(index=False).encode("utf-8"),
+            file_name=f"oos_by_country_{start.date()}_{end.date()}.csv", mime="text/csv")
+        st.caption("Allocation = SKU's EU OOS loss × its sales share in each "
+                   "country. GB is shown when the GB region is selected.")
