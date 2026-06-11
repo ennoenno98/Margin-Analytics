@@ -736,23 +736,25 @@ heat_rows = scope[scope["heating"]]
 st.markdown("### 🔴 Out-of-stock impact")
 ovb = st.radio("Bucket", ["Month", "Quarter"], horizontal=True, key="ov_bucket")
 operf = "M" if ovb == "Month" else "Q"
-ot = oos_rows.copy()
-ot["bucket"] = ot["Period"].dt.to_period(operf).dt.to_timestamp()
-ob = ot.groupby("bucket", observed=True).agg(
+sc = scope.copy()
+sc["bucket"] = sc["Period"].dt.to_period(operf).dt.to_timestamp()
+ob = sc.groupby("bucket", observed=True).agg(
     lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum"),
-    oos_skus=("SKU", "nunique")).reset_index().sort_values("bucket")
+    oos_days=("oos", "sum"), active=("Period", "count")).reset_index().sort_values("bucket")
+ob["rate"] = (ob["oos_days"] / ob["active"].where(ob["active"] > 0) * 100).round(1)
 ob["label"] = (ob["bucket"].dt.strftime("%b %Y") if operf == "M"
                else ob["bucket"].dt.to_period("Q").astype(str))
 figO = go.Figure()
 figO.add_bar(x=ob["label"], y=ob["lost_rev"], name="Lost revenue (€)", marker_color="#f4a261")
 figO.add_bar(x=ob["label"], y=ob["lost_cm3"], name="Lost CM3 (€)", marker_color="#d32f2f")
-figO.add_trace(go.Scatter(x=ob["label"], y=ob["oos_skus"], name="# SKUs out of stock",
+figO.add_trace(go.Scatter(x=ob["label"], y=ob["rate"], name="OOS rate (%)",
                           yaxis="y2", mode="lines+markers", line=dict(color="#264653", width=3)))
 figO.update_layout(
     barmode="group", height=420,
-    title="Lost revenue, lost CM3 & SKUs out of stock over time",
+    title="Lost revenue, lost CM3 & OOS rate over time",
     xaxis=dict(type="category"), yaxis=dict(title="€ lost"),
-    yaxis2=dict(title="# SKUs OOS", overlaying="y", side="right", showgrid=False),
+    yaxis2=dict(title="OOS rate (%)", overlaying="y", side="right",
+                showgrid=False, rangemode="tozero"),
     margin=dict(l=10, r=10, t=50, b=60),
     legend=dict(orientation="h", yanchor="top", y=-0.18, x=0.5, xanchor="center"))
 st.plotly_chart(figO, width="stretch")
