@@ -729,10 +729,34 @@ agg["Status"] = np.where(
 )
 agg = agg.sort_values("lost_cm3", ascending=False)
 
-# ---------- KPI tiles (split: involuntary OOS vs voluntary cooling-down) ----------
+# ---------- Header: OOS impact over time (hero) + split KPI groups ----------
 cd_rows = scope[scope["cooldown"]]
+heat_rows = scope[scope["heating"]]
 
-st.markdown("**🔴 Out of stock — involuntary (lost)**")
+st.markdown("### 🔴 Out-of-stock impact")
+ovb = st.radio("Bucket", ["Month", "Quarter"], horizontal=True, key="ov_bucket")
+operf = "M" if ovb == "Month" else "Q"
+ot = oos_rows.copy()
+ot["bucket"] = ot["Period"].dt.to_period(operf).dt.to_timestamp()
+ob = ot.groupby("bucket", observed=True).agg(
+    lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum"),
+    oos_skus=("SKU", "nunique")).reset_index().sort_values("bucket")
+ob["label"] = (ob["bucket"].dt.strftime("%b %Y") if operf == "M"
+               else ob["bucket"].dt.to_period("Q").astype(str))
+figO = go.Figure()
+figO.add_bar(x=ob["label"], y=ob["lost_rev"], name="Lost revenue (€)", marker_color="#f4a261")
+figO.add_bar(x=ob["label"], y=ob["lost_cm3"], name="Lost CM3 (€)", marker_color="#d32f2f")
+figO.add_trace(go.Scatter(x=ob["label"], y=ob["oos_skus"], name="# SKUs out of stock",
+                          yaxis="y2", mode="lines+markers", line=dict(color="#264653", width=3)))
+figO.update_layout(
+    barmode="group", height=420,
+    title="Lost revenue, lost CM3 & SKUs out of stock over time",
+    xaxis=dict(type="category"), yaxis=dict(title="€ lost"),
+    yaxis2=dict(title="# SKUs OOS", overlaying="y", side="right", showgrid=False),
+    margin=dict(l=10, r=10, t=50, b=60),
+    legend=dict(orientation="h", yanchor="top", y=-0.18, x=0.5, xanchor="center"))
+st.plotly_chart(figO, width="stretch")
+# Involuntary loss totals, beneath the chart.
 o1, o2, o3, o4 = st.columns(4)
 o1.metric("SKUs affected", fmt_num(agg["SKU"].nunique()))
 o2.metric("Lost revenue", eur(agg["lost_rev"].sum()))
@@ -746,7 +770,6 @@ c2.metric("Miss revenue", eur(cd_rows["rev_miss"].sum()))
 c3.metric("Miss CM3", eur(cd_rows["cm3_miss"].sum()))
 c4.metric("Cool-down SKU-days", fmt_num(len(cd_rows)))
 
-heat_rows = scope[scope["heating"]]
 st.markdown("**🔥 Heating up — ramp-up after return (lost sales + extra ad spend)**")
 h1, h2, h3, h4 = st.columns(4)
 h1.metric("SKUs heating up", fmt_num(heat_rows["SKU"].nunique()))
@@ -771,32 +794,6 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 #  Tab 1 — Most affected SKUs
 # ======================================================================
 with tab1:
-    # Headline: OOS (involuntary) impact over time — lost €, CM3 & # SKUs OOS.
-    ovb = st.radio("Bucket", ["Month", "Quarter"], horizontal=True, key="ov_bucket")
-    operf = "M" if ovb == "Month" else "Q"
-    ot = oos_rows.copy()
-    ot["bucket"] = ot["Period"].dt.to_period(operf).dt.to_timestamp()
-    ob = ot.groupby("bucket", observed=True).agg(
-        lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum"),
-        oos_skus=("SKU", "nunique")).reset_index().sort_values("bucket")
-    ob["label"] = (ob["bucket"].dt.strftime("%b %Y") if operf == "M"
-                   else ob["bucket"].dt.to_period("Q").astype(str))
-    figO = go.Figure()
-    figO.add_bar(x=ob["label"], y=ob["lost_rev"], name="Lost revenue (€)", marker_color="#f4a261")
-    figO.add_bar(x=ob["label"], y=ob["lost_cm3"], name="Lost CM3 (€)", marker_color="#d32f2f")
-    figO.add_trace(go.Scatter(x=ob["label"], y=ob["oos_skus"], name="# SKUs out of stock",
-                              yaxis="y2", mode="lines+markers",
-                              line=dict(color="#264653", width=3)))
-    figO.update_layout(
-        barmode="group", height=420,
-        title="🔴 Out-of-stock impact over time — lost revenue, lost CM3 & SKUs affected",
-        xaxis=dict(type="category"), yaxis=dict(title="€ lost"),
-        yaxis2=dict(title="# SKUs OOS", overlaying="y", side="right", showgrid=False),
-        margin=dict(l=10, r=10, t=50, b=60),
-        legend=dict(orientation="h", yanchor="top", y=-0.18, x=0.5, xanchor="center"))
-    st.plotly_chart(figO, width="stretch")
-    st.divider()
-
     top_n = st.slider("Show top N SKUs by lost CM3", 5, 50, 15, key="topn")
     top = agg.head(top_n)
     fig = px.bar(
