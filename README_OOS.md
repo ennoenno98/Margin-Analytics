@@ -64,8 +64,10 @@ independent pool (own stock, demand λ, reach and impact).
   revenue + lost CM3 + # SKUs out of stock, by month/quarter), KPI tiles, a
   ranked table, a top-N bar chart and a per-SKU timeline drill-down.
 - **Stock-out calendar** — a SKU × month heatmap of stock-out days.
-- **Country overview** — the Pan-EU OOS loss **allocated per country** by each
-  SKU's sales share per marketplace (same OOS events; loss split where it sells).
+- **Country overview** — OOS impact per country from the **actual items lost in
+  each country** (each SKU's EU lost units split by its unit share per
+  marketplace) valued at **that country's own price & CM3**, so the same
+  stock-out weighs differently by country. Pick a country to drill into its SKUs.
 - **Stock-out events** — every discrete stock-out collapsed into an event
   (start / end / duration / cause / lost €), with CSV export.
 - **Cooling down** — days the SKU was *deliberately throttled* (ad spend cut
