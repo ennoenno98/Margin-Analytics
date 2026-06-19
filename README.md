@@ -92,3 +92,11 @@ shows a hint near the table.
 
 `Margin_Analytics.xlsx` + `build_workbook.py` are the earlier Google Sheets
 template; kept in the repo for reference, not used by the dashboard.
+
+`Marketplace_PL_by_Country_Month.xlsx` + `build_marketplace_reference.py` turn
+the per-marketplace Amazon P&L exports in `pl_exports/` into a single
+lookup-friendly workbook (Summary / By Country & Month / Data (Tidy)) for
+referencing from another spreadsheet via XLOOKUP / SUMIFS. The exports carry
+no country label, so each is matched to its marketplace by its Units & Sales
+totals against the latest `novadata_exports/` margin file. Rebuild with
+`python build_marketplace_reference.py`.
