@@ -41,6 +41,7 @@ MARKETPLACES = [
     ("pl_2026-06-19_amazon.de.xlsx",     "amazon.de",     "Germany",     "DE"),
     ("pl_2026-06-19_amazon.it.xlsx",     "amazon.it",     "Italy",       "IT"),
     ("pl_2026-06-19_amazon.es.xlsx",     "amazon.es",     "Spain",       "ES"),
+    ("pl_2026-06-19_amazon.co.uk.xlsx",  "amazon.co.uk",  "United Kingdom", "UK"),
     ("pl_2026-06-19_amazon.fr.xlsx",     "amazon.fr",     "France",      "FR"),
     ("pl_2026-06-19_amazon.ie.xlsx",     "amazon.ie",     "Ireland",     "IE"),
     ("pl_2026-06-19_amazon.nl.xlsx",     "amazon.nl",     "Netherlands", "NL"),
@@ -315,8 +316,9 @@ def build_readme(wb, period_labels, month_labels):
         "Net Profit.",
         "Percent rows are stored as points (71.0 means 71%), shown with a "
         "trailing %. Reference the cell directly — no need to divide by 100.",
-        "All values are EUR; UK (GBP) and Sweden (SEK) marketplaces are not in "
-        "this export.",
+        "All values are EUR — the export reports the UK marketplace in EUR too, "
+        "so it sums in cleanly. Sweden (SEK) is the only EU marketplace not "
+        "included (no sales in the period).",
         "All-Marketplaces margins are recomputed from the summed €/unit bases. "
         "ACOS has no all-up value (it needs ad-attributed sales, not in this "
         "export) and is left blank.",
