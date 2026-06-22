@@ -630,18 +630,28 @@ region = c1.selectbox("Region", regions, index=0,
                            "amazon.co.uk). GB = the separate UK warehouse "
                            "(amazon.co.uk). They are tracked as independent pools.")
 pmin, pmax = long_all["Period"].min(), asof
-ptype = c2.selectbox("Period", ["Full range", "Quarter", "Month"], index=0)
+ptype = c2.selectbox("Period", ["Full range", "Year", "Quarter", "Month", "Week"], index=0)
 sel_periods, sel_freq = None, None
-if ptype == "Month":
-    opts = list(pd.period_range(pmin, pmax, freq="M"))[::-1]
-    chosen = c3.multiselect("Months", opts, default=[opts[0]],
-                            format_func=lambda p: p.strftime("%b %Y"))
-    sel_freq = "M"
+if ptype == "Year":
+    opts = list(pd.period_range(pmin, pmax, freq="Y"))[::-1]
+    chosen = c3.multiselect("Years", opts, default=[opts[0]],
+                            format_func=lambda p: str(p.year))
+    sel_freq = "Y"
 elif ptype == "Quarter":
     opts = list(pd.period_range(pmin, pmax, freq="Q"))[::-1]
     chosen = c3.multiselect("Quarters", opts, default=[opts[0]],
                             format_func=lambda p: f"{p.year} Q{p.quarter}")
     sel_freq = "Q"
+elif ptype == "Month":
+    opts = list(pd.period_range(pmin, pmax, freq="M"))[::-1]
+    chosen = c3.multiselect("Months", opts, default=[opts[0]],
+                            format_func=lambda p: p.strftime("%b %Y"))
+    sel_freq = "M"
+elif ptype == "Week":
+    opts = list(pd.period_range(pmin, pmax, freq="W"))[::-1]
+    chosen = c3.multiselect("Weeks", opts, default=[opts[0]],
+                            format_func=lambda p: f"CW{p.week} {p.start_time.year}")
+    sel_freq = "W"
 else:
     c3.multiselect("Bucket", ["— full range —"], default=[], disabled=True)
     chosen = []
