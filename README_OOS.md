@@ -74,6 +74,10 @@ independent pool (own stock, demand λ, reach and impact).
   and/or price raised) while stock was tight, to glide to the next shipment
   instead of hard stocking out. Reports the **revenue miss** and **CM3 miss**
   (the sales voluntarily forgone), per SKU, with CSV export.
+- **Top sellers** — OOS tracker for the highest-value SKUs, ranked by
+  **expected revenue** (λ × avg price — a stable base a stock-out can't shrink),
+  with current status/reach. The header also shows **WISR** (Weighted In-Stock
+  Rate): % of time in stock, weighted by expected revenue.
 - **Heating up** — the **ramp-up after a SKU returns** (from cooling-down or a
   stock-out): ad spend pushed up and/or price cut (only if previously raised)
   to rebuild momentum. Reports **ramp-up lost sales** (still below baseline λ
@@ -86,12 +90,15 @@ independent pool (own stock, demand λ, reach and impact).
 A deliberate PPC cut or price hike looks like a demand drop to the gap signal,
 so the model separates them. Reach (days-of-supply) drives the split:
 
-- **reach < 3 days → OOS** ("Critically low") — effectively out of stock even
-  if the balance hasn't hit literally zero.
+- **reach below the region threshold → OOS** ("Critically low") — effectively
+  out of stock even if the balance isn't literally zero. Defaults per Ops:
+  **EU 4 days** (≈ dispatch-to-sellable), **GB 12 days** (transfers + customs).
 - **3 ≤ reach < 30 days + throttled + still selling → Cooling down** — the
   SKU's **ad spend is cut by ≥ 70 % vs its baseline** and/or its **price is
-  ≥ 15 % above baseline**, while it still sells (units > 0). If a throttle pushes
-  sales to **zero** it's not cooling down — it counts as OOS (lost), not miss.
+  ≥ 15 % above baseline**, while it still sells (units > 0). An **ad cut only
+  counts if the price is not simultaneously discounted** (pulling ads back while
+  discounting is a promo ending, not a throttle). If a throttle pushes sales to
+  **zero** it's not cooling down — it counts as OOS (lost), not miss.
 
 Cooling-down impact is booked as *miss* (voluntary), kept apart from involuntary
 *lost*. Category priority per day: **Physical (network) > Critically low (<3d) >

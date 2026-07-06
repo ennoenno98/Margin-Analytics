@@ -83,7 +83,9 @@ BASELINE_WINDOW = 90       # trailing window for expected demand / price / CM3
 DEFAULT_MIN_DEMAND = 3.0   # min expected units/day to infer a marketplace gap
 TAIL_DAYS = 21             # treat trailing zero-runs near "today" as ongoing OOS
 LOW_STOCK_DAYS = 21        # days-of-supply threshold for the low-stock risk view
-OOS_DOS = 3                # reach (days-of-supply) below this counts as OOS
+OOS_DOS_EU = 4             # EU reach threshold — ~4d dispatch-to-sellable (Ops input)
+OOS_DOS_GB = 12            # GB reach threshold — longer transfers + customs (Ops input)
+OOS_DOS = OOS_DOS_EU       # fallback default for flag_oos()
 
 # "Cooling down" = deliberately throttling demand (cutting PPC and/or raising
 # price) while stock is tight, to glide to the next shipment instead of hard
@@ -400,9 +402,13 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     ad_cut = ~np.isnan(base_ppc) & (base_ppc > min_ppc) & (ppc <= base_ppc * (1 - ppc_cut))
     hike = ~np.isnan(price) & (price >= ap * (1 + price_up))
     cool_stock = ~np.isnan(dos) & (dos < dos_th) & (dos >= oos_dos)
+    # An ad cut only signals cooling-down if the price is NOT simultaneously
+    # discounted — pulling ads back while still selling below baseline price is
+    # a promo winding down (post-heat-up), not a stock-protective throttle.
+    not_discounted = ~np.isnan(price) & (price >= ap * 0.98)
     cooldown = (
-        (ad_cut | hike) & cool_stock & (units > 0) & (expected >= min_demand)
-        & had_past & ~phys_eu
+        ((ad_cut & not_discounted) | hike) & cool_stock & (units > 0)
+        & (expected >= min_demand) & had_past & ~phys_eu
     )
 
     oos_fba = fba_known & (fba == 0) & had_past
@@ -613,6 +619,24 @@ prod_short = prod_map.map(short_product)   # readable names for tables
 brand_map = meta.set_index("SKU")["Brand"]
 inv = inventory_status(eu, asof)
 
+# Data-freshness banner: sales (Novadata) refreshes daily via GitHub Actions;
+# the Amazon ledger is a manual upload — warn when either is stale.
+led_asof = eu["Date"].max() if not eu.empty else None
+_today = pd.Timestamp.today().normalize()
+_fresh = f"Sales data through **{asof.date()}**"
+if led_asof is not None:
+    _fresh += f" · stock ledger through **{led_asof.date()}**"
+st.caption(_fresh)
+_stale = []
+if (_today - asof).days > 3:
+    _stale.append(f"sales data is {(_today - asof).days} days old (daily refresh "
+                  "runs on the default branch)")
+if led_asof is not None and (_today - led_asof).days > 7:
+    _stale.append(f"stock ledger is {(_today - led_asof).days} days old — upload a "
+                  "fresh Inventory Ledger export via add_ledger.py")
+if _stale:
+    st.warning("⚠️ " + "; ".join(_stale) + ".")
+
 if ledger_path is None:
     st.warning(
         "No Amazon FBA Inventory Ledger found in `amazon_ledger/` — running on "
@@ -677,9 +701,13 @@ inv_dos = inv_r.set_index("SKU")["days_of_supply"] if not inv_r.empty else pd.Se
 
 with st.expander("Stock-out, cooling-down & heating-up thresholds"):
     cc1, cc2, cc3, cc4 = st.columns(4)
-    oos_reach = cc1.slider("OOS when reach below (days)", 1, 14, OOS_DOS, 1,
+    _reach_default = OOS_DOS_EU if region == "EU" else OOS_DOS_GB
+    oos_reach = cc1.slider("OOS when reach below (days)", 1, 21, _reach_default, 1,
+                           key=f"oos_reach_{region}",
                            help="Reach (days-of-supply) below this counts as out "
-                                "of stock, even if the balance isn't literally 0.")
+                                "of stock, even if the balance isn't literally 0. "
+                                "Defaults per Ops: EU 4 (≈ dispatch-to-sellable), "
+                                "GB 12 (longer transfers + customs).")
     cd_dos = cc2.slider("Cool-down when reach below (days)", 5, 60, COOLDOWN_DOS, 5)
     cd_price = cc3.slider("Cool-down: price hike vs baseline (%)", 2, 30,
                           int(COOLDOWN_PRICE_UP * 100), 1) / 100
@@ -748,10 +776,16 @@ ovb = st.radio("Bucket", ["Month", "Quarter"], horizontal=True, key="ov_bucket")
 operf = "M" if ovb == "Month" else "Q"
 sc = scope.copy()
 sc["bucket"] = sc["Period"].dt.to_period(operf).dt.to_timestamp()
+# WISR weight = expected revenue/day (λ × avg price) — a stable base a stock-out
+# can't shrink, unlike trailing realized revenue.
+sc["_w"] = sc["expected"] * sc["avg_price"].fillna(0)
+sc["_w_in"] = sc["_w"] * (~sc["oos"])
 ob = sc.groupby("bucket", observed=True).agg(
     lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum"),
-    oos_days=("oos", "sum"), active=("Period", "count")).reset_index().sort_values("bucket")
+    oos_days=("oos", "sum"), active=("Period", "count"),
+    w=("_w", "sum"), w_in=("_w_in", "sum")).reset_index().sort_values("bucket")
 ob["rate"] = (ob["oos_days"] / ob["active"].where(ob["active"] > 0) * 100).round(1)
+ob["wisr"] = (ob["w_in"] / ob["w"].where(ob["w"] > 0) * 100).round(1)
 ob["label"] = (ob["bucket"].dt.strftime("%b %Y") if operf == "M"
                else ob["bucket"].dt.to_period("Q").astype(str))
 figO = go.Figure()
@@ -759,22 +793,31 @@ figO.add_bar(x=ob["label"], y=ob["lost_rev"], name="Lost revenue (€)", marker_
 figO.add_bar(x=ob["label"], y=ob["lost_cm3"], name="Lost CM3 (€)", marker_color="#d32f2f")
 figO.add_trace(go.Scatter(x=ob["label"], y=ob["rate"], name="OOS rate (%)",
                           yaxis="y2", mode="lines+markers", line=dict(color="#264653", width=3)))
+figO.add_trace(go.Scatter(x=ob["label"], y=ob["wisr"], name="WISR (%)",
+                          yaxis="y2", mode="lines+markers",
+                          line=dict(color="#2a9d8f", width=2, dash="dot")))
 figO.update_layout(
     barmode="group", height=420,
-    title="Lost revenue, lost CM3 & OOS rate over time",
+    title="Lost revenue, lost CM3, OOS rate & WISR over time",
     xaxis=dict(type="category"), yaxis=dict(title="€ lost"),
-    yaxis2=dict(title="OOS rate (%)", overlaying="y", side="right",
+    yaxis2=dict(title="%", overlaying="y", side="right",
                 showgrid=False, rangemode="tozero"),
     margin=dict(l=10, r=10, t=50, b=60),
     legend=dict(orientation="h", yanchor="top", y=-0.18, x=0.5, xanchor="center"))
 st.plotly_chart(figO, width="stretch")
 # Involuntary loss totals, beneath the chart.
-o1, o2, o3, o4 = st.columns(4)
+o1, o2, o3, o4, o5 = st.columns(5)
 o1.metric("SKUs affected", fmt_num(agg["SKU"].nunique()))
 o2.metric("Lost revenue", eur(agg["lost_rev"].sum()))
 o3.metric("Lost CM3 (P&L impact)", eur(agg["lost_cm3"].sum()))
 _rate = len(oos_rows) / max(len(scope), 1) * 100
 o4.metric("OOS rate", f"{_rate:.1f}".replace(".", ",") + " %")
+_wtot, _wintot = sc["_w"].sum(), sc["_w_in"].sum()
+_wisr = _wintot / _wtot * 100 if _wtot > 0 else float("nan")
+o5.metric("WISR", f"{_wisr:.1f}".replace(".", ",") + " %",
+          help="Weighted In-Stock Rate: % of time in stock, weighted by each "
+               "SKU's expected revenue (demand rate λ × avg price) — high-value "
+               "SKUs dominate the score, and a stock-out can't shrink its own weight.")
 
 st.markdown("**🟣 Cooling down — voluntary throttle (miss)**")
 c1, c2, c3, c4 = st.columns(4)
@@ -798,9 +841,9 @@ st.caption(
     "All valued as contribution margin (CM3) / € — the true P&L impact."
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["Most affected SKUs", "Stock-out calendar", "Stock-out events",
-     "Cooling down", "Heating up", "Country overview"]
+     "Cooling down", "Heating up", "Country overview", "Top sellers"]
 )
 
 # ======================================================================
@@ -1091,3 +1134,56 @@ with tab6:
                    "that country, valued at that country's avg price / CM3 per unit "
                    "over the period. Country totals can differ from the EU-blended "
                    "total because each country's margin profile is used.")
+
+# ======================================================================
+#  Tab 7 — Top sellers (OOS tracker for the highest-value SKUs)
+# ======================================================================
+with tab7:
+    st.caption(
+        "Our **highest-value SKUs** ranked by expected revenue (demand rate λ × "
+        "avg price — a stable base a stock-out can't shrink, unlike trailing "
+        "realized revenue) and how availability treated them in the selected "
+        "period. This is the watchlist: a stock-out here hurts most."
+    )
+    tb = scope.copy()
+    tb["_exp_rev"] = tb["expected"] * tb["avg_price"].fillna(0)
+    ts_n = st.slider("Top N by expected revenue", 10, 50, 20, 5, key="ts_n")
+    t = tb.groupby("SKU", observed=True).agg(
+        exp_rev=("_exp_rev", "mean"), oos_days=("oos", "sum"),
+        active=("Period", "nunique"), lost_rev=("lost_rev", "sum"),
+        lost_cm3=("lost_cm3", "sum")).reset_index()
+    t = t.sort_values("exp_rev", ascending=False).head(ts_n)
+    t["oos_rate"] = (t["oos_days"] / t["active"].where(t["active"] > 0) * 100).round(1)
+    t["Product"] = t["SKU"].map(prod_short)
+    t["cur_stock"] = t["SKU"].map(inv_stock)
+    t["reach"] = t["SKU"].map(inv_dos).round(0)
+    t["Status"] = np.where(
+        t["cur_stock"].fillna(-1) <= 0, "🔴 Out of stock",
+        np.where(t["reach"].fillna(1e9) < oos_reach, "🔴 Critically low",
+                 np.where(t["reach"].fillna(1e9) < LOW_STOCK_DAYS, "🟠 Low stock",
+                          np.where(t["cur_stock"].isna(), "❔ Unknown", "🟢 In stock"))))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Top sellers with OOS days", fmt_num(int((t["oos_days"] > 0).sum())))
+    k2.metric("Lost revenue (top sellers)", eur(t["lost_rev"].sum()))
+    k3.metric("Lost CM3 (top sellers)", eur(t["lost_cm3"].sum()))
+    k4.metric("At risk right now", fmt_num(int(t["Status"].isin(
+        ["🔴 Out of stock", "🔴 Critically low"]).sum())))
+    disp = t[["SKU", "Product", "Status", "exp_rev", "oos_days", "oos_rate",
+              "lost_rev", "lost_cm3", "cur_stock", "reach"]].rename(columns={
+        "exp_rev": "Expected €/day", "oos_days": "OOS days", "oos_rate": "OOS rate %",
+        "lost_rev": "Lost revenue (€)", "lost_cm3": "Lost CM3 (€)",
+        "cur_stock": "Available stock", "reach": "Reach (days)"}).round(0)
+    st.dataframe(
+        disp, width="stretch", hide_index=True, height=560,
+        column_config={
+            "Expected €/day": st.column_config.NumberColumn(format="localized"),
+            "Lost revenue (€)": st.column_config.NumberColumn(format="localized"),
+            "Lost CM3 (€)": st.column_config.NumberColumn(format="localized"),
+            "Available stock": st.column_config.NumberColumn(format="localized"),
+            "Reach (days)": st.column_config.NumberColumn(format="localized"),
+            "OOS rate %": st.column_config.ProgressColumn(
+                format="%.0f%%", min_value=0, max_value=100),
+        })
+    st.download_button(
+        "⬇️ Download top sellers (CSV)", disp.to_csv(index=False).encode("utf-8"),
+        file_name=f"oos_topsellers_{start.date()}_{end.date()}.csv", mime="text/csv")
