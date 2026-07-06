@@ -103,6 +103,15 @@ HEATUP_PRICE_DOWN = 0.10   # price <= baseline x (1-this) = a re-stimulation cut
 HEATUP_WINDOW = 28         # recovery window (days) after the disruption
 HEATUP_RECOVERED = 0.9     # sales back to this x baseline = ramp-up over
 
+# Promo-elevated counterfactual: when a SKU was recently *positioned* to sell
+# faster than usual (price cut and/or ad push, e.g. Prime Day), a throttle or
+# stock-out in that window forgoes the POSITIONED run-rate, not the slow 90d
+# lambda — so losses in that window are valued at the positioned rate.
+PROMO_PRICE_CUT = 0.05     # price <= baseline x (1-this) counts as positioned
+PROMO_AD_UP = 1.5          # ad spend >= baseline x this counts as positioned
+PROMO_WINDOW = 21          # look-back (days) for the positioned run-rate
+PROMO_ELEV = 1.25          # positioned rate must exceed this x lambda to apply
+
 # Marketplace -> country label (for the country breakdown).
 MKT_COUNTRY = {
     "amazon.de": "🇩🇪 Germany", "amazon.fr": "🇫🇷 France", "amazon.it": "🇮🇹 Italy",
@@ -309,6 +318,19 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     had_past = pos.cummax()
     has_future = pos[::-1].cummax()[::-1]
 
+    # Positioned run-rate: average units on recent days the SKU was actively
+    # pushed (price cut and/or ad boost — e.g. Prime Day positioning). Remembered
+    # for PROMO_WINDOW days (shift(1): the day itself doesn't set its own bar).
+    # A price-cut day only counts as positioned if ads weren't simultaneously
+    # slashed — discounted-but-ad-cut days are themselves throttled and would
+    # dilute the positioned rate. (Before ad data exists, base_ppc is NaN and
+    # the ads condition defaults to true.)
+    ads_ok = base_ppc.isna() | (ppc >= base_ppc)
+    positioned = ((price <= avg_price * (1 - PROMO_PRICE_CUT)) & ads_ok) \
+        | (ppc >= base_ppc * PROMO_AD_UP)
+    expected_promo = (units.where(positioned)
+                      .rolling(PROMO_WINDOW, min_periods=2).mean().shift(1))
+
     def melt(frame: pd.DataFrame, name: str) -> pd.Series:
         s = frame.stack(["SKU", "region"], future_stack=True)
         s.name = name
@@ -317,6 +339,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     long = pd.concat(
         [melt(units, "units"), melt(sales, "sales"), melt(cm3, "cm3"),
          melt(fba, "fba"), melt(expected, "expected"),
+         melt(expected_promo, "expected_promo"),
          melt(avg_price, "avg_price"), melt(avg_cm3_pu, "avg_cm3_pu"),
          melt(ppc, "ppc"), melt(base_ppc, "base_ppc"), melt(price, "price"),
          melt(had_past, "had_past"), melt(has_future, "has_future")],
@@ -344,9 +367,9 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
         long["dos"] = np.nan
         long["receipts"] = np.nan
 
-    for col in ("units", "sales", "cm3", "fba", "expected", "avg_price",
-                "avg_cm3_pu", "ppc", "base_ppc", "price", "eu_stock", "dos",
-                "receipts"):
+    for col in ("units", "sales", "cm3", "fba", "expected", "expected_promo",
+                "avg_cm3_pu", "avg_price", "ppc", "base_ppc", "price",
+                "eu_stock", "dos", "receipts"):
         long[col] = long[col].astype("float32")
     for col in ("SKU", "region"):
         long[col] = long[col].astype("category")
@@ -465,8 +488,16 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
                                    np.where(heating, "Heating up", "")))),
     )
 
-    lost_units = np.where(oos, np.clip(expected - units, 0, None), 0.0)
-    miss_units = np.where(cooldown, np.clip(expected - units, 0, None), 0.0)
+    # Valuation counterfactual: if the SKU was recently POSITIONED to sell
+    # faster than usual (promo price/ads, e.g. Prime Day) and that positioned
+    # run-rate clearly exceeds lambda, an OOS day or throttle in that window
+    # forgoes the positioned rate — value lost/miss against it, not lambda.
+    exp_promo = long["expected_promo"].to_numpy()
+    elevated = ~np.isnan(exp_promo) & (exp_promo >= PROMO_ELEV * expected)
+    exp_eff = np.where(elevated, exp_promo, expected)
+
+    lost_units = np.where(oos, np.clip(exp_eff - units, 0, None), 0.0)
+    miss_units = np.where(cooldown, np.clip(exp_eff - units, 0, None), 0.0)
     ramp_units = np.where(heating, np.clip(expected - units, 0, None), 0.0)
     extra_ad = np.where(heating, np.clip(ppc - np.nan_to_num(base_ppc), 0, None), 0.0)
     res["oos"] = oos

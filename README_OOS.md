@@ -47,6 +47,12 @@ Demand gap (EU)**.
   Expected demand = trailing 90-day average units **per calendar day** (the
   demand rate), forward-filled so a multi-week stock-out keeps its pre-outage
   baseline.
+- **Promo-elevated counterfactual:** if the SKU was recently *positioned* to
+  sell faster than usual (price cut with ads at/above baseline, and/or an ad
+  boost — e.g. Prime Day), the average sales rate of those positioned days
+  (remembered 21 days) replaces λ when it clearly exceeds it (≥ 1,25×) — a
+  throttle or stock-out in that window forgoes the positioned rate, not the
+  long-run average.
 - **Lost revenue (€)** = lost units × trailing avg selling price.
 - **Lost CM3 (€)** = lost units × trailing avg contribution margin per unit —
   the true **P&L impact**, the headline number the ranking sorts by.
