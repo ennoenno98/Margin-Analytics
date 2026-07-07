@@ -180,6 +180,13 @@ def latest_ledger(d: Path) -> Path | None:
     return _latest(d, "inventory_ledger_*.csv", "inventory_ledger_*.csv.gz")
 
 
+def latest_discontinued(d: Path) -> Path | None:
+    """Newest product-discontinuation export (a weekly DB pull). The filename is
+    flexible — anything containing 'discontinued' as .xlsx / .csv / .csv.gz."""
+    return _latest(d, "*discontinued*.xlsx", "*discontinued*.csv",
+                   "*discontinued*.csv.gz")
+
+
 # ---------- Loaders ----------
 @st.cache_data(show_spinner=False)
 def load_margin(path: Path, mtime: float | None = None) -> pd.DataFrame:
@@ -267,6 +274,43 @@ def load_ledger(path: Path | None, mtime: float | None = None):
     eu["eu_stock"] = eu["on_hand"] + eu["in_transit"]
     eu["SKU"] = eu["SKU"].astype(str)
     return eu
+
+
+@st.cache_data(show_spinner=False)
+def load_discontinued(path: Path | None, mtime: float | None = None) -> pd.DataFrame:
+    """Product-discontinuation list (a weekly DB pull) → one row per SKU with the
+    date it was delisted.
+
+    A discontinued SKU keeps appearing in the Novadata export for a while, so its
+    post-delisting zero-sales tail would otherwise be read as an ongoing
+    stock-out / blocked listing (the trailing-zeros safeguard only spares the
+    last few weeks before "today"). Cutting a SKU off at its `inactive_date`
+    keeps those dead days out of every OOS/cooling/heating/blocked total.
+
+    A later `active_date` (SKU relisted after having been inactive) clears the
+    flag — the SKU is live again, not discontinued. `mtime` is part of the cache
+    key so an in-place re-upload of the same filename invalidates the cache."""
+    cols = ["SKU", "inactive_date", "active_date", "Product"]
+    if path is None:
+        return pd.DataFrame(columns=cols)
+    raw = (pd.read_excel(path) if path.suffix.lower() in (".xlsx", ".xls")
+           else pd.read_csv(path))
+    raw.columns = [str(c).strip().lower() for c in raw.columns]
+    if not {"sku", "product_inactive_date"}.issubset(raw.columns):
+        return pd.DataFrame(columns=cols)
+    raw["SKU"] = raw["sku"].astype(str).str.strip()
+    raw["_ina"] = pd.to_datetime(raw["product_inactive_date"], errors="coerce")
+    raw["_act"] = pd.to_datetime(raw.get("product_active_date"), errors="coerce")
+    raw["Product"] = raw.get("product_name_short",
+                             pd.Series("", index=raw.index)).astype(str)
+    # Collapse duplicate/repeat rows to one per SKU: keep the most recent
+    # (de)activation dates (the export can carry exact-duplicate rows).
+    g = (raw.groupby("SKU", as_index=False)
+         .agg(inactive_date=("_ina", "max"), active_date=("_act", "max"),
+              Product=("Product", "last")))
+    g = g[g["inactive_date"].notna()]
+    reactivated = g["active_date"].notna() & (g["active_date"] > g["inactive_date"])
+    return g[~reactivated][cols].reset_index(drop=True)
 
 
 @st.cache_data(show_spinner="Computing stock-out history…")
@@ -730,6 +774,7 @@ st.caption(
 
 margin_path = latest_export(EXPORTS_DIR)
 ledger_path = latest_ledger(LEDGER_DIR)
+disc_path = latest_discontinued(EXPORTS_DIR)
 if margin_path is None:
     st.error(f"No margin export in `{EXPORTS_DIR}`. Run the Novadata export first.")
     st.stop()
@@ -872,6 +917,23 @@ if search.strip():
     hits = [k for k in cats
             if s in str(k).lower() or s in str(prod_map.get(k, "")).lower()]
     scope = scope[scope["SKU"].isin(hits)]
+
+# ---------- Discontinued products (delisted → out of the OOS universe) ----------
+# A SKU keeps showing up in the Novadata export after it's delisted; from its
+# inactive_date on, those zero-sales days are neither a stock-out nor a blocked
+# listing — the product simply isn't sold any more. Drop them from the working
+# panel so no involuntary/voluntary/blocked total is inflated by dead SKUs, and
+# surface them as their own category below.
+disc = load_discontinued(disc_path,
+                         disc_path.stat().st_mtime if disc_path else None)
+disc_cut = disc.set_index("SKU")["inactive_date"] if not disc.empty else pd.Series(dtype="datetime64[ns]")
+if not disc_cut.empty:
+    _cut = scope["SKU"].astype(str).map(disc_cut)
+    _dmask = _cut.notna().to_numpy() & (scope["Period"] >= _cut).to_numpy()
+    disc_scope = scope[_dmask]        # delisted SKU-days that fall in the view
+    scope = scope[~_dmask]
+else:
+    disc_scope = scope.iloc[:0]
 if scope.empty:
     st.warning("No data in the current scope. Widen the filters.")
     st.stop()
@@ -984,14 +1046,43 @@ if not blk_rows.empty:
                          "Unrealized revenue (€)": st.column_config.NumberColumn(format="localized"),
                          "Unrealized CM3 (€)": st.column_config.NumberColumn(format="localized")})
 
+delisted_in_period = disc[(disc["inactive_date"] >= start)
+                          & (disc["inactive_date"] <= end)] if not disc.empty else disc
+st.markdown("**🗑️ Discontinued — delisted products (removed from every total above)**")
+g1, g2, g3, g4 = st.columns(4)
+g1.metric("Delisted SKUs in view", fmt_num(disc_scope["SKU"].nunique()))
+g2.metric("Dead SKU-days removed", fmt_num(len(disc_scope)),
+          help="Post-delisting zero-sales days dropped from the OOS/blocked "
+               "universe so they don't masquerade as stock-outs.")
+g3.metric("Delisted this period", fmt_num(len(delisted_in_period)),
+          help="Products whose delisting date falls inside the selected period.")
+g4.metric("On the discontinued list", fmt_num(len(disc)))
+if disc_path is None:
+    st.caption("No discontinued-products list found in `novadata_exports/` "
+               "(`*discontinued*.xlsx`/`.csv`). Drop the weekly DB pull there to "
+               "keep delisted SKUs out of the OOS totals.")
+elif not delisted_in_period.empty:
+    with st.expander(f"Products delisted in this period ({len(delisted_in_period)})"):
+        dt = delisted_in_period.copy()
+        dt["Product"] = dt["Product"].where(dt["Product"].astype(bool),
+                                             dt["SKU"].map(prod_short))
+        dt["active_date"] = dt["active_date"].dt.date
+        dt["inactive_date"] = dt["inactive_date"].dt.date
+        ddisp = (dt[["SKU", "Product", "active_date", "inactive_date"]]
+                 .sort_values("inactive_date", ascending=False)
+                 .rename(columns={"active_date": "Active since",
+                                  "inactive_date": "Delisted on"}))
+        st.dataframe(ddisp, width="stretch", hide_index=True, height=300)
+
 st.caption(
     f"Data through **{asof.date()}** · scope **{start.date()} → {end.date()}** "
     f"· region **{REGION_LABEL.get(region, region)}**. *Lost* = sales forfeited while out of stock; "
     "*Miss* = sales given up by deliberately throttling to avoid OOS; *Ramp-up "
     "lost + extra ad spend* = the cost of bringing a SKU back after it returns; "
     "*Blocked* = zero sales despite healthy stock (reach above the blocked "
-    "threshold) — a listing/offer issue, kept out of the OOS totals. All valued "
-    "as CM3 / € — the true P&L impact."
+    "threshold) — a listing/offer issue, kept out of the OOS totals; "
+    "*Discontinued* = delisted products (per the weekly list), dropped from "
+    "every total. All valued as CM3 / € — the true P&L impact."
 )
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(

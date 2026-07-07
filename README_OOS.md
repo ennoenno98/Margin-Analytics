@@ -47,6 +47,17 @@ with an unrealized-revenue/CM3 estimate and a per-SKU check-the-listing table.
 Cause priority: **Physical (network) > Critically low > Cooling down >
 Demand gap > Listing blocked**.
 
+**Discontinued products (delisted):** a SKU keeps appearing in the Novadata
+export for a while after it is taken off the listings, so its post-delisting
+zero-sales tail would otherwise be read as an ongoing stock-out or blocked
+listing. A weekly discontinuation list (`novadata_exports/*discontinued*.xlsx`
+or `.csv` — a DB pull with `sku`, `product_active_date`, `product_inactive_date`)
+cuts each SKU off at its `inactive_date`: from that day on its rows leave the
+OOS universe entirely (no lost / miss / blocked). A later `active_date`
+(relisted) clears the flag. Delisted SKUs are surfaced as their own
+**Discontinued** header category. The list is optional — without it the app
+falls back to the trailing-zeros safeguard alone.
+
 ### How impact is valued
 
 - **Lost units** = expected daily demand − whatever still sold that day.
