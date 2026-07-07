@@ -1,9 +1,10 @@
 [theme]
+# Vanatari corporate design (see brand.py / Corporate Design Booklet 2026)
 base = "light"
-primaryColor = "#1F3864"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F2F4F8"
-textColor = "#1F2937"
+primaryColor = "#ff5c3e"             # Warm Orange — highlights / accent
+backgroundColor = "#fbf7f2"          # Light Beige — app background
+secondaryBackgroundColor = "#e3eef6" # Light Blue — sidebar / cards
+textColor = "#3c1826"                # Dark Plum — text / ink
 
 [browser]
 gatherUsageStats = false
