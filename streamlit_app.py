@@ -1981,13 +1981,23 @@ with tab_slow:
                 f"Supply column isn't populated by Novadata yet (known gap)."
             )
         else:
-            # Tied-up stock value: FBA Available × avg unit price (sales / units over period)
+            # Tied-up stock value = FBA units × COGS/unit (what the stock COST,
+            # i.e. capital at risk) — NOT retail price, which would overstate it
+            # by the whole gross margin (~2.5× at Vegavero's ~60% CM1). COGS/unit
+            # is derived from CM1: COGS = Product Sales − CM1 over the period.
             units = pd.to_numeric(slow.get("Units"), errors="coerce")
             sales = pd.to_numeric(slow.get("Product Sales"), errors="coerce")
             fba = pd.to_numeric(slow.get("FBA Available"), errors="coerce")
+            cm1 = pd.to_numeric(slow.get("CM1"), errors="coerce") if "CM1" in slow.columns else None
             unit_price = sales / units.where(units > 0)
+            if cm1 is not None:
+                cogs_per_unit = (sales - cm1) / units.where(units > 0)
+            else:
+                # Legacy schema without absolute CM1: fall back to retail price.
+                cogs_per_unit = unit_price
             slow["Avg unit price"] = unit_price
-            slow["Tied-up value"] = fba * unit_price
+            slow["COGS / unit"] = cogs_per_unit
+            slow["Tied-up value"] = fba * cogs_per_unit
             slow = slow.sort_values("Days of Supply", ascending=False)
 
             s2.markdown(
@@ -2002,9 +2012,18 @@ with tab_slow:
             tied = slow["Tied-up value"].sum()
             k3.metric("Tied-up stock value (≈€)",
                       f"€{tied:,.0f}" if pd.notna(tied) and tied > 0 else "—",
-                      help="FBA Available × avg unit price (sales / units over the selected period).")
-            avg_cm3_slow = pd.to_numeric(slow.get("CM3%"), errors="coerce").mean()
-            k4.metric("Avg CM3 %", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—")
+                      help="FBA units × COGS/unit (COGS = Sales − CM1 over the period) "
+                           "— capital at risk, not retail value.")
+            # Sales-weighted CM3% (ΣCM3 / ΣSales), consistent with the rest of the
+            # app — an unweighted mean of per-SKU %s would be dominated by tiny SKUs.
+            _cm3_abs = pd.to_numeric(slow.get("CM3"), errors="coerce") if "CM3" in slow.columns else None
+            _sales_tot = pd.to_numeric(slow.get("Product Sales"), errors="coerce").sum()
+            if _cm3_abs is not None and _sales_tot:
+                avg_cm3_slow = _cm3_abs.sum() / _sales_tot * 100
+            else:
+                avg_cm3_slow = float("nan")
+            k4.metric("Avg CM3 % (weighted)", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—",
+                      help="Σ CM3 € / Σ Sales € across the slow movers (sales-weighted).")
 
             # Pull current comments (same store the Overview tab edits) so any
             # note added here ↔ shows up on the other tab automatically.
@@ -2023,7 +2042,7 @@ with tab_slow:
             show_cols = [c for c in [
                 "SKU", "Product", "Cluster",
                 "FBA Available", "Sales Velocity", "Days of Supply",
-                "Avg unit price", "Tied-up value",
+                "COGS / unit", "Tied-up value",
                 "Product Sales", "Units", "CM3%",
                 "Comments", "Global note",
             ] if c in slow.columns]
@@ -2043,8 +2062,10 @@ with tab_slow:
                         "Days of Supply", format="%d", disabled=True,
                         help=f"Orange ≥ {dos_threshold} d (your threshold); red ≥ {dos_threshold*2} d (critical).",
                     ),
-                    "Avg unit price": st.column_config.NumberColumn("Avg unit price", format="€%.1f", disabled=True),
-                    "Tied-up value": st.column_config.NumberColumn("Tied-up value", format="€%d", disabled=True),
+                    "COGS / unit": st.column_config.NumberColumn("COGS / unit", format="€%.1f", disabled=True),
+                    "Tied-up value": st.column_config.NumberColumn(
+                        "Tied-up value", format="€%d", disabled=True,
+                        help="FBA units × COGS/unit — capital at risk (not retail value)."),
                     "Product Sales": st.column_config.NumberColumn("Sales (€)", format="€%d", disabled=True),
                     "Units": st.column_config.NumberColumn("Units", format="%d", disabled=True),
                     "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),
