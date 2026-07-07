@@ -38,8 +38,14 @@ A SKU is **out of stock** on a day when **any** of:
    anomaly (this stops slow movers' normal no-sale days being mistaken for
    stock-outs).
 
-Cause priority: **Physical (network) > Critically low (<3d) > Cooling down >
-Demand gap (EU)**.
+**Blocked-listing workaround (no Seller Central suppression report exists):**
+zero sales on a day when reach is comfortably high (> 15 days, tunable) is a
+**listing/offer problem, not a stock-out** — tagged *Listing blocked (in
+stock)*, kept out of the OOS totals, and surfaced as its own header KPI group
+with an unrealized-revenue/CM3 estimate and a per-SKU check-the-listing table.
+
+Cause priority: **Physical (network) > Critically low > Cooling down >
+Demand gap (EU) > Listing blocked**.
 
 ### How impact is valued
 

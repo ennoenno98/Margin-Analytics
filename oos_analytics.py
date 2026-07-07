@@ -112,6 +112,10 @@ PROMO_AD_UP = 1.5          # ad spend >= baseline x this counts as positioned
 PROMO_WINDOW = 21          # look-back (days) for the positioned run-rate
 PROMO_ELEV = 1.25          # positioned rate must exceed this x lambda to apply
 
+# Listing blocked/suppressed workaround (no Seller Central report exists):
+# zero sales with plenty of stock is a listing problem, not a stock-out.
+BLOCKED_MIN_REACH = 15     # units==0 & reach ABOVE this => "Listing blocked", not OOS
+
 # Marketplace -> country label (for the country breakdown).
 MKT_COUNTRY = {
     "amazon.de": "🇩🇪 Germany", "amazon.fr": "🇫🇷 France", "amazon.it": "🇮🇹 Italy",
@@ -387,7 +391,8 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
              min_ppc: float = COOLDOWN_MIN_PPC,
              oos_dos: float = OOS_DOS,
              heat_ad_up: float = HEATUP_AD_UP, heat_price_down: float = HEATUP_PRICE_DOWN,
-             heat_win: int = HEATUP_WINDOW) -> pd.DataFrame:
+             heat_win: int = HEATUP_WINDOW,
+             blocked_reach: float = BLOCKED_MIN_REACH) -> pd.DataFrame:
     """Apply the hybrid OOS flag, the cooling-down flag, cause + impact (cheap).
 
     Categories are mutually exclusive per day, in priority order:
@@ -435,9 +440,15 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     )
 
     oos_fba = fba_known & (fba == 0) & had_past
-    oos_gap = (units == 0) & (expected >= min_demand) & had_past & (has_future | recent)
+    demand_gap = (units == 0) & (expected >= min_demand) & had_past & (has_future | recent)
+    # In stock but not selling: zero sales while reach is comfortably high is a
+    # LISTING problem (blocked / suppressed / not buyable offer), not a
+    # stock-out — there's no Seller Central report for suppression, so this
+    # rule is the workaround. Tracked as its own category, excluded from OOS.
+    blocked = demand_gap & ~np.isnan(dos) & (dos > blocked_reach)
+    oos_gap = demand_gap & ~blocked
     # Involuntary OOS excludes days we chose to throttle (those are cooling-down).
-    raw_oos = (phys_eu | low_reach | oos_fba | oos_gap) & ~cooldown
+    raw_oos = (phys_eu | low_reach | oos_fba | oos_gap) & ~cooldown & ~blocked
 
     res = long.copy()
     res["raw_oos"] = raw_oos
@@ -457,7 +468,7 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     oos_open = (last_oos.notna() & (last_rs.isna() | (last_oos > last_rs))).to_numpy()
     # Only bridge days where sales are still suppressed (the OOS symptom) — so a
     # genuine recovery (sales back near λ) ends the episode even before a Receipt.
-    filled = oos_open & ~np.isnan(dos) & (units < 0.5 * expected) & had_past
+    filled = oos_open & ~np.isnan(dos) & (units < 0.5 * expected) & had_past & ~blocked
     oos = raw_oos | filled
     cooldown = cooldown & ~oos          # a throttle inside an OOS episode is OOS
 
@@ -485,7 +496,8 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
         np.where(oos & ~np.isnan(dos) & (dos < oos_dos), "Critically low (<%gd reach)" % oos_dos,
                  np.where(cooldown, "Cooling down",
                           np.where(oos, "Demand gap (EU)",
-                                   np.where(heating, "Heating up", "")))),
+                                   np.where(blocked, "Listing blocked (in stock)",
+                                            np.where(heating, "Heating up", ""))))),
     )
 
     # Valuation counterfactual: if the SKU was recently POSITIONED to sell
@@ -500,9 +512,14 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     miss_units = np.where(cooldown, np.clip(exp_eff - units, 0, None), 0.0)
     ramp_units = np.where(heating, np.clip(expected - units, 0, None), 0.0)
     extra_ad = np.where(heating, np.clip(ppc - np.nan_to_num(base_ppc), 0, None), 0.0)
+    blk_units = np.where(blocked, np.clip(exp_eff - units, 0, None), 0.0)
     res["oos"] = oos
     res["cooldown"] = cooldown
     res["heating"] = heating
+    res["blocked"] = blocked
+    res["blk_units"] = blk_units.astype("float32")
+    res["blk_rev"] = (blk_units * np.nan_to_num(ap)).astype("float32")
+    res["blk_cm3"] = (blk_units * np.nan_to_num(cm3pu)).astype("float32")
     res["cause"] = cause
     res["lost_units"] = lost_units.astype("float32")
     res["lost_rev"] = (lost_units * np.nan_to_num(ap)).astype("float32")
@@ -744,12 +761,16 @@ with st.expander("Stock-out, cooling-down & heating-up thresholds"):
                           int(COOLDOWN_PRICE_UP * 100), 1) / 100
     cd_ppc = cc4.slider("Cool-down: ad-spend cut vs baseline (%)", 20, 90,
                         int(COOLDOWN_PPC_CUT * 100), 5) / 100
-    hc1, hc2, hc3 = st.columns(3)
+    hc1, hc2, hc3, hc4 = st.columns(4)
     heat_ad = hc1.slider("Heat-up: ad-spend up vs baseline (%)", 10, 200,
                          int(HEATUP_AD_UP * 100), 10) / 100
     heat_pr = hc2.slider("Heat-up: price cut vs baseline (%)", 2, 30,
                          int(HEATUP_PRICE_DOWN * 100), 1) / 100
     heat_win = hc3.slider("Heat-up window after return (days)", 7, 60, HEATUP_WINDOW, 7)
+    blk_reach = hc4.slider("Blocked listing: reach above (days)", 5, 60, BLOCKED_MIN_REACH, 5,
+                           help="Zero-sales days (with demand ≥ the min-demand gate) while "
+                                "reach is ABOVE this are tagged 'Listing blocked (in stock)' "
+                                "— a listing/offer problem, not a stock-out.")
     st.caption("OOS = reach below the first threshold (or balance 0 / a demand "
                "gap). 'Cooling down' = throttled (price up and/or ad cut) while "
                "stock is tight. 'Heating up' = the ramp-up after a SKU returns — "
@@ -761,7 +782,8 @@ with st.expander("Stock-out, cooling-down & heating-up thresholds"):
 # ---------- Apply scope ----------
 scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
                  price_up=cd_price, oos_dos=oos_reach,
-                 heat_ad_up=heat_ad, heat_price_down=heat_pr, heat_win=heat_win)
+                 heat_ad_up=heat_ad, heat_price_down=heat_pr, heat_win=heat_win,
+                 blocked_reach=blk_reach)
 scope = scope[scope["region"] == region]
 if sel_periods is not None:
     scope = scope[scope["Period"].dt.to_period(sel_freq).isin(sel_periods)]
@@ -864,12 +886,37 @@ h2.metric("Ramp-up lost CM3", eur(heat_rows["ramp_cm3"].sum()))
 h3.metric("Extra ad spend", eur(heat_rows["extra_ad"].sum()))
 h4.metric("Heat-up SKU-days", fmt_num(len(heat_rows)))
 
+blk_rows = scope[scope["blocked"]]
+st.markdown("**🚫 Listing blocked — in stock but not selling (not counted as OOS)**")
+b1, b2, b3, b4 = st.columns(4)
+b1.metric("SKUs affected", fmt_num(blk_rows["SKU"].nunique()))
+b2.metric("Blocked SKU-days", fmt_num(len(blk_rows)))
+b3.metric("Unrealized revenue", eur(blk_rows["blk_rev"].sum()))
+b4.metric("Unrealized CM3", eur(blk_rows["blk_cm3"].sum()))
+if not blk_rows.empty:
+    with st.expander("Blocked-listing SKUs (check the offer/listing!)"):
+        bagg = (blk_rows.groupby("SKU", observed=True)
+                .agg(days=("Period", "nunique"), last=("Period", "max"),
+                     rev=("blk_rev", "sum"), cm3=("blk_cm3", "sum"))
+                .reset_index().sort_values("cm3", ascending=False))
+        bagg["Product"] = bagg["SKU"].map(prod_short)
+        bagg["last"] = bagg["last"].dt.date
+        bdisp = bagg[["SKU", "Product", "days", "last", "rev", "cm3"]].rename(columns={
+            "days": "Blocked days", "last": "Last blocked day",
+            "rev": "Unrealized revenue (€)", "cm3": "Unrealized CM3 (€)"}).round(0)
+        st.dataframe(bdisp, width="stretch", hide_index=True, height=300,
+                     column_config={
+                         "Unrealized revenue (€)": st.column_config.NumberColumn(format="localized"),
+                         "Unrealized CM3 (€)": st.column_config.NumberColumn(format="localized")})
+
 st.caption(
     f"Data through **{asof.date()}** · scope **{start.date()} → {end.date()}** "
     f"· region **{REGION_LABEL.get(region, region)}**. *Lost* = sales forfeited while out of stock; "
     "*Miss* = sales given up by deliberately throttling to avoid OOS; *Ramp-up "
-    "lost + extra ad spend* = the cost of bringing a SKU back after it returns. "
-    "All valued as contribution margin (CM3) / € — the true P&L impact."
+    "lost + extra ad spend* = the cost of bringing a SKU back after it returns; "
+    "*Blocked* = zero sales despite healthy stock (reach above the blocked "
+    "threshold) — a listing/offer issue, kept out of the OOS totals. All valued "
+    "as CM3 / € — the true P&L impact."
 )
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
