@@ -32,7 +32,7 @@ A SKU is **out of stock** on a day when **any** of:
 1. **Physical (network):** EU sellable balance == 0 in the ledger.
 2. **Critically low (<3d):** reach (days-of-supply) below 3 — effectively out
    even if the balance isn't literally zero.
-3. **Demand gap (EU):** EU `Units == 0` on a day *enclosed by sales* (not a
+3. **Demand gap:** EU `Units == 0` on a day *enclosed by sales* (not a
    pre-launch / discontinued tail), for a SKU whose EU demand rate clears
    **Min demand (units/day)** — high enough that selling nothing is a genuine
    anomaly (this stops slow movers' normal no-sale days being mistaken for
@@ -45,14 +45,17 @@ stock)*, kept out of the OOS totals, and surfaced as its own header KPI group
 with an unrealized-revenue/CM3 estimate and a per-SKU check-the-listing table.
 
 Cause priority: **Physical (network) > Critically low > Cooling down >
-Demand gap (EU) > Listing blocked**.
+Demand gap > Listing blocked**.
 
 ### How impact is valued
 
 - **Lost units** = expected daily demand − whatever still sold that day.
-  Expected demand = trailing 90-day average units **per calendar day** (the
-  demand rate), forward-filled so a multi-week stock-out keeps its pre-outage
-  baseline.
+  Expected demand λ = trailing 90-day average units per **live** calendar day —
+  pre-launch days and long zero-runs (≥ 7 consecutive zero days: an outage or
+  blocked listing, not sales noise) are excluded from the baseline, so λ is
+  neither diluted for new SKUs nor decays through a stock-out (a multi-week
+  outage keeps its pre-outage rate). The newest export day is an intra-day
+  partial snapshot and is always dropped before analysis.
 - **Promo-elevated counterfactual:** if the SKU was recently *positioned* to
   sell faster than usual (price cut with ads at/above baseline, and/or an ad
   boost — e.g. Prime Day), the average sales rate of those positioned days
@@ -114,14 +117,15 @@ so the model separates them. Reach (days-of-supply) drives the split:
 
 Cooling-down impact is booked as *miss* (voluntary), kept apart from involuntary
 *lost*. Category priority per day: **Physical (network) > Critically low (<3d) >
-Cooling down > Demand gap (EU)**. All thresholds are tunable in the app.
+Cooling down > Demand gap**. All thresholds are tunable in the app.
 
 **Returns don't end a stock-out.** Customer returns trickle back into the
 warehouse and can nudge the sellable balance/reach up mid-stock-out, which would
-otherwise break the OOS run (or trip a spurious cooling-down flag). So once a SKU
-is OOS it stays OOS — through return-driven blips — until either a genuine
-inbound **Receipt** arrives or sales recover to ≥ ½·λ. Receipts (real inbound)
-and Customer Returns are separate ledger columns, so the two are told apart.
+otherwise break the OOS run (or trip a spurious cooling-down flag). An episode
+**closes** only when stock demonstrably recovers: a meaningful inbound
+**Receipt**, **reach climbing back above the cool-down band**, or sales
+recovering to ≥ ½ of the effective demand rate. Bridge-filled days with
+positive sales are labelled *Suppressed sales (post-OOS)*, not *Demand gap*.
 
 Caveat: ad-spend-cut detection only
 works from when Novadata began reporting Advertising Costs (~Feb 2026); the

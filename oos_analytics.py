@@ -182,8 +182,11 @@ def latest_ledger(d: Path) -> Path | None:
 
 # ---------- Loaders ----------
 @st.cache_data(show_spinner=False)
-def load_margin(path: Path) -> pd.DataFrame:
-    """Daily Novadata margin export, trimmed to what the OOS model needs."""
+def load_margin(path: Path, mtime: float | None = None) -> pd.DataFrame:
+    """Daily Novadata margin export, trimmed to what the OOS model needs.
+
+    `mtime` is part of the st.cache_data key so an in-place overwrite of the
+    same filename invalidates the cache."""
     KEEP = {
         "Period", "SKU", "Product", "Marketplace Name", "Brand",
         "Units", "Product Sales", "Contribution Margin 3", "Advertising Costs",
@@ -217,7 +220,7 @@ def load_margin(path: Path) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_ledger(path: Path | None):
+def load_ledger(path: Path | None, mtime: float | None = None):
     """Amazon FBA Inventory Ledger → daily stock panel per SKU and region.
 
     Returns one row per (SKU, region, Date). `eu_stock` is **available** stock =
@@ -238,6 +241,11 @@ def load_ledger(path: Path | None):
     }
     led = pd.read_csv(path, usecols=lambda c: c in KEEP)
     led["Date"] = pd.to_datetime(led["Date"], format="%m/%d/%Y", errors="coerce")
+    if led["Date"].isna().mean() > 0.02:
+        raise ValueError(
+            "Inventory-ledger dates unparseable (expected MM/DD/YYYY, e.g. "
+            "'07/06/2026') — was the export downloaded in a different locale?")
+    led = led[led["Date"].notna()]
     led = led.rename(columns={"MSKU": "SKU"})
     for c in ("Ending Warehouse Balance", "Customer Shipments",
               "In Transit Between Warehouses", "Receipts"):
@@ -262,7 +270,8 @@ def load_ledger(path: Path | None):
 
 
 @st.cache_data(show_spinner="Computing stock-out history…")
-def compute_oos_long(margin_path: Path, ledger_path: Path | None):
+def compute_oos_long(margin_path: Path, ledger_path: Path | None,
+                     m_margin: float | None = None, m_ledger: float | None = None):
     """Build the per-day OOS panel at SKU level, split into two regions.
 
     Demand and stock are pooled within each region — **EU** (the Pan-EU pool, all
@@ -273,17 +282,22 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
 
     Returns (long, meta, asof, eu).
     """
-    df = load_margin(margin_path)
+    df = load_margin(margin_path, m_margin)
     # Region split: GB (amazon.co.uk) is its own pool, everything else is EU.
     df["region"] = np.where(
         df["Marketplace Name"].astype(str) == "amazon.co.uk", "GB", "EU")
-    eu = load_ledger(ledger_path)
+    eu = load_ledger(ledger_path, m_ledger)
     keys = ["SKU", "region"]
 
     g = df.groupby(["Period"] + keys, observed=True, as_index=False).agg(
         Units=("Units", "sum"), Sales=("Sales", "sum"),
         CM3=("CM3", "sum"), FBA=("FBA Available", "max"), PPC=("AdSpend", "sum"),
     )
+    # The newest export day is an intra-day PARTIAL snapshot (the daily export
+    # runs in the morning) — drop it so no rule ever sees a partial day: it
+    # would otherwise book phantom zero-sales stock-outs every morning and
+    # pollute the demand baselines.
+    g = g[g["Period"] < g["Period"].max()]
     full_dates = pd.date_range(g["Period"].min(), g["Period"].max(), freq="D")
     asof = full_dates.max()
 
@@ -299,8 +313,23 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     ppc = pivot("PPC", "sum").fillna(0.0)
 
     pos = units > 0
-    roll_units = units.rolling(BASELINE_WINDOW, min_periods=1).sum()
-    roll_days = units.rolling(BASELINE_WINDOW, min_periods=1).count()
+    had_past = pos.cummax()
+    has_future = pos[::-1].cummax()[::-1]
+
+    # Demand-baseline input = only days the SKU was genuinely live. Two masks:
+    # (a) pre-launch days (before the first sale) would dilute lambda for a new
+    #     SKU's first ~90 days; (b) LONG zero-runs (>= 7 consecutive zero days —
+    #     an outage or blocked listing, not natural sales noise) would make
+    #     lambda decay through a stock-out so the biggest outages self-erase.
+    # With both masked, an all-masked window yields NaN and the .ffill() below
+    # genuinely carries the pre-outage rate forward. Short scattered zeros
+    # (< 7 days) still count, so slow movers keep their true low rate.
+    z = units.eq(0)
+    cz = z.cumsum()
+    zrun = cz - cz.where(~z).ffill().fillna(0)   # length of the current zero-run
+    units_base = units.where(had_past & ~(z & (zrun >= 7)))
+    roll_units = units_base.rolling(BASELINE_WINDOW, min_periods=1).sum()
+    roll_days = units_base.rolling(BASELINE_WINDOW, min_periods=1).count()
     roll_sales = sales.rolling(BASELINE_WINDOW, min_periods=1).sum()
     roll_cm3 = cm3.rolling(BASELINE_WINDOW, min_periods=1).sum()
     # Ad-spend baseline = trailing avg over days that actually had spend; NaN
@@ -310,17 +339,13 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     base_ppc = (roll_ppc / roll_ppc_days.where(roll_ppc_days > 0)).ffill()
     price = sales / units.where(units > 0)  # realised price/unit per day
 
-    # expected = average units per CALENDAR day = the demand rate. ffill keeps
-    # the pre-stock-out rate alive through a zero-run, so a multi-week stock-out
-    # is still measured. A zero-sales day only flags a stock-out when this rate
-    # clears DEFAULT_MIN_DEMAND (so a thin marketplace's normal no-sale days are
-    # not mistaken for stock-outs).
-    expected = (roll_units / roll_days).ffill()
+    # expected = average units per LIVE calendar day = the demand rate. A
+    # zero-sales day only flags a stock-out when this rate clears
+    # DEFAULT_MIN_DEMAND (so a thin marketplace's normal no-sale days are not
+    # mistaken for stock-outs).
+    expected = (roll_units / roll_days.where(roll_days > 0)).ffill()
     avg_price = (roll_sales / roll_units.where(roll_units > 0)).ffill()
     avg_cm3_pu = (roll_cm3 / roll_units.where(roll_units > 0)).ffill()
-
-    had_past = pos.cummax()
-    has_future = pos[::-1].cummax()[::-1]
 
     # Positioned run-rate: average units on recent days the SKU was actively
     # pushed (price cut and/or ad boost — e.g. Prime Day positioning). Remembered
@@ -371,6 +396,14 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
         long["dos"] = np.nan
         long["receipts"] = np.nan
 
+    # Carry the last known ledger state forward through days the (manually
+    # uploaded) ledger doesn't cover yet — otherwise NaN reach silently
+    # disables the blocked/reach rules whenever the ledger is stale (the
+    # freshness banner still warns about the staleness itself).
+    long = long.sort_values(["SKU", "region", "Period"]).reset_index(drop=True)
+    long[["eu_stock", "dos"]] = (
+        long.groupby(["SKU", "region"], observed=True)[["eu_stock", "dos"]].ffill())
+
     for col in ("units", "sales", "cm3", "fba", "expected", "expected_promo",
                 "avg_cm3_pu", "avg_price", "ppc", "base_ppc", "price",
                 "eu_stock", "dos", "receipts"):
@@ -381,7 +414,6 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     info = df[["SKU", "Product", "Brand"]].dropna(subset=["SKU"]).copy()
     info["SKU"] = info["SKU"].astype(str)
     meta = info.drop_duplicates(subset=["SKU"], keep="last")
-    long = long.sort_values(["SKU", "region", "Period"]).reset_index(drop=True)
     return long, meta, asof, eu
 
 
@@ -415,6 +447,14 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     base_ppc = long["base_ppc"].to_numpy()
     price = long["price"].to_numpy()
     dos = long["dos"].to_numpy()
+
+    # Counterfactual for valuation AND recovery gates: if the SKU was recently
+    # POSITIONED to sell faster than usual (promo price/ads, e.g. Prime Day) and
+    # that positioned run-rate clearly exceeds lambda, use it — so a day is
+    # valued and judged "recovered" against the same bar.
+    exp_promo = long["expected_promo"].to_numpy()
+    elevated = ~np.isnan(exp_promo) & (exp_promo >= PROMO_ELEV * expected)
+    exp_eff = np.where(elevated, exp_promo, expected)
 
     # Pan-EU: a SKU is physically out of stock only when the whole EU network
     # sellable balance is zero (local-warehouse zeros are served from the pool).
@@ -456,19 +496,22 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     # --- Keep an OOS episode open through return-driven blips ---
     # Customer returns trickle back into the warehouse and can nudge the sellable
     # balance / reach up mid-stock-out, spuriously breaking the OOS run (or even
-    # tripping a cooling-down flag). A real recovery is a genuine inbound
-    # *Receipt*, not a return — so once a SKU is OOS it stays OOS until the next
-    # Receipts restock, as long as stock is still depleted.
+    # tripping a cooling-down flag). An episode CLOSES when stock demonstrably
+    # recovers: a meaningful inbound Receipt (scaled to demand, so several
+    # partial deliveries aren't required to arrive on one day) OR reach climbing
+    # back above the cool-down band — not on a mere returns blip.
     receipts = long["receipts"].to_numpy()
-    restock = ~np.isnan(receipts) & (receipts >= np.maximum(10.0, expected))
-    res["_restock"] = restock
+    restock = ~np.isnan(receipts) & (receipts >= np.maximum(10.0, exp_eff))
+    recovered_stock = ~np.isnan(dos) & (dos >= dos_th)
+    res["_close"] = restock | recovered_stock
     grp = [res["SKU"].values, res["region"].values]
     last_oos = res["Period"].where(res["raw_oos"]).groupby(grp).ffill()
-    last_rs = res["Period"].where(res["_restock"]).groupby(grp).ffill()
+    last_rs = res["Period"].where(res["_close"]).groupby(grp).ffill()
     oos_open = (last_oos.notna() & (last_rs.isna() | (last_oos > last_rs))).to_numpy()
     # Only bridge days where sales are still suppressed (the OOS symptom) — so a
-    # genuine recovery (sales back near λ) ends the episode even before a Receipt.
-    filled = oos_open & ~np.isnan(dos) & (units < 0.5 * expected) & had_past & ~blocked
+    # genuine recovery (sales back near the effective rate) ends the episode
+    # even before a Receipt.
+    filled = oos_open & ~np.isnan(dos) & (units < 0.5 * exp_eff) & had_past & ~blocked
     oos = raw_oos | filled
     cooldown = cooldown & ~oos          # a throttle inside an OOS episode is OOS
 
@@ -488,50 +531,68 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     price_drop = ~np.isnan(price) & (price <= ap * (1 - heat_price_down)) & prior_hike
     heating = (
         (ad_boost | price_drop) & recovery_ctx & ~oos & ~cooldown & ~phys_eu
-        & had_past & (units > 0) & (units < HEATUP_RECOVERED * expected)
+        & had_past & (units > 0) & (units < HEATUP_RECOVERED * exp_eff)
     )
 
+    # Cause labels: bridge-filled days can carry positive sales, so they get
+    # their own label instead of masquerading as a zero-sales demand gap; no
+    # region suffix (GB rows were previously mislabelled "(EU)").
     cause = np.where(
         phys_eu, "Physical (network)",
         np.where(oos & ~np.isnan(dos) & (dos < oos_dos), "Critically low (<%gd reach)" % oos_dos,
                  np.where(cooldown, "Cooling down",
-                          np.where(oos, "Demand gap (EU)",
-                                   np.where(blocked, "Listing blocked (in stock)",
-                                            np.where(heating, "Heating up", ""))))),
+                          np.where(oos & (units == 0), "Demand gap",
+                                   np.where(oos, "Suppressed sales (post-OOS)",
+                                            np.where(blocked, "Listing blocked (in stock)",
+                                                     np.where(heating, "Heating up", "")))))),
     )
 
-    # Valuation counterfactual: if the SKU was recently POSITIONED to sell
-    # faster than usual (promo price/ads, e.g. Prime Day) and that positioned
-    # run-rate clearly exceeds lambda, an OOS day or throttle in that window
-    # forgoes the positioned rate — value lost/miss against it, not lambda.
-    exp_promo = long["expected_promo"].to_numpy()
-    elevated = ~np.isnan(exp_promo) & (exp_promo >= PROMO_ELEV * expected)
-    exp_eff = np.where(elevated, exp_promo, expected)
-
-    lost_units = np.where(oos, np.clip(exp_eff - units, 0, None), 0.0)
-    miss_units = np.where(cooldown, np.clip(exp_eff - units, 0, None), 0.0)
-    ramp_units = np.where(heating, np.clip(expected - units, 0, None), 0.0)
+    shortfall = np.clip(exp_eff - units, 0, None)
+    lost_units = np.where(oos, shortfall, 0.0)
+    miss_units = np.where(cooldown, shortfall, 0.0)
+    ramp_units = np.where(heating, shortfall, 0.0)
     extra_ad = np.where(heating, np.clip(ppc - np.nan_to_num(base_ppc), 0, None), 0.0)
-    blk_units = np.where(blocked, np.clip(exp_eff - units, 0, None), 0.0)
+    blk_units = np.where(blocked, shortfall, 0.0)
+    ap0 = np.nan_to_num(ap)
+    cm0 = np.nan_to_num(cm3pu)
     res["oos"] = oos
     res["cooldown"] = cooldown
     res["heating"] = heating
     res["blocked"] = blocked
     res["blk_units"] = blk_units.astype("float32")
-    res["blk_rev"] = (blk_units * np.nan_to_num(ap)).astype("float32")
-    res["blk_cm3"] = (blk_units * np.nan_to_num(cm3pu)).astype("float32")
+    res["blk_rev"] = (blk_units * ap0).astype("float32")
+    res["blk_cm3"] = (blk_units * cm0).astype("float32")
     res["cause"] = cause
     res["lost_units"] = lost_units.astype("float32")
-    res["lost_rev"] = (lost_units * np.nan_to_num(ap)).astype("float32")
-    res["lost_cm3"] = (lost_units * np.nan_to_num(cm3pu)).astype("float32")
+    res["lost_rev"] = (lost_units * ap0).astype("float32")
+    res["lost_cm3"] = (lost_units * cm0).astype("float32")
     res["miss_units"] = miss_units.astype("float32")
-    res["rev_miss"] = (miss_units * np.nan_to_num(ap)).astype("float32")
-    res["cm3_miss"] = (miss_units * np.nan_to_num(cm3pu)).astype("float32")
+    res["rev_miss"] = (miss_units * ap0).astype("float32")
+    res["cm3_miss"] = (miss_units * cm0).astype("float32")
     res["ramp_units"] = ramp_units.astype("float32")
-    res["ramp_rev"] = (ramp_units * np.nan_to_num(ap)).astype("float32")
-    res["ramp_cm3"] = (ramp_units * np.nan_to_num(cm3pu)).astype("float32")
+    res["ramp_rev"] = (ramp_units * ap0).astype("float32")
+    res["ramp_cm3"] = (ramp_units * cm0).astype("float32")
     res["extra_ad"] = extra_ad.astype("float32")
-    return res.drop(columns=["raw_oos", "_restock"])
+    return res.drop(columns=["raw_oos", "_close"])
+
+
+
+@st.cache_data(show_spinner="Applying thresholds…", max_entries=4)
+def compute_flagged(margin_path: Path, ledger_path: Path | None,
+                    m_margin: float | None, m_ledger: float | None,
+                    min_demand: float, dos_th: float, ppc_cut: float,
+                    price_up: float, oos_dos: float, heat_ad_up: float,
+                    heat_price_down: float, heat_win: int,
+                    blocked_reach: float) -> pd.DataFrame:
+    """Cached flag_oos: reruns only when data or thresholds actually change,
+    instead of re-copying and re-flagging the full panel on every widget
+    interaction (search keystrokes, tab sliders, radios)."""
+    long_all, _meta, _asof, _eu = compute_oos_long(margin_path, ledger_path,
+                                                   m_margin, m_ledger)
+    return flag_oos(long_all, min_demand, dos_th=dos_th, ppc_cut=ppc_cut,
+                    price_up=price_up, oos_dos=oos_dos, heat_ad_up=heat_ad_up,
+                    heat_price_down=heat_price_down, heat_win=heat_win,
+                    blocked_reach=blocked_reach)
 
 
 # ---------- Helpers ----------
@@ -612,7 +673,22 @@ def inventory_status(eu: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
     out["days_of_supply"] = (
         out["cur_stock"] / out["avg_daily_demand"].where(out["avg_daily_demand"] > 0)
     )
+    # A SKU whose ledger rows stop well before the ledger's overall end has no
+    # current reading — blank it (status shows Unknown) instead of presenting a
+    # stale historical balance as "current stock".
+    stale = out["last_date"] < (eu["Date"].max() - pd.Timedelta(days=7))
+    out.loc[stale, ["cur_stock", "in_transit", "avg_daily_demand", "days_of_supply"]] = np.nan
     return out
+
+
+def stock_status(cur_stock: pd.Series, reach: pd.Series, oos_reach: float) -> np.ndarray:
+    """One status ladder for every table (tabs previously disagreed)."""
+    return np.where(
+        cur_stock.isna(), "❔ Unknown",
+        np.where(cur_stock <= 0, "🔴 Out of stock",
+                 np.where(reach.fillna(1e9) < oos_reach, "🔴 Critically low",
+                          np.where(reach.fillna(1e9) < LOW_STOCK_DAYS,
+                                   "🟠 Low stock", "🟢 In stock"))))
 
 
 def sku_timeline_fig(d: pd.DataFrame, title: str) -> go.Figure:
@@ -658,7 +734,9 @@ if margin_path is None:
     st.error(f"No margin export in `{EXPORTS_DIR}`. Run the Novadata export first.")
     st.stop()
 
-long_all, meta, asof, eu = compute_oos_long(margin_path, ledger_path)
+m_margin = margin_path.stat().st_mtime
+m_ledger = ledger_path.stat().st_mtime if ledger_path else None
+long_all, meta, asof, eu = compute_oos_long(margin_path, ledger_path, m_margin, m_ledger)
 prod_map = meta.set_index("SKU")["Product"].astype("object")
 en_titles = load_english_titles(REPO_ROOT / "product_titles_en.csv")
 if not en_titles.empty:
@@ -780,10 +858,9 @@ with st.expander("Stock-out, cooling-down & heating-up thresholds"):
                "(~Feb 2026); price signals span the full year.")
 
 # ---------- Apply scope ----------
-scope = flag_oos(long_all, min_demand, dos_th=cd_dos, ppc_cut=cd_ppc,
-                 price_up=cd_price, oos_dos=oos_reach,
-                 heat_ad_up=heat_ad, heat_price_down=heat_pr, heat_win=heat_win,
-                 blocked_reach=blk_reach)
+scope = compute_flagged(margin_path, ledger_path, m_margin, m_ledger,
+                        min_demand, cd_dos, cd_ppc, cd_price, oos_reach,
+                        heat_ad, heat_pr, heat_win, blk_reach)
 scope = scope[scope["region"] == region]
 if sel_periods is not None:
     scope = scope[scope["Period"].dt.to_period(sel_freq).isin(sel_periods)]
@@ -791,9 +868,10 @@ else:
     scope = scope[(scope["Period"] >= start) & (scope["Period"] <= end)]
 if search.strip():
     s = search.strip().lower()
-    skus = scope["SKU"].astype(str).str.lower()
-    prods = scope["SKU"].astype(str).map(prod_map).astype(str).str.lower()
-    scope = scope[skus.str.contains(s) | prods.str.contains(s, na=False)]
+    cats = scope["SKU"].cat.categories
+    hits = [k for k in cats
+            if s in str(k).lower() or s in str(prod_map.get(k, "")).lower()]
+    scope = scope[scope["SKU"].isin(hits)]
 if scope.empty:
     st.warning("No data in the current scope. Widen the filters.")
     st.stop()
@@ -813,11 +891,7 @@ agg["Product"] = agg["SKU"].map(prod_short)
 agg["Brand"] = agg["SKU"].map(brand_map)
 agg["cur_stock"] = agg["SKU"].map(inv_stock)
 agg["days_of_supply"] = agg["SKU"].map(inv_dos).round(0)
-agg["Status"] = np.where(
-    agg["cur_stock"].fillna(-1) == 0, "🔴 Out of stock",
-    np.where(agg["days_of_supply"].fillna(1e9) < LOW_STOCK_DAYS, "🟠 Low stock",
-             np.where(agg["cur_stock"].isna(), "❔ Unknown", "🟢 In stock")),
-)
+agg["Status"] = stock_status(agg["cur_stock"], agg["days_of_supply"], oos_reach)
 agg = agg.sort_values("lost_cm3", ascending=False)
 
 # ---------- Header: OOS impact over time (hero) + split KPI groups ----------
@@ -827,7 +901,8 @@ heat_rows = scope[scope["heating"]]
 st.markdown("### 🔴 Out-of-stock impact")
 ovb = st.radio("Bucket", ["Month", "Quarter"], horizontal=True, key="ov_bucket")
 operf = "M" if ovb == "Month" else "Q"
-sc = scope.copy()
+sc = scope[["Period", "SKU", "oos", "lost_rev", "lost_cm3",
+            "expected", "avg_price"]].copy()
 sc["bucket"] = sc["Period"].dt.to_period(operf).dt.to_timestamp()
 # WISR weight = expected revenue/day (λ × avg price) — a stable base a stock-out
 # can't shrink, unlike trailing realized revenue.
@@ -1141,15 +1216,15 @@ with tab6:
         "stock-out weighs differently by country (high-margin DE vs thin ES). "
         "Pick a country to drill into its SKUs."
     )
-    mg = load_margin(margin_path)
+    # Country mix from the FULL period (not the selected window): a SKU that
+    # was out of stock the whole selected month would otherwise have no
+    # in-window sales, get dropped, and the biggest loss would vanish from the
+    # country view. Full-period shares are also not distorted by the OOS gap
+    # itself. Losses (agg) stay window-scoped.
+    mg = load_margin(margin_path, m_margin)
     mg = mg[mg["Marketplace Name"] != "amazon.co.uk"] if region == "EU" \
         else mg[mg["Marketplace Name"] == "amazon.co.uk"]
-    if sel_periods is not None:
-        mg = mg[mg["Period"].dt.to_period(sel_freq).isin(sel_periods)]
-    else:
-        mg = mg[(mg["Period"] >= start) & (mg["Period"] <= end)]
-    mg = mg.copy()
-    mg["SKU"] = mg["SKU"].astype(str)
+    mg = mg.assign(SKU=mg["SKU"].astype(str))
     cm = mg.groupby(["SKU", "Marketplace Name"], observed=True).agg(
         units=("Units", "sum"), sales=("Sales", "sum"), cm3=("CM3", "sum")).reset_index()
     cm = cm[cm["units"] > 0]
@@ -1223,7 +1298,8 @@ with tab7:
         "realized revenue) and how availability treated them in the selected "
         "period. This is the watchlist: a stock-out here hurts most."
     )
-    tb = scope.copy()
+    tb = scope[["SKU", "Period", "expected", "avg_price", "oos",
+                "lost_rev", "lost_cm3"]].copy()
     tb["_exp_rev"] = tb["expected"] * tb["avg_price"].fillna(0)
     ts_n = st.slider("Top N by expected revenue", 10, 50, 20, 5, key="ts_n")
     t = tb.groupby("SKU", observed=True).agg(
@@ -1235,11 +1311,7 @@ with tab7:
     t["Product"] = t["SKU"].map(prod_short)
     t["cur_stock"] = t["SKU"].map(inv_stock)
     t["reach"] = t["SKU"].map(inv_dos).round(0)
-    t["Status"] = np.where(
-        t["cur_stock"].fillna(-1) <= 0, "🔴 Out of stock",
-        np.where(t["reach"].fillna(1e9) < oos_reach, "🔴 Critically low",
-                 np.where(t["reach"].fillna(1e9) < LOW_STOCK_DAYS, "🟠 Low stock",
-                          np.where(t["cur_stock"].isna(), "❔ Unknown", "🟢 In stock"))))
+    t["Status"] = stock_status(t["cur_stock"], t["reach"], oos_reach)
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Top sellers with OOS days", fmt_num(int((t["oos_days"] > 0).sum())))
     k2.metric("Lost revenue (top sellers)", eur(t["lost_rev"].sum()))
