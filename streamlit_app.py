@@ -703,7 +703,13 @@ def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
         return df_in.copy()
     sum_cols = [c for c in SUM_COLS if c in df_in.columns]
     first_cols = [c for c in FIRST_COLS if c in df_in.columns]
-    wavg_cols = [c for c in WAVG_COLS if c in df_in.columns]
+    # When absolute margins are present (daily schema) the CM1/2/3% columns are
+    # re-derived from ΣCM/ΣSales below, so weight-averaging them here would be
+    # dead work — restrict the weighted-average pass to the columns that survive
+    # (ROAS, CTR). On the legacy schema (no absolutes) keep averaging the %s.
+    has_abs = "CM3" in df_in.columns
+    wavg_cols = [c for c in WAVG_COLS if c in df_in.columns
+                 and not (has_abs and c in ("CM1%", "CM2%", "CM3%"))]
 
     base = (
         df_in.groupby("SKU", as_index=False, sort=False)
@@ -1040,6 +1046,14 @@ tab_overview, tab_trend, tab_slow = st.tabs(["Overview", "Margin Trend", "Slow m
 # Overview tab — table + Δ vs previous period
 # =========================================================================
 with tab_overview:
+    # ----- Manual one-off adjustments (adjustments.json) -----
+    # Applied FIRST so every downstream figure — Δ CM3, cluster tiers, P&L —
+    # sees the same adjusted CM1/2/3 the table displays. Prior-period slices are
+    # adjusted separately over their own windows below, so the comparison stays
+    # apples-to-apples.
+    adjustments = load_adjustments()
+    filtered, adj_notes = apply_adjustments(filtered, adjustments, selected_periods)
+
     # ----- Δ CM3% vs the equivalent prior set (shift the selection back 1 week) -----
     # In single-week mode this is just the previous week; in multi-week mode we
     # shift every selected week back by 1 week, aggregate, and compare.
@@ -1059,6 +1073,8 @@ with tab_overview:
     if prior_set:
         prior_raw = mp_slice[mp_slice["Period"].isin(prior_set)]
         prior_agg = aggregate_periods(prior_raw)
+        # Adjust the prior window too, so Δ CM3 compares adjusted vs adjusted.
+        prior_agg, _ = apply_adjustments(prior_agg, adjustments, prior_set)
         prior = prior_agg.set_index("SKU")["CM3%"]
         filtered["Δ CM3 vs prior"] = filtered["CM3%"] - filtered["SKU"].map(prior)
         delta_caption = (
@@ -1070,7 +1086,10 @@ with tab_overview:
         delta_caption = f"No equivalent prior {granularity.lower()} available for Δ CM3%."
 
     # ----- Cluster tiers: computed on the aggregated marketplace slice -----
+    # Adjust over the same window as `filtered` so an adjusted SKU lands in the
+    # tier its corrected margin implies (e.g. Moringa moves out of the loss bucket).
     mp_period = aggregate_periods(raw_slice) if needs_aggregation else raw_slice.copy()
+    mp_period, _ = apply_adjustments(mp_period, adjustments, selected_periods)
     tier_base = mp_period.dropna(subset=["CM3%", "Product Sales"]).copy()
     tier_base["Margin Tier"] = tier_1_to_3(tier_base["CM3%"])
     tier_base["Volume Tier"] = tier_1_to_3(tier_base["Product Sales"])
@@ -1171,26 +1190,30 @@ with tab_overview:
     # ----- Revenue growth: same calendar weeks one month earlier (shift back 4) -----
     prior_4w_set = _equivalent_prior_set(selected_periods, 28)
     if prior_4w_set:
-        cur_rev = filtered.set_index("SKU")["Product Sales"]
+        # Compare average revenue PER DAY, not raw sums: the prior set can hold a
+        # different number of days than the current selection (data gaps, the
+        # left edge of the dataset, or ±3-day matches that collide), and raw
+        # revenue sums aren't window-size-invariant — a shorter prior window
+        # would otherwise fabricate growth. Dividing each side by its own day
+        # count makes the comparison like-for-like.
+        n_cur = max(len(selected_periods), 1)
+        n_prior = max(len(prior_4w_set), 1)
+        cur_rev = filtered.set_index("SKU")["Product Sales"] / n_cur
         prior_4w_raw = mp_slice[mp_slice["Period"].isin(prior_4w_set)]
         prior_4w_agg = aggregate_periods(prior_4w_raw)
-        prev_rev = prior_4w_agg.set_index("SKU")["Product Sales"]
+        prev_rev = prior_4w_agg.set_index("SKU")["Product Sales"] / n_prior
         # Align by SKU; some current SKUs may not appear in the prior set.
         prev_rev_aligned = prev_rev.reindex(cur_rev.index)
         wow4 = ((cur_rev - prev_rev_aligned)
                 / prev_rev_aligned.where(prev_rev_aligned > 0)) * 100
         filtered["Rev Δ 4w %"] = filtered["SKU"].map(wow4)
         growth_caption = (
-            f"Rev Δ 4w % compares the selection to the same days 4 weeks earlier "
-            f"(ending {_fmt_day(max(prior_4w_set))})."
+            f"Rev Δ 4w % compares average €/day in the selection to the same days "
+            f"4 weeks earlier (ending {_fmt_day(max(prior_4w_set))})."
         )
     else:
         filtered["Rev Δ 4w %"] = pd.NA
         growth_caption = "No equivalent set 4 weeks back, so Rev Δ 4w % is empty."
-
-    # ----- Apply manual one-off adjustments (adjustments.json) -----
-    adjustments = load_adjustments()
-    filtered, adj_notes = apply_adjustments(filtered, adjustments, selected_periods)
 
     # ----- P&L Impact = total CM3 (absolute € contribution) -----
     # Daily export carries CM3 in € directly; weekly legacy schema only has the
