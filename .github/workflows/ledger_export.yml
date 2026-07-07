@@ -1,0 +1,51 @@
+name: Amazon Inventory Ledger (SP-API)
+
+on:
+  schedule:
+    # Weekly, Mondays 05:30 UTC (before the 06:00 Novadata export)
+    - cron: "30 5 * * 1"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write   # so the workflow can commit the refreshed ledger
+
+jobs:
+  ledger:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-export.txt
+
+      - name: Fetch FBA Inventory Ledger via SP-API
+        env:
+          LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
+          LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
+          # Optional overrides (set as repo variables if you need them):
+          SP_API_MARKETPLACE_IDS: ${{ vars.SP_API_MARKETPLACE_IDS }}
+          SP_API_ENDPOINT: ${{ vars.SP_API_ENDPOINT }}
+        run: python amazon_sp_api_ledger.py
+
+      - name: Commit refreshed ledger (for the OOS dashboard)
+        run: |
+          if [[ -n "$(git status --porcelain amazon_ledger/)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add amazon_ledger/
+            git commit -m "data: weekly Amazon Inventory Ledger refresh (SP-API)"
+            git push
+          else
+            echo "No ledger changes."
+          fi

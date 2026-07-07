@@ -131,10 +131,39 @@ Caveat: ad-spend-cut detection only
 works from when Novadata began reporting Advertising Costs (~Feb 2026); the
 price-hike lever spans the full year.
 
-## Refreshing the ledger (manual)
+## Refreshing the ledger
 
 The margin export refreshes automatically (GitHub Actions, daily). The Amazon
-Inventory Ledger is uploaded **manually** when you want fresh stock data:
+Inventory Ledger can be refreshed **automatically via the SP-API** (recommended)
+or uploaded **manually**.
+
+### Automatic — Amazon SP-API (recommended)
+
+`amazon_sp_api_ledger.py` requests the same `GET_LEDGER_DETAIL_VIEW_DATA`
+report through the Selling Partner API and hands it to `add_ledger.py`, so no
+Seller Central clicks are needed. The `Amazon Inventory Ledger (SP-API)` GitHub
+Action (`.github/workflows/ledger_export.yml`) runs it weekly and commits the
+refresh.
+
+One-time setup:
+
+1. Create a **self-authorized SP-API app** on your own seller account
+   (Seller Central → *Develop Apps*), with the *Inventory and Order Tracking*
+   role. No AWS IAM / request-signing is required.
+2. Self-authorize it to your account to obtain a **refresh token**.
+3. Add three **GitHub → Settings → Secrets** (repo scope):
+   `LWA_CLIENT_ID`, `LWA_CLIENT_SECRET`, `SP_API_REFRESH_TOKEN`.
+   Optional repo **variables**: `SP_API_MARKETPLACE_IDS` (comma-separated;
+   defaults to the EU + UK set) and `SP_API_ENDPOINT` (defaults to the EU host).
+
+Run it locally the same way:
+```bash
+export LWA_CLIENT_ID=... LWA_CLIENT_SECRET=... SP_API_REFRESH_TOKEN=...
+python amazon_sp_api_ledger.py
+git add amazon_ledger && git commit -m "data: ledger refresh" && git push
+```
+
+### Manual (fallback)
 
 1. **Seller Central → Reports → Fulfilment → Inventory Ledger → "Detailed
    View"**, set the date range to the trailing ~12 months, download the CSV.
@@ -143,9 +172,10 @@ Inventory Ledger is uploaded **manually** when you want fresh stock data:
    python add_ledger.py ~/Downloads/inventory-ledger.csv
    git add amazon_ledger && git commit -m "data: ledger refresh" && git push
    ```
-   It gzips the file, date-stamps it by the latest date inside, and prunes old
-   snapshots. The dashboard always reads the newest one. The app still runs
-   (Novadata signals only) if no ledger is present.
+
+Either path gzips the file, date-stamps it by the latest date inside, and prunes
+old snapshots. The dashboard always reads the newest one. The app still runs
+(Novadata signals only) if no ledger is present.
 
 ## Deploy
 
