@@ -306,12 +306,21 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None):
     base_ppc = (roll_ppc / roll_ppc_days.where(roll_ppc_days > 0)).ffill()
     price = sales / units.where(units > 0)  # realised price/unit per day
 
-    # expected = average units per CALENDAR day = the demand rate. ffill keeps
-    # the pre-stock-out rate alive through a zero-run, so a multi-week stock-out
-    # is still measured. A zero-sales day only flags a stock-out when this rate
-    # clears DEFAULT_MIN_DEMAND (so a thin marketplace's normal no-sale days are
-    # not mistaken for stock-outs).
-    expected = (roll_units / roll_days).ffill()
+    # expected = average units per CALENDAR day = the demand rate.
+    #
+    # We SAMPLE the rate only on days the SKU actually sold (.where(pos)) and
+    # then hold it flat through any zero-run with ffill. This is what keeps the
+    # pre-stock-out rate alive through a multi-week outage: the rate itself is
+    # still per-calendar-day (roll_days counts every day in the window, so a
+    # thin marketplace's normal no-sale days keep it below DEFAULT_MIN_DEMAND
+    # and don't look like stock-outs), but we must NOT let the zero-run days
+    # re-sample it — if we divided the trailing sum by all calendar days on the
+    # zero days too, those zeros would roll into the window and decay the rate
+    # toward 0, so a long stock-out would eventually value itself at ~0 lost
+    # sales (and even stop being flagged as OOS once it fell under min-demand).
+    # Freezing at the last selling day's rate keeps lost-unit valuation and the
+    # WISR weight (expected x price) stock-out-proof, as intended.
+    expected = (roll_units / roll_days).where(pos).ffill()
     avg_price = (roll_sales / roll_units.where(roll_units > 0)).ffill()
     avg_cm3_pu = (roll_cm3 / roll_units.where(roll_units > 0)).ffill()
 
