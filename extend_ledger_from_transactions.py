@@ -48,7 +48,12 @@ def main(tx_path: str) -> None:
     led["_d"] = pd.to_datetime(led["Date"], format="%m/%d/%Y", errors="coerce")
     base_day = led["_d"].max()
 
-    tx = pd.read_csv(tx_path, sep="\t", dtype=str)
+    # Transaction-view exports come both tab-separated (.txt) and
+    # comma-separated (.csv) depending on how they were downloaded — sniff it.
+    with open(tx_path, "r", encoding="utf-8", errors="replace") as fh:
+        first = fh.readline()
+    sep = "\t" if first.count("\t") >= first.count(",") else ","
+    tx = pd.read_csv(tx_path, sep=sep, dtype=str)
     if "Event Type" not in tx.columns or "Quantity" not in tx.columns:
         sys.exit("This does not look like a Transaction-view export "
                  "(missing 'Event Type' / 'Quantity').")
