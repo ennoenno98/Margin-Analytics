@@ -21,13 +21,13 @@ OUT = ROOT / "reports" / "OOS_Methodology_Sheet.pdf"
 CHART = ROOT / "reports" / "_oos_sheet_example.png"
 
 # Model parameters (match oos_analytics.py defaults).
-W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 3.0, 30
+W, MIND, TAIL, OOS_DOS, CD_DOS = 90, 3.0, 21, 4.0, 30
 PPC_CUT, PRICE_UP, MIN_PPC = 0.7, 0.15, 2.0
 SKU = "VV-VITA-216"   # analysed EU-wide (Pan-EU), pooling all marketplaces
 
 # ---------- compute the example SKU's daily series ----------
-mp = ROOT / "novadata_exports/margin_export_2026-06-03.csv.gz"
-lp = ROOT / "amazon_ledger/inventory_ledger_2026-06-03.csv.gz"
+mp = sorted((ROOT / "novadata_exports").glob("margin_export_*.csv.gz"))[-1]
+lp = sorted((ROOT / "amazon_ledger").glob("inventory_ledger_*.csv.gz"))[-1]
 K = {"Period", "SKU", "Marketplace Name", "Units", "Product Sales",
      "Contribution Margin 3", "Advertising Costs"}
 df = pd.read_csv(mp, usecols=lambda c: c in K)
@@ -38,6 +38,7 @@ for c in ("Units", "Product Sales", "Advertising Costs"):
 df = df.rename(columns={"Product Sales": "Sales"})
 df["AdSpend"] = (-df["Advertising Costs"]).clip(lower=0)
 df = df[df["Marketplace Name"] != "amazon.co.uk"]  # GB separate, not Pan-EU
+df = df[df["Period"] < df["Period"].max()]           # drop the partial newest day
 
 full = pd.date_range(df.Period.min(), df.Period.max(), freq="D")
 asof = full.max()
@@ -50,7 +51,7 @@ pos = units > 0
 expected = (units.rolling(W, min_periods=1).sum() / units.rolling(W, min_periods=1).count()).ffill()
 avg_price = (sales.rolling(W, min_periods=1).sum() / units.rolling(W, min_periods=1).sum().where(lambda x: x > 0)).ffill()
 avg_cm3 = (cm3.rolling(W, min_periods=1).sum() / units.rolling(W, min_periods=1).sum().where(lambda x: x > 0)).ffill()
-rps = ppc.rolling(60, min_periods=1).sum(); rpd = (ppc > 0).rolling(60, min_periods=1).sum()
+rps = ppc.rolling(90, min_periods=1).sum(); rpd = (ppc > 0).rolling(90, min_periods=1).sum()
 base_ppc = (rps / rpd.where(rpd > 0)).ffill()
 price = sales / units.where(units > 0)
 had = pos.cummax(); fut = pos[::-1].cummax()[::-1]
@@ -81,7 +82,7 @@ cooldown = (ad_cut | hike) & cool_stock & (units > 0) & (expected >= MIND) & had
 oos_gap = (units == 0) & (expected >= MIND) & had & (fut | recent)
 oos = (phys | low_reach | oos_gap) & ~cooldown
 cat = np.where(phys, "Physical OOS",
-      np.where(low_reach, "Critically low (<3d)",
+      np.where(low_reach, "Critically low (<4d)",
       np.where(cooldown, "Cooling down",
       np.where(oos, "Demand gap (EU)", "—"))))
 lost_u = np.where(oos, np.clip(expected - units, 0, None), 0.0)
@@ -95,7 +96,7 @@ panel = pd.DataFrame({
 
 # annual summary (this SKU x marketplace)
 summ = dict(
-    oos_days=int((panel["label"].isin(["Physical OOS", "Critically low (<3d)", "Demand gap (EU)"])).sum()),
+    oos_days=int((panel["label"].isin(["Physical OOS", "Critically low (<4d)", "Demand gap (EU)"])).sum()),
     cool_days=int((panel["label"] == "Cooling down").sum()),
     lost_rev=panel.lost_rev.sum(), lost_cm3=panel.lost_cm3.sum(),
     miss_rev=panel.miss_rev.sum(), miss_cm3=panel.miss_cm3.sum(),
@@ -103,7 +104,7 @@ summ = dict(
 title_en = pd.read_csv(ROOT / "product_titles_en.csv", dtype=str).set_index("SKU")["Title"].get(SKU, SKU)
 
 # ---------- chart: auto-pick the ~75-day window that best shows BOTH ----------
-OOS_LBLS = ["Physical OOS", "Critically low (<3d)", "Demand gap (EU)"]
+OOS_LBLS = ["Physical OOS", "Critically low (<4d)", "Demand gap (EU)"]
 is_oos = panel["label"].isin(OOS_LBLS).astype(int)
 is_cd = (panel["label"] == "Cooling down").astype(int)
 ro = is_oos.rolling(75, min_periods=1).sum()
@@ -123,7 +124,7 @@ if pd.notna(first_oos):
         w_end = min(asof, max(w_end, restock_day + pd.Timedelta(days=14)))
 win = pd.date_range(w_start, w_end)
 p = panel.reindex(win)
-w_oos = int(p["label"].isin(["Physical OOS", "Critically low (<3d)", "Demand gap (EU)"]).sum())
+w_oos = int(p["label"].isin(["Physical OOS", "Critically low (<4d)", "Demand gap (EU)"]).sum())
 w_cd = int((p["label"] == "Cooling down").sum())
 w_hi, w_lo, w_reach = p.eu_stock.max(), p.eu_stock.min(), p.dos.min()
 cdw = p[p["label"] == "Cooling down"]
@@ -140,7 +141,7 @@ cd_ppc = ppc.reindex(cdw.index).mean() if len(cdw) else 0.0
 fig, ax = plt.subplots(figsize=(9, 3.4))
 ax.bar(win, p.units.values, color="#2a9d8f", label="Units sold/day")
 ax.plot(win, p["exp"].values, color="#264653", lw=1.6, ls=":", label="Expected demand (lambda)")
-shade = {"Physical OOS": "#b00020", "Critically low (<3d)": "#d32f2f",
+shade = {"Physical OOS": "#b00020", "Critically low (<4d)": "#d32f2f",
          "Demand gap (EU)": "#f4a261", "Cooling down": "#9b5de5"}
 for c, col in shade.items():
     for x in win[p["label"].values == c]:
@@ -285,7 +286,11 @@ E.append(mktable(rows, col_w=[1.5*cm, 1.2*cm, 1.0*cm, 1.4*cm, 1.3*cm, 1.4*cm,
                               4.0*cm, 1.5*cm, 1.5*cm], fs=7.6))
 gap()
 
-P("6. Caveats &amp; rules", H2)
+P("6. Caveats & rules", H2)
+P("This sheet illustrates the CORE rules on one example; the interactive "
+  "dashboard is the source of truth and includes further refinements "
+  "(blocked-listing rule, promo-elevated counterfactual, episode bridging, "
+  "region-specific reach EU 4 / GB 12).", small)
 P("<b>Available stock</b> = on-hand sellable + units in transit between FCs, so a "
   "Pan-EU redistribution (e.g. a bulk receipt landing at the Poland hub, then "
   "moving to other FCs over ~1-3 weeks) is not read as a stock-out. <b>Customer "
@@ -298,7 +303,7 @@ P("Impact figures are estimates (assume the SKU would have sold at its recent "
   "rate). Ad-spend-cut detection only applies from when Novadata began reporting "
   "Advertising Costs (~Feb 2026); the price-hike lever spans the full year. Reach "
   "is EU-pooled, so reach-based rules need ledger coverage for the SKU. All "
-  "thresholds (3/day, reach 3 & 30, +15%, -70%) are tunable in the dashboard.", small)
+  "thresholds (3/day, reach 4 & 30, +15%, -70%) are tunable in the dashboard.", small)
 
 doc.build(E)
 print("WROTE", OUT, OUT.stat().st_size, "bytes |", summ)

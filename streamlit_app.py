@@ -22,6 +22,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+import brand
+
 REPO_ROOT = Path(__file__).resolve().parent
 EXPORTS_DIR = REPO_ROOT / "novadata_exports"
 
@@ -30,6 +32,10 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
+
+# Vanatari corporate design — brand CSS + Plotly template (must run early,
+# before login/title, so every screen is branded).
+brand.apply()
 
 
 # ---------- Auth ----------
@@ -1297,11 +1303,11 @@ with tab_overview:
             country_fig = go.Figure()
             country_fig.add_bar(
                 x=chart_df["Marketplace"], y=chart_df["Sales (€)"], name="Sales (€)",
-                marker_color="#1f3864",
+                marker_color=brand.CHART_ORANGE,
             )
             country_fig.add_bar(
                 x=chart_df["Marketplace"], y=chart_df["P&L Impact (€)"], name="P&L Impact (€)",
-                marker_color="#74AC2A",
+                marker_color=brand.CHART_BLUE,
             )
             country_fig.update_layout(
                 barmode="group", title="Sales vs P&L Impact per country",
@@ -1358,7 +1364,7 @@ with tab_overview:
         if active_code:
             cls = f"st-key-cell_{active_code.replace('-', '_')}"
             css_rules.append(
-                f".{cls} button {{ outline:3px solid #1f3864 !important; "
+                f".{cls} button {{ outline:3px solid {brand.ORANGE} !important; "
                 f"outline-offset:-3px; }}"
             )
         st.markdown(f"<style>{''.join(css_rules)}</style>", unsafe_allow_html=True)
@@ -1864,7 +1870,7 @@ with tab_trend:
         line.update_yaxes(ticksuffix="%")
         line.update_xaxes(title=freq_label.capitalize())
         line.add_hline(
-            y=target_cm3, line_dash="dot", line_color="#d32f2f",
+            y=target_cm3, line_dash="dot", line_color=brand.PLUM,
             annotation_text=f"Target {target_cm3:.0f}%", annotation_position="top right",
         )
         st.plotly_chart(line, width="stretch")

@@ -32,21 +32,41 @@ A SKU is **out of stock** on a day when **any** of:
 1. **Physical (network):** EU sellable balance == 0 in the ledger.
 2. **Critically low (<3d):** reach (days-of-supply) below 3 — effectively out
    even if the balance isn't literally zero.
-3. **Demand gap (EU):** EU `Units == 0` on a day *enclosed by sales* (not a
+3. **Demand gap:** EU `Units == 0` on a day *enclosed by sales* (not a
    pre-launch / discontinued tail), for a SKU whose EU demand rate clears
    **Min demand (units/day)** — high enough that selling nothing is a genuine
    anomaly (this stops slow movers' normal no-sale days being mistaken for
    stock-outs).
 
-Cause priority: **Physical (network) > Critically low (<3d) > Cooling down >
-Demand gap (EU)**.
+**Blocked-listing workaround (no Seller Central suppression report exists):**
+zero sales on a day when reach is comfortably high (> 15 days, tunable) is a
+**listing/offer problem, not a stock-out** — tagged *Listing blocked (in
+stock)*, kept out of the OOS totals, and surfaced as its own header KPI group
+with an unrealized-revenue/CM3 estimate and a per-SKU check-the-listing table.
+
+Cause priority: **Physical (network) > Critically low > Cooling down >
+Demand gap > Listing blocked**.
+
+**Discontinued products (delisted):** a SKU keeps appearing in the Novadata
+export for a while after it is taken off the listings, so its post-delisting
+zero-sales tail would otherwise be read as an ongoing stock-out or blocked
+listing. A weekly discontinuation list (`novadata_exports/*discontinued*.xlsx`
+or `.csv` — a DB pull with `sku`, `product_active_date`, `product_inactive_date`)
+cuts each SKU off at its `inactive_date`: from that day on its rows leave the
+OOS universe entirely (no lost / miss / blocked). A later `active_date`
+(relisted) clears the flag. Delisted SKUs are surfaced as their own
+**Discontinued** header category. The list is optional — without it the app
+falls back to the trailing-zeros safeguard alone.
 
 ### How impact is valued
 
 - **Lost units** = expected daily demand − whatever still sold that day.
-  Expected demand = trailing 90-day average units **per calendar day** (the
-  demand rate), forward-filled so a multi-week stock-out keeps its pre-outage
-  baseline.
+  Expected demand λ = trailing 90-day average units per **live** calendar day —
+  pre-launch days and long zero-runs (≥ 7 consecutive zero days: an outage or
+  blocked listing, not sales noise) are excluded from the baseline, so λ is
+  neither diluted for new SKUs nor decays through a stock-out (a multi-week
+  outage keeps its pre-outage rate). The newest export day is an intra-day
+  partial snapshot and is always dropped before analysis.
 - **Promo-elevated counterfactual:** if the SKU was recently *positioned* to
   sell faster than usual (price cut with ads at/above baseline, and/or an ad
   boost — e.g. Prime Day), the average sales rate of those positioned days
@@ -108,23 +128,53 @@ so the model separates them. Reach (days-of-supply) drives the split:
 
 Cooling-down impact is booked as *miss* (voluntary), kept apart from involuntary
 *lost*. Category priority per day: **Physical (network) > Critically low (<3d) >
-Cooling down > Demand gap (EU)**. All thresholds are tunable in the app.
+Cooling down > Demand gap**. All thresholds are tunable in the app.
 
 **Returns don't end a stock-out.** Customer returns trickle back into the
 warehouse and can nudge the sellable balance/reach up mid-stock-out, which would
-otherwise break the OOS run (or trip a spurious cooling-down flag). So once a SKU
-is OOS it stays OOS — through return-driven blips — until either a genuine
-inbound **Receipt** arrives or sales recover to ≥ ½·λ. Receipts (real inbound)
-and Customer Returns are separate ledger columns, so the two are told apart.
+otherwise break the OOS run (or trip a spurious cooling-down flag). An episode
+**closes** only when stock demonstrably recovers: a meaningful inbound
+**Receipt**, **reach climbing back above the cool-down band**, or sales
+recovering to ≥ ½ of the effective demand rate. Bridge-filled days with
+positive sales are labelled *Suppressed sales (post-OOS)*, not *Demand gap*.
 
 Caveat: ad-spend-cut detection only
 works from when Novadata began reporting Advertising Costs (~Feb 2026); the
 price-hike lever spans the full year.
 
-## Refreshing the ledger (manual)
+## Refreshing the ledger
 
 The margin export refreshes automatically (GitHub Actions, daily). The Amazon
-Inventory Ledger is uploaded **manually** when you want fresh stock data:
+Inventory Ledger can be refreshed **automatically via the SP-API** (recommended)
+or uploaded **manually**.
+
+### Automatic — Amazon SP-API (recommended)
+
+`amazon_sp_api_ledger.py` requests the same `GET_LEDGER_DETAIL_VIEW_DATA`
+report through the Selling Partner API and hands it to `add_ledger.py`, so no
+Seller Central clicks are needed. The `Amazon Inventory Ledger (SP-API)` GitHub
+Action (`.github/workflows/ledger_export.yml`) runs it weekly and commits the
+refresh.
+
+One-time setup:
+
+1. Create a **self-authorized SP-API app** on your own seller account
+   (Seller Central → *Develop Apps*), with the *Inventory and Order Tracking*
+   role. No AWS IAM / request-signing is required.
+2. Self-authorize it to your account to obtain a **refresh token**.
+3. Add three **GitHub → Settings → Secrets** (repo scope):
+   `LWA_CLIENT_ID`, `LWA_CLIENT_SECRET`, `SP_API_REFRESH_TOKEN`.
+   Optional repo **variables**: `SP_API_MARKETPLACE_IDS` (comma-separated;
+   defaults to the EU + UK set) and `SP_API_ENDPOINT` (defaults to the EU host).
+
+Run it locally the same way:
+```bash
+export LWA_CLIENT_ID=... LWA_CLIENT_SECRET=... SP_API_REFRESH_TOKEN=...
+python amazon_sp_api_ledger.py
+git add amazon_ledger && git commit -m "data: ledger refresh" && git push
+```
+
+### Manual (fallback)
 
 1. **Seller Central → Reports → Fulfilment → Inventory Ledger → "Detailed
    View"**, set the date range to the trailing ~12 months, download the CSV.
@@ -133,9 +183,10 @@ Inventory Ledger is uploaded **manually** when you want fresh stock data:
    python add_ledger.py ~/Downloads/inventory-ledger.csv
    git add amazon_ledger && git commit -m "data: ledger refresh" && git push
    ```
-   It gzips the file, date-stamps it by the latest date inside, and prunes old
-   snapshots. The dashboard always reads the newest one. The app still runs
-   (Novadata signals only) if no ledger is present.
+
+Either path gzips the file, date-stamps it by the latest date inside, and prunes
+old snapshots. The dashboard always reads the newest one. The app still runs
+(Novadata signals only) if no ledger is present.
 
 ## Deploy
 

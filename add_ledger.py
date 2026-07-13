@@ -23,6 +23,13 @@ LEDGER_DIR = Path(__file__).resolve().parent / "amazon_ledger"
 KEEP_LATEST = 4  # keep the N most recent snapshots, prune older ones
 
 
+def is_synthetic(path: Path) -> bool:
+    """Files written by extend_ledger_from_transactions.py contain
+    pseudo-location 'EU' rows; real Detailed-view exports never do."""
+    loc = pd.read_csv(path, usecols=["Location"], dtype=str)["Location"]
+    return bool((loc == "EU").any())
+
+
 def main(src: str) -> None:
     src_path = Path(src)
     if not src_path.exists():
@@ -37,6 +44,9 @@ def main(src: str) -> None:
         pd.read_csv(src_path, usecols=["Date"])["Date"],
         format="%m/%d/%Y", errors="coerce",
     )
+    if dates.isna().mean() > 0.02:
+        sys.exit("Ledger dates unparseable (expected MM/DD/YYYY) — was the "
+                 "export downloaded in a different locale?")
     stamp = dates.max().strftime("%Y-%m-%d")
 
     LEDGER_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,11 +56,25 @@ def main(src: str) -> None:
     size_mb = dest.stat().st_size / 1024 / 1024
     print(f"Wrote {dest.name} ({size_mb:.1f} MB), covering through {stamp}.")
 
-    # Prune old snapshots.
+    # A real import supersedes any synthesized roll-forward tails — remove
+    # them even when they carry a LATER date stamp, otherwise the dashboard's
+    # newest-file pick would silently keep using the synthesized data and this
+    # import would never take effect. (Re-run extend_ledger_from_transactions.py
+    # afterwards if you want a fresh tail on top of the new anchor.)
+    for p in sorted(LEDGER_DIR.glob("inventory_ledger_*.csv.gz")):
+        if p != dest and is_synthetic(p):
+            p.unlink()
+            print(f"Removed synthesized snapshot {p.name} (superseded by this "
+                  "real import).")
+
+    # Prune old snapshots — but never the newest real one.
     snaps = sorted(LEDGER_DIR.glob("inventory_ledger_*.csv.gz"))
-    for old in snaps[:-KEEP_LATEST]:
-        old.unlink()
-        print(f"Pruned old snapshot: {old.name}")
+    real = [p for p in snaps if not is_synthetic(p)]
+    keep = set(snaps[-KEEP_LATEST:]) | ({real[-1]} if real else set())
+    for old in snaps:
+        if old not in keep:
+            old.unlink()
+            print(f"Pruned old snapshot: {old.name}")
 
     print("Done. Commit & push amazon_ledger/ so the dashboard picks it up.")
 

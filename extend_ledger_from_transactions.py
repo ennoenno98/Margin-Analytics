@@ -27,6 +27,13 @@ LEDGER_DIR = Path(__file__).resolve().parent / "amazon_ledger"
 KEEP_LATEST = 4
 
 
+def is_synthetic(path: Path) -> bool:
+    """Files written by this script contain pseudo-location 'EU' rows; real
+    Detailed-view exports never do."""
+    loc = pd.read_csv(path, usecols=["Location"], dtype=str)["Location"]
+    return bool((loc == "EU").any())
+
+
 def latest_ledger() -> Path:
     cands = sorted(LEDGER_DIR.glob("inventory_ledger_*.csv.gz"))
     if not cands:
@@ -41,11 +48,19 @@ def main(tx_path: str) -> None:
     led["_d"] = pd.to_datetime(led["Date"], format="%m/%d/%Y", errors="coerce")
     base_day = led["_d"].max()
 
-    tx = pd.read_csv(tx_path, sep="\t", dtype=str)
+    # Transaction-view exports come both tab-separated (.txt) and
+    # comma-separated (.csv) depending on how they were downloaded — sniff it.
+    with open(tx_path, "r", encoding="utf-8", errors="replace") as fh:
+        first = fh.readline()
+    sep = "\t" if first.count("\t") >= first.count(",") else ","
+    tx = pd.read_csv(tx_path, sep=sep, dtype=str)
     if "Event Type" not in tx.columns or "Quantity" not in tx.columns:
         sys.exit("This does not look like a Transaction-view export "
                  "(missing 'Event Type' / 'Quantity').")
     tx["Date"] = pd.to_datetime(tx["Date"], format="%m/%d/%Y", errors="coerce")
+    if tx["Date"].isna().mean() > 0.02:
+        sys.exit("Transaction dates unparseable (expected MM/DD/YYYY) — was the "
+                 "export downloaded in a different locale?")
     tx["Quantity"] = pd.to_numeric(tx["Quantity"], errors="coerce").fillna(0)
     tx = tx[(tx["Disposition"] == "SELLABLE") & (tx["Date"] > base_day)]
     if tx.empty:
@@ -92,7 +107,8 @@ def main(tx_path: str) -> None:
     out["MSKU"] = panel["MSKU"]
     out["Disposition"] = "SELLABLE"
     out["Location"] = panel["region"]          # "EU" pseudo-location / "GB"
-    out["Ending Warehouse Balance"] = panel["bal"].round(0).astype(int).astype(str)
+    out["Ending Warehouse Balance"] = (panel["bal"].clip(lower=0)
+                                       .round(0).astype(int).astype(str))
     out["In Transit Between Warehouses"] = "0"
     out["Customer Shipments"] = panel["ship"].round(0).astype(int).astype(str)
     out["Receipts"] = panel["rcpt"].round(0).astype(int).astype(str)
@@ -106,9 +122,14 @@ def main(tx_path: str) -> None:
           f"{panel['MSKU'].nunique()} SKUs.")
 
     snaps = sorted(LEDGER_DIR.glob("inventory_ledger_*.csv.gz"))
-    for old in snaps[:-KEEP_LATEST]:
-        old.unlink()
-        print(f"Pruned old snapshot: {old.name}")
+    real = [p for p in snaps if not is_synthetic(p)]
+    # Never prune the newest REAL Detailed-view snapshot — it is the only
+    # anchor the roll-forward chain can be re-derived from.
+    keep = set(snaps[-KEEP_LATEST:]) | ({real[-1]} if real else set())
+    for old in snaps:
+        if old not in keep:
+            old.unlink()
+            print(f"Pruned old snapshot: {old.name}")
     print("Done. Commit & push amazon_ledger/ so the dashboard picks it up.")
 
 
