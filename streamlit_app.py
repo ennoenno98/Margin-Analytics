@@ -709,7 +709,13 @@ def aggregate_periods(df_in: pd.DataFrame) -> pd.DataFrame:
         return df_in.copy()
     sum_cols = [c for c in SUM_COLS if c in df_in.columns]
     first_cols = [c for c in FIRST_COLS if c in df_in.columns]
-    wavg_cols = [c for c in WAVG_COLS if c in df_in.columns]
+    # When absolute margins are present (daily schema) the CM1/2/3% columns are
+    # re-derived from ΣCM/ΣSales below, so weight-averaging them here would be
+    # dead work — restrict the weighted-average pass to the columns that survive
+    # (ROAS, CTR). On the legacy schema (no absolutes) keep averaging the %s.
+    has_abs = "CM3" in df_in.columns
+    wavg_cols = [c for c in WAVG_COLS if c in df_in.columns
+                 and not (has_abs and c in ("CM1%", "CM2%", "CM3%"))]
 
     base = (
         df_in.groupby("SKU", as_index=False, sort=False)
@@ -1046,6 +1052,14 @@ tab_overview, tab_trend, tab_slow = st.tabs(["Overview", "Margin Trend", "Slow m
 # Overview tab — table + Δ vs previous period
 # =========================================================================
 with tab_overview:
+    # ----- Manual one-off adjustments (adjustments.json) -----
+    # Applied FIRST so every downstream figure — Δ CM3, cluster tiers, P&L —
+    # sees the same adjusted CM1/2/3 the table displays. Prior-period slices are
+    # adjusted separately over their own windows below, so the comparison stays
+    # apples-to-apples.
+    adjustments = load_adjustments()
+    filtered, adj_notes = apply_adjustments(filtered, adjustments, selected_periods)
+
     # ----- Δ CM3% vs the equivalent prior set (shift the selection back 1 week) -----
     # In single-week mode this is just the previous week; in multi-week mode we
     # shift every selected week back by 1 week, aggregate, and compare.
@@ -1065,6 +1079,8 @@ with tab_overview:
     if prior_set:
         prior_raw = mp_slice[mp_slice["Period"].isin(prior_set)]
         prior_agg = aggregate_periods(prior_raw)
+        # Adjust the prior window too, so Δ CM3 compares adjusted vs adjusted.
+        prior_agg, _ = apply_adjustments(prior_agg, adjustments, prior_set)
         prior = prior_agg.set_index("SKU")["CM3%"]
         filtered["Δ CM3 vs prior"] = filtered["CM3%"] - filtered["SKU"].map(prior)
         delta_caption = (
@@ -1076,7 +1092,10 @@ with tab_overview:
         delta_caption = f"No equivalent prior {granularity.lower()} available for Δ CM3%."
 
     # ----- Cluster tiers: computed on the aggregated marketplace slice -----
+    # Adjust over the same window as `filtered` so an adjusted SKU lands in the
+    # tier its corrected margin implies (e.g. Moringa moves out of the loss bucket).
     mp_period = aggregate_periods(raw_slice) if needs_aggregation else raw_slice.copy()
+    mp_period, _ = apply_adjustments(mp_period, adjustments, selected_periods)
     tier_base = mp_period.dropna(subset=["CM3%", "Product Sales"]).copy()
     tier_base["Margin Tier"] = tier_1_to_3(tier_base["CM3%"])
     tier_base["Volume Tier"] = tier_1_to_3(tier_base["Product Sales"])
@@ -1177,26 +1196,30 @@ with tab_overview:
     # ----- Revenue growth: same calendar weeks one month earlier (shift back 4) -----
     prior_4w_set = _equivalent_prior_set(selected_periods, 28)
     if prior_4w_set:
-        cur_rev = filtered.set_index("SKU")["Product Sales"]
+        # Compare average revenue PER DAY, not raw sums: the prior set can hold a
+        # different number of days than the current selection (data gaps, the
+        # left edge of the dataset, or ±3-day matches that collide), and raw
+        # revenue sums aren't window-size-invariant — a shorter prior window
+        # would otherwise fabricate growth. Dividing each side by its own day
+        # count makes the comparison like-for-like.
+        n_cur = max(len(selected_periods), 1)
+        n_prior = max(len(prior_4w_set), 1)
+        cur_rev = filtered.set_index("SKU")["Product Sales"] / n_cur
         prior_4w_raw = mp_slice[mp_slice["Period"].isin(prior_4w_set)]
         prior_4w_agg = aggregate_periods(prior_4w_raw)
-        prev_rev = prior_4w_agg.set_index("SKU")["Product Sales"]
+        prev_rev = prior_4w_agg.set_index("SKU")["Product Sales"] / n_prior
         # Align by SKU; some current SKUs may not appear in the prior set.
         prev_rev_aligned = prev_rev.reindex(cur_rev.index)
         wow4 = ((cur_rev - prev_rev_aligned)
                 / prev_rev_aligned.where(prev_rev_aligned > 0)) * 100
         filtered["Rev Δ 4w %"] = filtered["SKU"].map(wow4)
         growth_caption = (
-            f"Rev Δ 4w % compares the selection to the same days 4 weeks earlier "
-            f"(ending {_fmt_day(max(prior_4w_set))})."
+            f"Rev Δ 4w % compares average €/day in the selection to the same days "
+            f"4 weeks earlier (ending {_fmt_day(max(prior_4w_set))})."
         )
     else:
         filtered["Rev Δ 4w %"] = pd.NA
         growth_caption = "No equivalent set 4 weeks back, so Rev Δ 4w % is empty."
-
-    # ----- Apply manual one-off adjustments (adjustments.json) -----
-    adjustments = load_adjustments()
-    filtered, adj_notes = apply_adjustments(filtered, adjustments, selected_periods)
 
     # ----- P&L Impact = total CM3 (absolute € contribution) -----
     # Daily export carries CM3 in € directly; weekly legacy schema only has the
@@ -1987,13 +2010,23 @@ with tab_slow:
                 f"Supply column isn't populated by Novadata yet (known gap)."
             )
         else:
-            # Tied-up stock value: FBA Available × avg unit price (sales / units over period)
+            # Tied-up stock value = FBA units × COGS/unit (what the stock COST,
+            # i.e. capital at risk) — NOT retail price, which would overstate it
+            # by the whole gross margin (~2.5× at Vegavero's ~60% CM1). COGS/unit
+            # is derived from CM1: COGS = Product Sales − CM1 over the period.
             units = pd.to_numeric(slow.get("Units"), errors="coerce")
             sales = pd.to_numeric(slow.get("Product Sales"), errors="coerce")
             fba = pd.to_numeric(slow.get("FBA Available"), errors="coerce")
+            cm1 = pd.to_numeric(slow.get("CM1"), errors="coerce") if "CM1" in slow.columns else None
             unit_price = sales / units.where(units > 0)
+            if cm1 is not None:
+                cogs_per_unit = (sales - cm1) / units.where(units > 0)
+            else:
+                # Legacy schema without absolute CM1: fall back to retail price.
+                cogs_per_unit = unit_price
             slow["Avg unit price"] = unit_price
-            slow["Tied-up value"] = fba * unit_price
+            slow["COGS / unit"] = cogs_per_unit
+            slow["Tied-up value"] = fba * cogs_per_unit
             slow = slow.sort_values("Days of Supply", ascending=False)
 
             s2.markdown(
@@ -2008,9 +2041,18 @@ with tab_slow:
             tied = slow["Tied-up value"].sum()
             k3.metric("Tied-up stock value (≈€)",
                       f"€{tied:,.0f}" if pd.notna(tied) and tied > 0 else "—",
-                      help="FBA Available × avg unit price (sales / units over the selected period).")
-            avg_cm3_slow = pd.to_numeric(slow.get("CM3%"), errors="coerce").mean()
-            k4.metric("Avg CM3 %", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—")
+                      help="FBA units × COGS/unit (COGS = Sales − CM1 over the period) "
+                           "— capital at risk, not retail value.")
+            # Sales-weighted CM3% (ΣCM3 / ΣSales), consistent with the rest of the
+            # app — an unweighted mean of per-SKU %s would be dominated by tiny SKUs.
+            _cm3_abs = pd.to_numeric(slow.get("CM3"), errors="coerce") if "CM3" in slow.columns else None
+            _sales_tot = pd.to_numeric(slow.get("Product Sales"), errors="coerce").sum()
+            if _cm3_abs is not None and _sales_tot:
+                avg_cm3_slow = _cm3_abs.sum() / _sales_tot * 100
+            else:
+                avg_cm3_slow = float("nan")
+            k4.metric("Avg CM3 % (weighted)", f"{avg_cm3_slow:.1f}%" if pd.notna(avg_cm3_slow) else "—",
+                      help="Σ CM3 € / Σ Sales € across the slow movers (sales-weighted).")
 
             # Pull current comments (same store the Overview tab edits) so any
             # note added here ↔ shows up on the other tab automatically.
@@ -2029,7 +2071,7 @@ with tab_slow:
             show_cols = [c for c in [
                 "SKU", "Product", "Cluster",
                 "FBA Available", "Sales Velocity", "Days of Supply",
-                "Avg unit price", "Tied-up value",
+                "COGS / unit", "Tied-up value",
                 "Product Sales", "Units", "CM3%",
                 "Comments", "Global note",
             ] if c in slow.columns]
@@ -2049,8 +2091,10 @@ with tab_slow:
                         "Days of Supply", format="%d", disabled=True,
                         help=f"Orange ≥ {dos_threshold} d (your threshold); red ≥ {dos_threshold*2} d (critical).",
                     ),
-                    "Avg unit price": st.column_config.NumberColumn("Avg unit price", format="€%.1f", disabled=True),
-                    "Tied-up value": st.column_config.NumberColumn("Tied-up value", format="€%d", disabled=True),
+                    "COGS / unit": st.column_config.NumberColumn("COGS / unit", format="€%.1f", disabled=True),
+                    "Tied-up value": st.column_config.NumberColumn(
+                        "Tied-up value", format="€%d", disabled=True,
+                        help="FBA units × COGS/unit — capital at risk (not retail value)."),
                     "Product Sales": st.column_config.NumberColumn("Sales (€)", format="€%d", disabled=True),
                     "Units": st.column_config.NumberColumn("Units", format="%d", disabled=True),
                     "CM3%": st.column_config.NumberColumn("CM3 %", format="%.1f%%", disabled=True),

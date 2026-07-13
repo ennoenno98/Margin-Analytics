@@ -383,10 +383,14 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None,
     base_ppc = (roll_ppc / roll_ppc_days.where(roll_ppc_days > 0)).ffill()
     price = sales / units.where(units > 0)  # realised price/unit per day
 
-    # expected = average units per LIVE calendar day = the demand rate. A
-    # zero-sales day only flags a stock-out when this rate clears
-    # DEFAULT_MIN_DEMAND (so a thin marketplace's normal no-sale days are not
-    # mistaken for stock-outs).
+    # expected = average units per LIVE calendar day = the demand rate.
+    # roll_units/roll_days are built from units_base above, which already masks
+    # pre-launch days and long (>=7d) zero-runs — so the window only averages
+    # days the SKU was genuinely live, and the ffill carries that pre-outage
+    # rate forward through a stock-out (the rate can't decay to ~0 and stop
+    # flagging OOS). Short scattered zero days still count, so a thin
+    # marketplace's normal no-sale days keep it below DEFAULT_MIN_DEMAND and
+    # don't look like stock-outs.
     expected = (roll_units / roll_days.where(roll_days > 0)).ffill()
     avg_price = (roll_sales / roll_units.where(roll_units > 0)).ffill()
     avg_cm3_pu = (roll_cm3 / roll_units.where(roll_units > 0)).ffill()

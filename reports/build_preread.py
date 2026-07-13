@@ -142,10 +142,14 @@ def _spread_adjustments_to_daily(win: pd.DataFrame, adjustments: dict,
             sales = pd.to_numeric(out.loc[mask, "Product Sales"], errors="coerce").fillna(0)
             for short in ("CM1", "CM2", "CM3"):
                 if short in out.columns and f"{short}%" in out.columns:
+                    # .where(sales > 0) yields NaN (a float) on zero-sales rows;
+                    # .replace(0, pd.NA) would inject the pd.NA extension scalar,
+                    # which can't be cast back into the float32 %-column under
+                    # pandas 3.0 (LossySetitemError).
                     out.loc[mask, f"{short}%"] = (
                         pd.to_numeric(out.loc[mask, short], errors="coerce")
-                        / sales.replace(0, pd.NA) * 100
-                    )
+                        / sales.where(sales > 0) * 100
+                    ).astype("float32")
     return out
 
 
@@ -208,17 +212,21 @@ def compute():
             vel=("Sales Velocity", "sum"),
         )
         sku_inv["dos"] = sku_inv["fba"] / sku_inv["vel"].where(sku_inv["vel"] > 0)
-        # Join with Mar-May economics (sales, units, CM3%) for ranking + value.
-        slow = sku_inv.merge(
-            agg[["SKU", "Product", "Product Sales", "Units", "CM3%"]],
-            on="SKU", how="left",
-        )
+        # Join with Mar-May economics (sales, units, CM1, CM3%) for ranking + value.
+        econ_cols = [c for c in ["SKU", "Product", "Product Sales", "Units", "CM1", "CM3%"]
+                     if c in agg.columns]
+        slow = sku_inv.merge(agg[econ_cols], on="SKU", how="left")
         slow = slow[slow["dos"] > 180].copy()
-        # Tied-up value ≈ FBA × avg unit price over the period.
+        # Tied-up value = FBA units × COGS/unit (capital at risk), NOT retail
+        # price — retail would overstate it by the gross margin (~2.5× at ~60%
+        # CM1). COGS = Product Sales − CM1 over the period.
         units = pd.to_numeric(slow["Units"], errors="coerce")
         sales = pd.to_numeric(slow["Product Sales"], errors="coerce")
-        slow["unit_price"] = sales / units.where(units > 0)
-        slow["tied_up"] = slow["fba"] * slow["unit_price"]
+        if "CM1" in slow.columns:
+            slow["cogs_unit"] = (sales - pd.to_numeric(slow["CM1"], errors="coerce")) / units.where(units > 0)
+        else:
+            slow["cogs_unit"] = sales / units.where(units > 0)
+        slow["tied_up"] = slow["fba"] * slow["cogs_unit"]
         slow = slow.sort_values("dos", ascending=False).reset_index(drop=True)
 
     return dict(agg=agg, tb=tb, port=port, trends=trends, slow=slow,
@@ -537,9 +545,10 @@ def build():
         E.append(Paragraph(
             f"<b>{n} SKUs</b> have more than six months of FBA stock at current sales velocity, "
             f"of which <b>{critical}</b> exceed twelve months (critical overstock). "
-            f"Together they tie up roughly <b>{eur(tied_up)}</b> of inventory value "
-            f"({fba_units:,} FBA units). Days of Supply = FBA Available ÷ Sales Velocity "
-            f"(units/day), with both totals summed across marketplaces.", body))
+            f"Together they tie up roughly <b>{eur(tied_up)}</b> of capital at cost "
+            f"(FBA units × COGS/unit, where COGS = Sales − CM1 — not retail value) "
+            f"across {fba_units:,} FBA units. Days of Supply = FBA Available ÷ Sales "
+            f"Velocity (units/day), with both totals summed across marketplaces.", body))
         E.append(Spacer(1, 6))
 
         kpi = [["Slow-mover SKUs (>180 d)", "Critical (>360 d)", "FBA units locked", "Tied-up value"],
@@ -595,9 +604,10 @@ def build():
         ]))
         E.append(Spacer(1, 6))
         E.append(Paragraph(
-            "Tied-up value ≈ FBA units × avg unit price (sales / units over March–May), "
-            "i.e. cash sitting in unsold stock. Sales / CM3% are this SKU's Mar–May economics "
-            "for context. DoS values shown in red exceed 360 days (a year of stock).", small))
+            "Tied-up value ≈ FBA units × COGS/unit (COGS = Sales − CM1 over March–May), "
+            "i.e. capital sitting in unsold stock at cost — not retail value. Sales / CM3% "
+            "are this SKU's Mar–May economics for context. DoS values shown in red exceed "
+            "360 days (a year of stock).", small))
 
     # ----- Adjustment box (only if any adjustment is applied) -------------
     if adj_notes:
