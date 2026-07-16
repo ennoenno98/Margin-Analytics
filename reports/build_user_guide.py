@@ -1,6 +1,13 @@
-"""Render the marketing-team OOS dashboard user guide to a styled PDF."""
+"""Render the marketing-team OOS dashboard user guide to a PDF in the Vanatari
+corporate design (palette + serif-headline / sans-body split from brand.py).
+
+Brand fonts (Literata / Satoshi) aren't available to reportlab, so we use the
+built-in Times (serif) for headlines and Helvetica (sans) for body — the same
+serif/sans intent as the corporate design, in the brand colours."""
 from __future__ import annotations
+import sys
 from pathlib import Path
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -9,25 +16,32 @@ from reportlab.lib.enums import TA_LEFT
 from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
                                 TableStyle, ListFlowable, ListItem)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import brand  # noqa: E402  — corporate palette, single source of truth
+
 OUT = Path(__file__).resolve().parent / "OOS_Dashboard_User_Guide.pdf"
-DARK = colors.HexColor("#264653")
-TEAL = colors.HexColor("#2a9d8f")
-GREY = colors.HexColor("#cccccc")
-LIGHT = colors.HexColor("#eef4f3")
+
+# ---------- corporate palette (from brand.py) ----------
+PLUM = colors.HexColor(brand.PLUM)          # ink
+ORANGE = colors.HexColor(brand.ORANGE)      # accent
+LIGHT_BLUE = colors.HexColor(brand.LIGHT_BLUE)
+BEIGE = colors.HexColor(brand.BEIGE)        # page background
+GRID = colors.HexColor(brand.PLUM_GRID)
+MUTED = colors.HexColor(brand.PLUM_60)
+SERIF, SANS = "Times-Bold", "Helvetica"
 
 ss = getSampleStyleSheet()
-H1 = ParagraphStyle("H1", parent=ss["Heading1"], textColor=DARK, fontSize=18, spaceAfter=2)
-H2 = ParagraphStyle("H2", parent=ss["Heading2"], textColor=TEAL, fontSize=12.5,
-                    spaceBefore=10, spaceAfter=4)
-body = ParagraphStyle("body", parent=ss["BodyText"], fontSize=9.3, leading=13, alignment=TA_LEFT)
-small = ParagraphStyle("small", parent=ss["BodyText"], fontSize=8, leading=10.5, textColor=colors.grey)
-cellh = ParagraphStyle("cellh", parent=body, fontSize=8.8, leading=11, textColor=colors.white,
-                       fontName="Helvetica-Bold")
+H1 = ParagraphStyle("H1", parent=ss["Heading1"], fontName=SERIF, textColor=PLUM,
+                    fontSize=19, spaceAfter=1, leading=22)
+H2 = ParagraphStyle("H2", parent=ss["Heading2"], fontName=SERIF, textColor=ORANGE,
+                    fontSize=12.5, spaceBefore=11, spaceAfter=4, leading=15)
+body = ParagraphStyle("body", parent=ss["BodyText"], fontName=SANS, fontSize=9.3,
+                      leading=13, textColor=PLUM, alignment=TA_LEFT)
+small = ParagraphStyle("small", parent=body, fontSize=8, leading=10.5, textColor=MUTED)
+cellh = ParagraphStyle("cellh", parent=body, fontSize=8.8, leading=11,
+                       textColor=colors.white, fontName="Helvetica-Bold")
 cell = ParagraphStyle("cell", parent=body, fontSize=8.6, leading=11)
-callout = ParagraphStyle("callout", parent=body, fontSize=9.3, leading=13,
-                         backColor=LIGHT, borderColor=TEAL, borderWidth=0,
-                         leftIndent=6, rightIndent=6, spaceBefore=2, spaceAfter=2,
-                         borderPadding=6)
+co = ParagraphStyle("co", parent=body, fontSize=9.4, leading=13.5)
 
 E = []
 def P(t, st=body): E.append(Paragraph(t, st))
@@ -35,24 +49,44 @@ def gap(h=0.18): E.append(Spacer(1, h * cm))
 def bullets(items, st=body):
     E.append(ListFlowable(
         [ListItem(Paragraph(t, st), leftIndent=10, value="•") for t in items],
-        bulletType="bullet", start="•", leftIndent=12, bulletFontSize=7))
+        bulletType="bullet", start="•", leftIndent=12, bulletColor=ORANGE, bulletFontSize=7))
 
 def table(rows, widths):
     data = [[Paragraph(c, cellh if i == 0 else cell) for c in r] for i, r in enumerate(rows)]
     t = Table(data, colWidths=widths, repeatRows=1)
-    sty = [("BACKGROUND", (0, 0), (-1, 0), DARK),
-           ("GRID", (0, 0), (-1, -1), 0.4, GREY),
-           ("VALIGN", (0, 0), (-1, -1), "TOP"),
-           ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-           ("TOPPADDING", (0, 0), (-1, -1), 3.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
-           ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT])]
-    t.setStyle(TableStyle(sty))
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), PLUM),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.4, GRID),
+        ("LINEAFTER", (0, 0), (-2, -1), 0.4, GRID),
+        ("BOX", (0, 0), (-1, -1), 0.4, GRID),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BLUE])]))
     E.append(t)
+
+def callout(html):
+    """Light-blue box with a warm-orange accent bar down the left edge."""
+    inner = Table([[Paragraph(html, co)]], colWidths=[15.3 * cm])
+    inner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), LIGHT_BLUE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+    bar = Table([["", inner]], colWidths=[0.12 * cm, 15.5 * cm])
+    bar.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), ORANGE),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    E.append(bar)
 
 # ---------------------------------------------------------------- content
 P("OOS Impact Analytics — User Guide", H1)
 P("A quick guide for the marketing team. No technical knowledge needed.", small)
-gap()
+E.append(Spacer(1, 0.05 * cm))
+E.append(Table([[""]], colWidths=[16.6 * cm], rowHeights=[2],
+               style=TableStyle([("BACKGROUND", (0, 0), (-1, -1), ORANGE)])))
+gap(0.22)
 
 P("What this dashboard is for", H2)
 P("It answers one question: <b>how much revenue and margin are we losing because "
@@ -61,10 +95,10 @@ P("It answers one question: <b>how much revenue and margin are we losing because
   "have sold if it had been in stock, and turns the gap into euros. Use it to spot "
   "which SKUs to prioritise for restocking, which listings need attention, and how "
   "much a stock-out really cost.")
-gap(0.1)
-P("<b>One rule to remember:</b> the headline number is <b>Lost CM3</b> — the "
-  "contribution margin (real profit) we gave up. <b>Lost revenue</b> is the top-line "
-  "version of the same thing.", callout)
+gap(0.12)
+callout("<b>One rule to remember:</b> the headline number is <b>Lost CM3</b> — the "
+        "contribution margin (real profit) we gave up. <b>Lost revenue</b> is the "
+        "top-line version of the same thing.")
 gap()
 
 P("Getting in", H2)
@@ -73,8 +107,7 @@ P("Open the dashboard link and enter the shared password. That's it — the data
 gap()
 
 P("The filter bar (top of the page)", H2)
-P("Five controls sit across the top. Set these first; everything below updates "
-  "instantly.")
+P("Five controls sit across the top. Set these first; everything below updates instantly.")
 gap(0.08)
 table([
     ["Filter", "What it does"],
@@ -86,7 +119,7 @@ table([
     ["Min demand", "How busy a product must be before a no-sales day counts as a "
                    "stock-out. Leave at the default (3/day) unless investigating slow movers."],
     ["Search", "Type part of a product name or SKU to focus on one product or a range."],
-], [3.0 * cm, 13.2 * cm])
+], [3.0 * cm, 13.6 * cm])
 gap(0.1)
 P("There's also a <b>thresholds</b> expander. You can ignore it — the defaults are "
   "set with Ops. Open it only to tune sensitivity (e.g. how tight stock must be to "
@@ -121,7 +154,7 @@ table([
     ["Country overview", "Which countries carry the loss, valued at each country's own price "
                          "and margin. Drill into one country."],
     ["Top sellers", "A watchlist of the highest-value products and their current stock status."],
-], [3.4 * cm, 12.8 * cm])
+], [3.4 * cm, 13.2 * cm])
 gap(0.1)
 P("Most tables have a <b>download button</b> for exporting to Excel / CSV.")
 gap()
@@ -141,8 +174,8 @@ bullets([
 gap()
 
 P("A typical workflow", H2)
-E.append(ListFlowable([
-    ListItem(Paragraph(t, body), leftIndent=12) for t in [
+E.append(ListFlowable(
+    [ListItem(Paragraph(t, body), leftIndent=12) for t in [
         "Pick your <b>Region</b> and <b>Period</b> (e.g. EU, last quarter).",
         "Look at the <b>headline KPIs</b> — how much did we lose, and is the trend up or down?",
         "Open <b>Most affected SKUs</b> and note the top few by Lost CM3.",
@@ -150,7 +183,7 @@ E.append(ListFlowable([
         "throttle, or blocked listing?",
         "Check the <b>Listing blocked</b> list — quick wins (a listing fix, no restock).",
         "Export <b>Stock-out events</b> or the ranked table to share with Ops / Supply Chain.",
-    ]], bulletType="1", leftIndent=14))
+    ]], bulletType="1", bulletColor=ORANGE, leftIndent=14))
 gap()
 
 P("Good to know", H2)
@@ -169,7 +202,16 @@ gap(0.2)
 P("Questions or a metric that looks off? Flag it — the model's thresholds are all tunable and "
   "documented in the methodology sheet.", small)
 
+
+def _bg(canvas, doc):
+    canvas.saveState()
+    canvas.setFillColor(BEIGE)
+    canvas.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
+    canvas.restoreState()
+
+
 SimpleDocTemplate(str(OUT), pagesize=A4, topMargin=1.4 * cm, bottomMargin=1.2 * cm,
                   leftMargin=1.8 * cm, rightMargin=1.8 * cm,
-                  title="OOS Impact Analytics — User Guide").build(E)
+                  title="OOS Impact Analytics — User Guide").build(
+    E, onFirstPage=_bg, onLaterPages=_bg)
 print("WROTE", OUT, OUT.stat().st_size, "bytes")
