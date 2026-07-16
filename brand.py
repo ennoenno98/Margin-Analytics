@@ -59,7 +59,41 @@ NEUTRAL = "#9a8f94"
 SANS = "Satoshi, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
 SERIF = "Literata, Georgia, 'Times New Roman', serif"
 
+# Single-hue magnitude ramp (beige surface -> warm orange), for heatmaps / choropleths.
+SEQUENTIAL = [[0.0, BEIGE], [0.5, "#f6a482"], [1.0, CHART_ORANGE]]
+
 _TEMPLATE_NAME = "vanatari"
+
+
+def style(fig, *, height: int | None = None, legend: bool = True):
+    """Apply the corporate chart layout: European number separators (decimal
+    comma, thousands dot), consistent breathing room, a top-left horizontal
+    legend, and branded hover labels. Per-axis tick formats stay with each
+    chart. Returns the figure for chaining."""
+    fig.update_layout(
+        template=_TEMPLATE_NAME,
+        separators=",.",                       # 1.234,5  (European)
+        margin=dict(l=20, r=24, t=78, b=52),
+        title=dict(x=0, xanchor="left", y=0.97, yanchor="top",
+                   font=dict(family=SERIF, color=PLUM, size=16)),
+        hoverlabel=dict(font=dict(family=SANS, size=12), bgcolor="#ffffff",
+                        bordercolor=PLUM_GRID),
+        font=dict(family=SANS, size=13, color=PLUM),
+    )
+    # Let axes claim the width/height their tick labels & titles need, so long
+    # € values and SKU names are never clipped.
+    fig.update_xaxes(automargin=True)
+    fig.update_yaxes(automargin=True, title_standoff=8)
+    if legend:
+        fig.update_layout(legend=dict(
+            orientation="h", yanchor="bottom", y=1.015, x=0, xanchor="left",
+            bgcolor="rgba(0,0,0,0)", font=dict(color=PLUM_60, size=12),
+            title_text=""))
+    else:
+        fig.update_layout(showlegend=False)
+    if height is not None:
+        fig.update_layout(height=height)
+    return fig
 
 
 def _register_template() -> None:

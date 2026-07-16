@@ -72,7 +72,10 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
+
+import brand
 
 REPO_ROOT = Path(__file__).resolve().parent
 EXPORTS_DIR = REPO_ROOT / "novadata_exports"
@@ -125,6 +128,7 @@ MKT_COUNTRY = {
 }
 
 st.set_page_config(page_title="OOS Impact Analytics", page_icon="📦", layout="wide")
+brand.apply()   # Vanatari corporate design — brand CSS + Plotly template
 
 
 # ---------- Auth (mirrors streamlit_app.py) ----------
@@ -751,27 +755,33 @@ def sku_timeline_fig(d: pd.DataFrame, title: str) -> go.Figure:
     + stock (ledger), with OOS days shaded red and cooling-down days purple."""
     d = d.sort_values("Period")
     fig = go.Figure()
+    # Sales (bars) vs the stock level (recessive reference line on a 2nd scale):
+    # a deliberate overlay — the whole point of the view is to correlate the
+    # stock draw-down with the sales it suppressed.
     fig.add_bar(x=d["Period"], y=d["units"], name="Units sold/day",
-                marker_color="#2a9d8f")
+                marker_color=brand.CHART_BLUE,
+                hovertemplate="%{x|%d %b %Y}<br>%{y:,.0f} units<extra></extra>")
     fig.add_trace(go.Scatter(x=d["Period"], y=d["expected"], name="Expected demand (λ)",
-                             mode="lines", line=dict(color="#264653", dash="dot")))
+                             mode="lines", line=dict(color=brand.PLUM, dash="dot", width=2),
+                             hovertemplate="λ %{y:,.0f}/day<extra></extra>"))
     if d["eu_stock"].notna().any():
         fig.add_trace(go.Scatter(x=d["Period"], y=d["eu_stock"], name="Stock (ledger)",
-                                 yaxis="y2", mode="lines", line=dict(color="#8d99ae")))
+                                 yaxis="y2", mode="lines",
+                                 line=dict(color=brand.PLUM_60, width=1.5),
+                                 hovertemplate="%{y:,.0f} in stock<extra></extra>"))
     half = pd.Timedelta(hours=12)
     for dd in d.loc[d["oos"], "Period"]:
-        fig.add_vrect(x0=dd - half, x1=dd + half, fillcolor="#d32f2f",
-                      opacity=0.13, line_width=0, layer="below")
+        fig.add_vrect(x0=dd - half, x1=dd + half, fillcolor=brand.BAD,
+                      opacity=0.12, line_width=0, layer="below")
     for dd in d.loc[d["cooldown"], "Period"]:
-        fig.add_vrect(x0=dd - half, x1=dd + half, fillcolor="#9b5de5",
-                      opacity=0.13, line_width=0, layer="below")
+        fig.add_vrect(x0=dd - half, x1=dd + half, fillcolor=brand.CHART_VIOLET,
+                      opacity=0.12, line_width=0, layer="below")
     fig.update_layout(
-        height=360, title=title, bargap=0,
-        yaxis=dict(title="Units / day"),
-        yaxis2=dict(title="Stock", overlaying="y", side="right", showgrid=False),
-        margin=dict(l=10, r=10, t=50, b=60),
-        legend=dict(orientation="h", yanchor="top", y=-0.2, x=0.5, xanchor="center"))
-    return fig
+        title=title, bargap=0.15,
+        yaxis=dict(title="Units / day", rangemode="tozero", tickformat=",.0f"),
+        yaxis2=dict(title="Stock", overlaying="y", side="right", showgrid=False,
+                    rangemode="tozero", tickformat=",.0f"))
+    return brand.style(fig, height=380)
 # ======================================================================
 require_login()
 
@@ -1016,23 +1026,33 @@ ob["rate"] = (ob["oos_days"] / ob["active"].where(ob["active"] > 0) * 100).round
 ob["wisr"] = (ob["w_in"] / ob["w"].where(ob["w"] > 0) * 100).round(1)
 ob["label"] = (ob["bucket"].dt.strftime("%b %Y") if operf == "M"
                else ob["bucket"].dt.to_period("Q").astype(str))
-figO = go.Figure()
-figO.add_bar(x=ob["label"], y=ob["lost_rev"], name="Lost revenue (€)", marker_color="#f4a261")
-figO.add_bar(x=ob["label"], y=ob["lost_cm3"], name="Lost CM3 (€)", marker_color="#d32f2f")
+# Two measures on different scales (€ and %) → two stacked panels sharing the
+# x-axis, never one dual-axis chart.
+figO = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09,
+                     row_heights=[0.62, 0.38])
+figO.add_bar(x=ob["label"], y=ob["lost_cm3"], name="Lost CM3 (€)",
+             marker_color=brand.CHART_ORANGE,
+             hovertemplate="%{x}<br>Lost CM3 €%{y:,.0f}<extra></extra>", row=1, col=1)
+figO.add_bar(x=ob["label"], y=ob["lost_rev"], name="Lost revenue (€)",
+             marker_color=brand.CHART_BLUE,
+             hovertemplate="%{x}<br>Lost revenue €%{y:,.0f}<extra></extra>", row=1, col=1)
 figO.add_trace(go.Scatter(x=ob["label"], y=ob["rate"], name="OOS rate (%)",
-                          yaxis="y2", mode="lines+markers", line=dict(color="#264653", width=3)))
+                          mode="lines+markers", line=dict(color=brand.CHART_ORANGE, width=2),
+                          marker=dict(size=7),
+                          hovertemplate="%{x}<br>OOS rate %{y:,.1f} %<extra></extra>"),
+               row=2, col=1)
 figO.add_trace(go.Scatter(x=ob["label"], y=ob["wisr"], name="WISR (%)",
-                          yaxis="y2", mode="lines+markers",
-                          line=dict(color="#2a9d8f", width=2, dash="dot")))
-figO.update_layout(
-    barmode="group", height=420,
-    title="Lost revenue, lost CM3, OOS rate & WISR over time",
-    xaxis=dict(type="category"), yaxis=dict(title="€ lost"),
-    yaxis2=dict(title="%", overlaying="y", side="right",
-                showgrid=False, rangemode="tozero"),
-    margin=dict(l=10, r=10, t=50, b=60),
-    legend=dict(orientation="h", yanchor="top", y=-0.18, x=0.5, xanchor="center"))
-st.plotly_chart(figO, width="stretch")
+                          mode="lines+markers", line=dict(color=brand.CHART_BLUE, width=2, dash="dot"),
+                          marker=dict(size=7),
+                          hovertemplate="%{x}<br>WISR %{y:,.1f} %<extra></extra>"),
+               row=2, col=1)
+figO.update_layout(barmode="group", bargap=0.28, bargroupgap=0.12,
+                   title="Lost impact, OOS rate & WISR over time")
+figO.update_yaxes(title_text="€ lost", tickprefix="€ ", tickformat=",.0f", row=1, col=1)
+figO.update_yaxes(title_text="rate", ticksuffix=" %", tickformat=",.0f",
+                  rangemode="tozero", row=2, col=1)
+figO.update_xaxes(type="category", row=2, col=1)
+st.plotly_chart(brand.style(figO, height=440), width="stretch")
 # Involuntary loss totals, beneath the chart.
 o1, o2, o3, o4, o5 = st.columns(5)
 o1.metric("SKUs affected", fmt_num(agg["SKU"].nunique()))
@@ -1140,9 +1160,10 @@ with tab1:
         labels={"lost_cm3": "Lost CM3 (€)", "SKU": ""},
         title=f"Top {top_n} SKUs by lost contribution margin",
     )
-    fig.update_layout(height=max(320, 26 * top_n), margin=dict(l=10, r=10, t=50, b=10))
-    fig.update_traces(marker_color="#d32f2f")
-    st.plotly_chart(fig, width="stretch")
+    fig.update_traces(marker_color=brand.CHART_ORANGE)
+    fig.update_xaxes(tickprefix="€ ", tickformat=",.0f")
+    st.plotly_chart(brand.style(fig, height=max(340, 30 * top_n), legend=False),
+                    width="stretch")
 
     # Drill-down: pick one of the top SKUs → stock / demand / OOS timeline.
     sel = st.selectbox(
@@ -1199,10 +1220,14 @@ with tab2:
                             aggfunc="count", observed=True).reindex(top_skus)
         pv.columns = [c.strftime("%b %y") for c in pv.columns]
         pv.index = [f"{s} · {prod_short.get(s, '')}"[:32] for s in pv.index]
-        figh = px.imshow(pv, color_continuous_scale="Reds", aspect="auto",
+        figh = px.imshow(pv, color_continuous_scale=brand.SEQUENTIAL, aspect="auto",
                          labels=dict(color="OOS days"))
-        figh.update_layout(height=max(300, 24 * n_heat), margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(figh, width="stretch")
+        figh.update_traces(hovertemplate="%{y}<br>%{x}<br>%{z:,.0f} OOS days<extra></extra>",
+                           xgap=2, ygap=2)
+        figh.update_xaxes(showgrid=False)
+        figh.update_yaxes(showgrid=False)
+        st.plotly_chart(brand.style(figh, height=max(320, 28 * n_heat), legend=False),
+                        width="stretch")
 
 # ======================================================================
 #  Tab 3 — Stock-out events
@@ -1387,10 +1412,10 @@ with tab6:
             figc = px.bar(country.sort_values("lost_cm3"), x="lost_cm3", y="Country",
                           orientation="h", labels={"lost_cm3": "Lost CM3 (€)", "Country": ""},
                           title="OOS lost CM3 by country (actual items × country margin)")
-            figc.update_traces(marker_color="#d32f2f")
-            figc.update_layout(height=max(300, 40 * len(country)),
-                               margin=dict(l=10, r=10, t=50, b=10))
-            st.plotly_chart(figc, width="stretch")
+            figc.update_traces(marker_color=brand.CHART_ORANGE)
+            figc.update_xaxes(tickprefix="€ ", tickformat=",.0f")
+            st.plotly_chart(brand.style(figc, height=max(320, 44 * len(country)),
+                                        legend=False), width="stretch")
             disp = country[["Country", "oos_skus", "units_lost", "lost_rev", "lost_cm3"]].rename(
                 columns={"oos_skus": "OOS SKUs", "units_lost": "Lost units",
                          "lost_rev": "Lost revenue (€)", "lost_cm3": "Lost CM3 (€)"}).round(0)
