@@ -469,7 +469,7 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
              dos_th: float = COOLDOWN_DOS, ppc_cut: float = COOLDOWN_PPC_CUT,
              price_up: float = COOLDOWN_PRICE_UP,
              min_ppc: float = COOLDOWN_MIN_PPC,
-             oos_dos: float = OOS_DOS,
+             oos_dos_eu: float = OOS_DOS_EU, oos_dos_gb: float = OOS_DOS_GB,
              heat_ad_up: float = HEATUP_AD_UP, heat_price_down: float = HEATUP_PRICE_DOWN,
              heat_win: int = HEATUP_WINDOW,
              blocked_reach: float = BLOCKED_MIN_REACH) -> pd.DataFrame:
@@ -495,6 +495,11 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     base_ppc = long["base_ppc"].to_numpy()
     price = long["price"].to_numpy()
     dos = long["dos"].to_numpy()
+    # Reach threshold is per region (EU dispatch-to-sellable is faster than GB's
+    # transfers + customs), so a combined EU+UK view flags each region on its
+    # own bar in the same pass.
+    oos_dos = np.where(long["region"].astype(str).to_numpy() == "GB",
+                       oos_dos_gb, oos_dos_eu).astype(float)
 
     # Counterfactual for valuation AND recovery gates: if the SKU was recently
     # POSITIONED to sell faster than usual (promo price/ads, e.g. Prime Day) and
@@ -587,7 +592,7 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     # region suffix (GB rows were previously mislabelled "(EU)").
     cause = np.where(
         phys_eu, "Physical (network)",
-        np.where(oos & ~np.isnan(dos) & (dos < oos_dos), "Critically low (<%gd reach)" % oos_dos,
+        np.where(oos & ~np.isnan(dos) & (dos < oos_dos), "Critically low (reach)",
                  np.where(cooldown, "Cooling down",
                           np.where(oos & (units == 0), "Demand gap",
                                    np.where(oos, "Suppressed sales (post-OOS)",
@@ -629,7 +634,8 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
 def compute_flagged(margin_path: Path, ledger_path: Path | None,
                     m_margin: float | None, m_ledger: float | None,
                     min_demand: float, dos_th: float, ppc_cut: float,
-                    price_up: float, oos_dos: float, heat_ad_up: float,
+                    price_up: float, oos_dos_eu: float, oos_dos_gb: float,
+                    heat_ad_up: float,
                     heat_price_down: float, heat_win: int,
                     blocked_reach: float) -> pd.DataFrame:
     """Cached flag_oos: reruns only when data or thresholds actually change,
@@ -638,7 +644,8 @@ def compute_flagged(margin_path: Path, ledger_path: Path | None,
     long_all, _meta, _asof, _eu = compute_oos_long(margin_path, ledger_path,
                                                    m_margin, m_ledger)
     return flag_oos(long_all, min_demand, dos_th=dos_th, ppc_cut=ppc_cut,
-                    price_up=price_up, oos_dos=oos_dos, heat_ad_up=heat_ad_up,
+                    price_up=price_up, oos_dos_eu=oos_dos_eu, oos_dos_gb=oos_dos_gb,
+                    heat_ad_up=heat_ad_up,
                     heat_price_down=heat_price_down, heat_win=heat_win,
                     blocked_reach=blocked_reach)
 
@@ -820,14 +827,18 @@ if ledger_path is None:
     )
 
 # ---------- Filter bar ----------
-REGION_LABEL = {"EU": "🇪🇺 EU (Pan-EU)", "GB": "🇬🇧 GB (UK warehouse)"}
-regions = [r for r in ["EU", "GB"] if r in set(long_all["region"].unique())]
+REGION_LABEL = {"EU": "🇪🇺 EU (Pan-EU)", "GB": "🇬🇧 GB (UK warehouse)",
+                "ALL": "🇪🇺+🇬🇧 EU + UK (combined)"}
+_present = [r for r in ["EU", "GB"] if r in set(long_all["region"].unique())]
+# Offer the combined view only when both pools are actually present.
+regions = _present + (["ALL"] if len(_present) > 1 else [])
 c1, c2, c3, c4, c5 = st.columns([1.1, 0.95, 1.2, 0.9, 1.25])
 region = c1.selectbox("Region", regions, index=0,
                       format_func=lambda r: REGION_LABEL.get(r, r),
                       help="EU = the Pan-EU pool (all marketplaces except "
                            "amazon.co.uk). GB = the separate UK warehouse "
-                           "(amazon.co.uk). They are tracked as independent pools.")
+                           "(amazon.co.uk). EU + UK combined sums both pools, "
+                           "each still flagged on its own reach threshold.")
 pmin, pmax = long_all["Period"].min(), asof
 ptype = c2.selectbox("Period", ["Full range", "Year", "Quarter", "Month", "Week"], index=0)
 sel_periods, sel_freq = None, None
@@ -870,19 +881,41 @@ min_demand = c4.slider(
 search = c5.text_input("SKU or Product contains", "")
 
 # Region-scoped current-stock lookups for the ranking / status columns.
-inv_r = inv[inv["region"] == region] if not inv.empty else inv
-inv_stock = inv_r.set_index("SKU")["cur_stock"] if not inv_r.empty else pd.Series(dtype=float)
-inv_dos = inv_r.set_index("SKU")["days_of_supply"] if not inv_r.empty else pd.Series(dtype=float)
+# Combined view sums stock across both pools and blends reach = total stock /
+# total daily demand (a single SKU can sit in both EU and GB).
+if inv.empty:
+    inv_stock = pd.Series(dtype=float)
+    inv_dos = pd.Series(dtype=float)
+elif region == "ALL":
+    g = inv.groupby("SKU").agg(cur_stock=("cur_stock", "sum"),
+                               dmd=("avg_daily_demand", "sum"))
+    inv_stock = g["cur_stock"]
+    inv_dos = g["cur_stock"] / g["dmd"].where(g["dmd"] > 0)
+else:
+    inv_r = inv[inv["region"] == region]
+    inv_stock = inv_r.set_index("SKU")["cur_stock"] if not inv_r.empty else pd.Series(dtype=float)
+    inv_dos = inv_r.set_index("SKU")["days_of_supply"] if not inv_r.empty else pd.Series(dtype=float)
 
 with st.expander("Stock-out, cooling-down & heating-up thresholds"):
     cc1, cc2, cc3, cc4 = st.columns(4)
-    _reach_default = OOS_DOS_EU if region == "EU" else OOS_DOS_GB
-    oos_reach = cc1.slider("OOS when reach below (days)", 1, 21, _reach_default, 1,
-                           key=f"oos_reach_{region}",
-                           help="Reach (days-of-supply) below this counts as out "
-                                "of stock, even if the balance isn't literally 0. "
-                                "Defaults per Ops: EU 4 (≈ dispatch-to-sellable), "
-                                "GB 12 (longer transfers + customs).")
+    _reach_help = ("Reach (days-of-supply) below this counts as out of stock, "
+                   "even if the balance isn't literally 0. Defaults per Ops: "
+                   "EU 4 (≈ dispatch-to-sellable), GB 12 (longer transfers + "
+                   "customs).")
+    if region == "ALL":
+        # Each pool keeps its own threshold in the combined view.
+        rcol1, rcol2 = cc1.columns(2)
+        eu_reach = rcol1.slider("OOS reach EU", 1, 21, OOS_DOS_EU, 1,
+                                key="oos_reach_EU_combined", help=_reach_help)
+        gb_reach = rcol2.slider("OOS reach GB", 1, 21, OOS_DOS_GB, 1,
+                                key="oos_reach_GB_combined", help=_reach_help)
+        oos_reach = eu_reach  # status-badge tier for blended-stock SKUs
+    else:
+        _reach_default = OOS_DOS_EU if region == "EU" else OOS_DOS_GB
+        oos_reach = cc1.slider("OOS when reach below (days)", 1, 21, _reach_default, 1,
+                               key=f"oos_reach_{region}", help=_reach_help)
+        eu_reach = oos_reach if region == "EU" else OOS_DOS_EU
+        gb_reach = oos_reach if region == "GB" else OOS_DOS_GB
     cd_dos = cc2.slider("Cool-down when reach below (days)", 5, 60, COOLDOWN_DOS, 5)
     cd_price = cc3.slider("Cool-down: price hike vs baseline (%)", 2, 30,
                           int(COOLDOWN_PRICE_UP * 100), 1) / 100
@@ -908,9 +941,10 @@ with st.expander("Stock-out, cooling-down & heating-up thresholds"):
 
 # ---------- Apply scope ----------
 scope = compute_flagged(margin_path, ledger_path, m_margin, m_ledger,
-                        min_demand, cd_dos, cd_ppc, cd_price, oos_reach,
+                        min_demand, cd_dos, cd_ppc, cd_price, eu_reach, gb_reach,
                         heat_ad, heat_pr, heat_win, blk_reach)
-scope = scope[scope["region"] == region]
+if region != "ALL":
+    scope = scope[scope["region"] == region]
 if sel_periods is not None:
     scope = scope[scope["Period"].dt.to_period(sel_freq).isin(sel_periods)]
 else:
@@ -1317,8 +1351,11 @@ with tab6:
     # country view. Full-period shares are also not distorted by the OOS gap
     # itself. Losses (agg) stay window-scoped.
     mg = load_margin(margin_path, m_margin)
-    mg = mg[mg["Marketplace Name"] != "amazon.co.uk"] if region == "EU" \
-        else mg[mg["Marketplace Name"] == "amazon.co.uk"]
+    if region == "EU":
+        mg = mg[mg["Marketplace Name"] != "amazon.co.uk"]
+    elif region == "GB":
+        mg = mg[mg["Marketplace Name"] == "amazon.co.uk"]
+    # region == "ALL": keep every marketplace (UK shown alongside EU countries)
     mg = mg.assign(SKU=mg["SKU"].astype(str))
     cm = mg.groupby(["SKU", "Marketplace Name"], observed=True).agg(
         units=("Units", "sum"), sales=("Sales", "sum"), cm3=("CM3", "sum")).reset_index()
