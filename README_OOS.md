@@ -82,6 +82,15 @@ Thresholds live at the top of `oos_analytics.py`
 
 ## The dashboard
 
+A **Country** filter sits next to the Region toggle. Pick a country and the "
+"whole dashboard's **€ impact** (lost / miss / blocked / ramp) is re-scoped to "
+"that country — each SKU's loss split by its share of that country (units by "
+"unit share, revenue by revenue share, CM3 by CM3 share), so the countries "
+"always sum back to the Pan-EU total. Because stock is pooled Pan-EU, a "
+"stock-out is one **network** event, so the availability metrics — OOS days, "
+"OOS rate, reach, WISR, the calendar and events — stay network-level and are "
+"identical across countries; only the money is country-specific.
+
 A **Region** toggle at the top switches between **🇪🇺 EU** (the Pan-EU pool) and
 **🇬🇧 GB** (the separate UK warehouse / amazon.co.uk) — each tracked as an
 independent pool (own stock, demand λ, reach and impact).
