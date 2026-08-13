@@ -837,18 +837,63 @@ if ledger_path is None:
     )
 
 # ---------- Filter bar ----------
+COUNTRY_ALL = "🌍 All countries"
+
+
+@st.cache_data(show_spinner=False)
+def country_alloc(margin_path: Path, m_margin: float | None, region: str) -> pd.DataFrame:
+    """Per-SKU × country allocation *shares* from the margin export (full period,
+    so a fully-OOS SKU keeps its country mix). Each metric gets its own share so
+    the countries always sum back to the SKU's model total:
+      • ushare — country's share of the SKU's units  (splits lost units)
+      • rshare — country's share of the SKU's revenue (splits lost revenue)
+      • cshare — country's share of the SKU's CM3     (splits lost CM3)
+    CM3 falls back to the unit share when the SKU's total CM3 isn't positive (so
+    a loss-leader SKU doesn't produce nonsensical negative country shares)."""
+    mg = load_margin(margin_path, m_margin)
+    if region == "EU":
+        mg = mg[mg["Marketplace Name"] != "amazon.co.uk"]
+    elif region == "GB":
+        mg = mg[mg["Marketplace Name"] == "amazon.co.uk"]
+    mg = mg.assign(SKU=mg["SKU"].astype(str),
+                   Country=mg["Marketplace Name"].map(MKT_COUNTRY).fillna(mg["Marketplace Name"]))
+    cm = mg.groupby(["SKU", "Country"], observed=True).agg(
+        units=("Units", "sum"), sales=("Sales", "sum"), cm3=("CM3", "sum")).reset_index()
+    cm = cm[cm["units"] > 0]
+    grp = cm.groupby("SKU")
+    tot_u = grp["units"].transform("sum")
+    tot_s = grp["sales"].transform("sum")
+    tot_c = grp["cm3"].transform("sum")
+    cm["ushare"] = cm["units"] / tot_u.where(tot_u > 0)
+    cm["rshare"] = cm["sales"] / tot_s.where(tot_s > 0)
+    cm["cshare"] = np.where(tot_c > 0, cm["cm3"] / tot_c.where(tot_c > 0), cm["ushare"])
+    return cm[["SKU", "Country", "units", "ushare", "rshare", "cshare"]]
+
+
 REGION_LABEL = {"EU": "🇪🇺 EU (Pan-EU)", "GB": "🇬🇧 GB (UK warehouse)",
                 "ALL": "🇪🇺+🇬🇧 EU + UK (combined)"}
 _present = [r for r in ["EU", "GB"] if r in set(long_all["region"].unique())]
 # Offer the combined view only when both pools are actually present.
 regions = _present + (["ALL"] if len(_present) > 1 else [])
-c1, c2, c3, c4, c5 = st.columns([1.1, 0.95, 1.2, 0.9, 1.25])
+c1, cco, c2, c3, c4, c5 = st.columns([1.0, 1.15, 0.8, 1.05, 0.85, 1.1])
 region = c1.selectbox("Region", regions, index=0,
                       format_func=lambda r: REGION_LABEL.get(r, r),
                       help="EU = the Pan-EU pool (all marketplaces except "
                            "amazon.co.uk). GB = the separate UK warehouse "
                            "(amazon.co.uk). EU + UK combined sums both pools, "
                            "each still flagged on its own reach threshold.")
+# Country filter: scopes the € impact to one country (availability stays
+# network-level — see the banner). Options ordered by that country's volume.
+_ca = country_alloc(margin_path, m_margin, region)
+_country_order = (_ca.groupby("Country")["units"].sum()
+                  .sort_values(ascending=False).index.tolist())
+country_sel = cco.selectbox(
+    "Country", [COUNTRY_ALL] + _country_order,
+    help="Splits the € impact (lost / miss / blocked / ramp) onto one country "
+         "by each SKU's actual unit-share there, valued at that country's own "
+         "price & margin. Stock-outs are Pan-EU network events, so OOS days, "
+         "OOS rate, reach and WISR stay network-level (identical across "
+         "countries) — only the money is country-specific.")
 pmin, pmax = long_all["Period"].min(), asof
 ptype = c2.selectbox("Period", ["Full range", "Year", "Quarter", "Month", "Week"], index=0)
 sel_periods, sel_freq = None, None
@@ -985,6 +1030,33 @@ else:
 if scope.empty:
     st.warning("No data in the current scope. Widen the filters.")
     st.stop()
+
+# ---------- Country allocation (rescope € impact to one country) ----------
+# Stock is pooled Pan-EU, so a stock-out is one network event — the OOS flags,
+# days, reach and WISR are network-level and identical for every country. Only
+# the *money* is country-specific: split each SKU's lost/miss/blocked/ramp units
+# by its unit-share in the chosen country, valued at that country's price & CM3.
+if country_sel != COUNTRY_ALL:
+    _sub = _ca[_ca["Country"] == country_sel].set_index("SKU")
+    _sk = scope["SKU"].astype(str)
+    _us = _sk.map(_sub["ushare"]).fillna(0.0).to_numpy()   # units
+    _rs = _sk.map(_sub["rshare"]).fillna(0.0).to_numpy()   # revenue
+    _cs = _sk.map(_sub["cshare"]).fillna(0.0).to_numpy()   # CM3
+    scope = scope.copy()
+    # Each metric split by its own country share → countries sum to the total.
+    for _col, _w in [("lost_units", _us), ("lost_rev", _rs), ("lost_cm3", _cs),
+                     ("miss_units", _us), ("rev_miss", _rs), ("cm3_miss", _cs),
+                     ("blk_units", _us), ("blk_rev", _rs), ("blk_cm3", _cs),
+                     ("ramp_units", _us), ("ramp_rev", _rs), ("ramp_cm3", _cs),
+                     ("extra_ad", _us)]:
+        scope[_col] = (scope[_col].to_numpy() * _w).astype("float32")
+    st.info(
+        f"💶 **€ impact allocated to {country_sel}** — lost / miss / blocked / "
+        "ramp values below are this country's share of each SKU (units by unit "
+        "share, revenue by revenue share, CM3 by CM3 share), so the countries "
+        "sum back to the Pan-EU total. **Availability — OOS rate, WISR, reach, "
+        "the calendar and events — is network-level and identical across "
+        "countries** (stock-outs hit the whole pool at once).")
 
 # ---------- Per-SKU aggregation ----------
 oos_rows = scope[scope["oos"]]
@@ -1363,91 +1435,98 @@ with tab5:
 #  Tab 6 — Country overview (allocate Pan-EU OOS loss to countries)
 # ======================================================================
 with tab6:
-    st.caption(
-        "OOS impact per country from the **actual items lost in each country** — "
-        "each SKU's EU lost units split by its **unit share per marketplace**, then "
-        "valued at **that country's own price & contribution margin**. So the same "
-        "stock-out weighs differently by country (high-margin DE vs thin ES). "
-        "Pick a country to drill into its SKUs."
-    )
-    # Country mix from the FULL period (not the selected window): a SKU that
-    # was out of stock the whole selected month would otherwise have no
-    # in-window sales, get dropped, and the biggest loss would vanish from the
-    # country view. Full-period shares are also not distorted by the OOS gap
-    # itself. Losses (agg) stay window-scoped.
-    mg = load_margin(margin_path, m_margin)
-    if region == "EU":
-        mg = mg[mg["Marketplace Name"] != "amazon.co.uk"]
-    elif region == "GB":
-        mg = mg[mg["Marketplace Name"] == "amazon.co.uk"]
-    # region == "ALL": keep every marketplace (UK shown alongside EU countries)
-    mg = mg.assign(SKU=mg["SKU"].astype(str))
-    cm = mg.groupby(["SKU", "Marketplace Name"], observed=True).agg(
-        units=("Units", "sum"), sales=("Sales", "sum"), cm3=("CM3", "sum")).reset_index()
-    cm = cm[cm["units"] > 0]
-    cm["price"] = cm["sales"] / cm["units"]
-    cm["cm3pu"] = cm["cm3"] / cm["units"]
-    totu = cm.groupby("SKU")["units"].transform("sum")
-    cm["ushare"] = cm["units"] / totu.where(totu > 0)
-    alloc = cm.merge(agg[["SKU", "lost_units"]], on="SKU", how="inner")
-    alloc["units_lost"] = alloc["lost_units"] * alloc["ushare"]
-    alloc["c_rev"] = alloc["units_lost"] * alloc["price"]
-    alloc["c_cm3"] = alloc["units_lost"] * alloc["cm3pu"]
-    alloc["Country"] = alloc["Marketplace Name"].map(MKT_COUNTRY).fillna(alloc["Marketplace Name"])
-
-    if alloc.empty:
-        st.info("No allocatable OOS loss in the current scope.")
+    if country_sel != COUNTRY_ALL:
+        st.info(
+            f"A country is selected in the top filter (**{country_sel}**), so the "
+            "whole dashboard is already scoped to it — the KPIs and every tab show "
+            f"{country_sel}'s allocated impact. Set **Country → 🌍 All countries** "
+            "to compare across countries here.")
     else:
-        country = (alloc.groupby("Country", observed=True).agg(
-            units_lost=("units_lost", "sum"), lost_rev=("c_rev", "sum"),
-            lost_cm3=("c_cm3", "sum"), oos_skus=("SKU", "nunique"))
-            .reset_index().sort_values("lost_cm3", ascending=False))
-        pick = st.selectbox("Country", ["🌍 All countries"] + country["Country"].tolist())
+        st.caption(
+            "OOS impact per country from the **actual items lost in each country** — "
+            "each SKU's EU lost units split by its **unit share per marketplace**, then "
+            "valued at **that country's own price & contribution margin**. So the same "
+            "stock-out weighs differently by country (high-margin DE vs thin ES). "
+            "Pick a country to drill into its SKUs."
+        )
+        # Country mix from the FULL period (not the selected window): a SKU that
+        # was out of stock the whole selected month would otherwise have no
+        # in-window sales, get dropped, and the biggest loss would vanish from the
+        # country view. Full-period shares are also not distorted by the OOS gap
+        # itself. Losses (agg) stay window-scoped.
+        mg = load_margin(margin_path, m_margin)
+        if region == "EU":
+            mg = mg[mg["Marketplace Name"] != "amazon.co.uk"]
+        elif region == "GB":
+            mg = mg[mg["Marketplace Name"] == "amazon.co.uk"]
+        # region == "ALL": keep every marketplace (UK shown alongside EU countries)
+        mg = mg.assign(SKU=mg["SKU"].astype(str))
+        cm = mg.groupby(["SKU", "Marketplace Name"], observed=True).agg(
+            units=("Units", "sum"), sales=("Sales", "sum"), cm3=("CM3", "sum")).reset_index()
+        cm = cm[cm["units"] > 0]
+        cm["price"] = cm["sales"] / cm["units"]
+        cm["cm3pu"] = cm["cm3"] / cm["units"]
+        totu = cm.groupby("SKU")["units"].transform("sum")
+        cm["ushare"] = cm["units"] / totu.where(totu > 0)
+        alloc = cm.merge(agg[["SKU", "lost_units"]], on="SKU", how="inner")
+        alloc["units_lost"] = alloc["lost_units"] * alloc["ushare"]
+        alloc["c_rev"] = alloc["units_lost"] * alloc["price"]
+        alloc["c_cm3"] = alloc["units_lost"] * alloc["cm3pu"]
+        alloc["Country"] = alloc["Marketplace Name"].map(MKT_COUNTRY).fillna(alloc["Marketplace Name"])
 
-        if pick == "🌍 All countries":
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Countries", fmt_num(len(country)))
-            k2.metric("Lost revenue", eur(country["lost_rev"].sum()))
-            k3.metric("Lost CM3", eur(country["lost_cm3"].sum()))
-            figc = px.bar(country.sort_values("lost_cm3"), x="lost_cm3", y="Country",
-                          orientation="h", labels={"lost_cm3": "Lost CM3 (€)", "Country": ""},
-                          title="OOS lost CM3 by country (actual items × country margin)")
-            figc.update_traces(marker_color=brand.CHART_ORANGE)
-            figc.update_xaxes(tickprefix="€ ", tickformat=",.0f")
-            st.plotly_chart(brand.style(figc, height=max(320, 44 * len(country)),
-                                        legend=False), width="stretch")
-            disp = country[["Country", "oos_skus", "units_lost", "lost_rev", "lost_cm3"]].rename(
-                columns={"oos_skus": "OOS SKUs", "units_lost": "Lost units",
-                         "lost_rev": "Lost revenue (€)", "lost_cm3": "Lost CM3 (€)"}).round(0)
-            fname = f"oos_by_country_{start.date()}_{end.date()}.csv"
+        if alloc.empty:
+            st.info("No allocatable OOS loss in the current scope.")
         else:
-            d = alloc[alloc["Country"] == pick].copy()
-            d["Product"] = d["SKU"].map(prod_short)
-            k1, k2, k3 = st.columns(3)
-            k1.metric("SKUs affected", fmt_num(d["SKU"].nunique()))
-            k2.metric("Lost revenue", eur(d["c_rev"].sum()))
-            k3.metric("Lost CM3", eur(d["c_cm3"].sum()))
-            disp = d[["SKU", "Product", "units_lost", "c_rev", "c_cm3"]].rename(
-                columns={"units_lost": "Lost units", "c_rev": "Lost revenue (€)",
-                         "c_cm3": "Lost CM3 (€)"}).sort_values("Lost CM3 (€)", ascending=False).round(0)
-            fname = f"oos_{pick.split()[-1]}_{start.date()}_{end.date()}.csv"
+            country = (alloc.groupby("Country", observed=True).agg(
+                units_lost=("units_lost", "sum"), lost_rev=("c_rev", "sum"),
+                lost_cm3=("c_cm3", "sum"), oos_skus=("SKU", "nunique"))
+                .reset_index().sort_values("lost_cm3", ascending=False))
+            pick = st.selectbox("Country", ["🌍 All countries"] + country["Country"].tolist())
 
-        st.dataframe(
-            disp, width="stretch", hide_index=True, height=420,
-            column_config={
-                "Lost revenue (€)": st.column_config.NumberColumn(format="localized"),
-                "Lost CM3 (€)": st.column_config.NumberColumn(format="localized"),
-                "Lost units": st.column_config.NumberColumn(format="localized")})
-        st.download_button("⬇️ Download (CSV)", disp.to_csv(index=False).encode("utf-8"),
-                           file_name=fname, mime="text/csv")
-        st.caption("Lost items per country = SKU's EU lost units × its unit share in "
-                   "that country, valued at that country's avg price / CM3 per unit "
-                   "over the period. Country totals can differ from the EU-blended "
-                   "total because each country's margin profile is used.")
+            if pick == "🌍 All countries":
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Countries", fmt_num(len(country)))
+                k2.metric("Lost revenue", eur(country["lost_rev"].sum()))
+                k3.metric("Lost CM3", eur(country["lost_cm3"].sum()))
+                figc = px.bar(country.sort_values("lost_cm3"), x="lost_cm3", y="Country",
+                              orientation="h", labels={"lost_cm3": "Lost CM3 (€)", "Country": ""},
+                              title="OOS lost CM3 by country (actual items × country margin)")
+                figc.update_traces(marker_color=brand.CHART_ORANGE)
+                figc.update_xaxes(tickprefix="€ ", tickformat=",.0f")
+                st.plotly_chart(brand.style(figc, height=max(320, 44 * len(country)),
+                                            legend=False), width="stretch")
+                disp = country[["Country", "oos_skus", "units_lost", "lost_rev", "lost_cm3"]].rename(
+                    columns={"oos_skus": "OOS SKUs", "units_lost": "Lost units",
+                             "lost_rev": "Lost revenue (€)", "lost_cm3": "Lost CM3 (€)"}).round(0)
+                fname = f"oos_by_country_{start.date()}_{end.date()}.csv"
+            else:
+                d = alloc[alloc["Country"] == pick].copy()
+                d["Product"] = d["SKU"].map(prod_short)
+                k1, k2, k3 = st.columns(3)
+                k1.metric("SKUs affected", fmt_num(d["SKU"].nunique()))
+                k2.metric("Lost revenue", eur(d["c_rev"].sum()))
+                k3.metric("Lost CM3", eur(d["c_cm3"].sum()))
+                disp = d[["SKU", "Product", "units_lost", "c_rev", "c_cm3"]].rename(
+                    columns={"units_lost": "Lost units", "c_rev": "Lost revenue (€)",
+                             "c_cm3": "Lost CM3 (€)"}).sort_values("Lost CM3 (€)", ascending=False).round(0)
+                fname = f"oos_{pick.split()[-1]}_{start.date()}_{end.date()}.csv"
 
-# ======================================================================
-#  Tab 7 — Top sellers (OOS tracker for the highest-value SKUs)
-# ======================================================================
+            st.dataframe(
+                disp, width="stretch", hide_index=True, height=420,
+                column_config={
+                    "Lost revenue (€)": st.column_config.NumberColumn(format="localized"),
+                    "Lost CM3 (€)": st.column_config.NumberColumn(format="localized"),
+                    "Lost units": st.column_config.NumberColumn(format="localized")})
+            st.download_button("⬇️ Download (CSV)", disp.to_csv(index=False).encode("utf-8"),
+                               file_name=fname, mime="text/csv")
+            st.caption("Lost items per country = SKU's EU lost units × its unit share in "
+                       "that country, valued at that country's avg price / CM3 per unit "
+                       "over the period. Country totals can differ from the EU-blended "
+                       "total because each country's margin profile is used.")
+
+    # ======================================================================
+    #  Tab 7 — Top sellers (OOS tracker for the highest-value SKUs)
+    # ======================================================================
 with tab7:
     st.caption(
         "Our **highest-value SKUs** ranked by expected revenue (demand rate λ × "
