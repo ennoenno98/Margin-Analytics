@@ -875,13 +875,21 @@ REGION_LABEL = {"EU": "🇪🇺 EU (Pan-EU)", "GB": "🇬🇧 GB (UK warehouse)"
 _present = [r for r in ["EU", "GB"] if r in set(long_all["region"].unique())]
 # Offer the combined view only when both pools are actually present.
 regions = _present + (["ALL"] if len(_present) > 1 else [])
-c1, cco, c2, c3, c4, c5 = st.columns([1.0, 1.15, 0.8, 1.05, 0.85, 1.1])
+c1, cbr, cco, c2, c3, c4, c5 = st.columns([0.85, 0.9, 1.0, 0.72, 0.95, 0.78, 1.0])
 region = c1.selectbox("Region", regions, index=0,
                       format_func=lambda r: REGION_LABEL.get(r, r),
                       help="EU = the Pan-EU pool (all marketplaces except "
                            "amazon.co.uk). GB = the separate UK warehouse "
                            "(amazon.co.uk). EU + UK combined sums both pools, "
                            "each still flagged on its own reach threshold.")
+# Brand filter: scope the whole dashboard to one brand (Vegavero / wowtamins).
+BRAND_ALL = "All brands"
+_bcounts = brand_map.dropna().astype(str)
+_bcounts = _bcounts[_bcounts.str.strip() != ""].value_counts()
+brand_sel = cbr.selectbox(
+    "Brand", [BRAND_ALL] + list(_bcounts.index),
+    help="Filter the whole dashboard to one brand — everything below (KPIs, "
+         "ranking, tabs) is scoped to that brand's SKUs.")
 # Country filter: scopes the € impact to one country (availability stays
 # network-level — see the banner). Options ordered by that country's volume.
 _ca = country_alloc(margin_path, m_margin, region)
@@ -1010,6 +1018,11 @@ if search.strip():
     hits = [k for k in cats
             if s in str(k).lower() or s in str(prod_map.get(k, "")).lower()]
     scope = scope[scope["SKU"].isin(hits)]
+if brand_sel != BRAND_ALL:
+    _bm = brand_map.copy()
+    _bm.index = _bm.index.astype(str)
+    _keep = scope["SKU"].astype(str).map(_bm).eq(brand_sel).to_numpy()
+    scope = scope[_keep]
 
 # ---------- Discontinued products (delisted → out of the OOS universe) ----------
 # A SKU keeps showing up in the Novadata export after it's delisted; from its
