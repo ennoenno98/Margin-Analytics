@@ -80,6 +80,7 @@ import brand
 REPO_ROOT = Path(__file__).resolve().parent
 EXPORTS_DIR = REPO_ROOT / "novadata_exports"
 LEDGER_DIR = REPO_ROOT / "amazon_ledger"
+DATADIVE_DIR = REPO_ROOT / "datadive_ranks"
 
 # Demand baseline window + OOS heuristic defaults.
 BASELINE_WINDOW = 90       # trailing window for expected demand / price / CM3
@@ -1228,9 +1229,38 @@ st.caption(
     "every total. All valued as CM3 / € — the true P&L impact."
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+@st.cache_data(show_spinner=False)
+def load_keyword_footprint():
+    """Newest DataDive Rank Radar snapshot (organic keyword footprint per
+    ASIN × marketplace). Point-in-time — refresh by re-pulling from DataDive."""
+    files = sorted(DATADIVE_DIR.glob("keyword_footprint_*.csv"))
+    if not files:
+        return pd.DataFrame(), None
+    f = files[-1]
+    df = pd.read_csv(f)
+    df["region"] = np.where(df["marketplace"] == "co.uk", "GB", "EU")
+    df["Country"] = ("amazon." + df["marketplace"].astype(str)).map(MKT_COUNTRY).fillna(df["marketplace"])
+    return df, f.stem.replace("keyword_footprint_", "")
+
+
+@st.cache_data(show_spinner=False)
+def asin_sku_map(path: Path, mtime: float | None):
+    """Child ASIN → SKU from the margin export (the most common SKU per ASIN)."""
+    d = pd.read_csv(path, usecols=lambda c: c in {"SKU", "Child ASIN"})
+    if "Child ASIN" not in d.columns:
+        return pd.Series(dtype=object)
+    d = d.dropna(subset=["Child ASIN", "SKU"])
+    d["SKU"] = d["SKU"].astype(str)
+    d["Child ASIN"] = d["Child ASIN"].astype(str)
+    if d.empty:
+        return pd.Series(dtype=object)
+    return d.groupby("Child ASIN")["SKU"].agg(lambda s: s.value_counts().index[0])
+
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     ["Most affected SKUs", "Stock-out calendar", "Stock-out events",
-     "Cooling down", "Heating up", "Country overview", "Top sellers"]
+     "Cooling down", "Heating up", "Country overview", "Top sellers",
+     "Keyword erosion"]
 )
 
 # ======================================================================
@@ -1570,3 +1600,80 @@ with tab7:
     st.download_button(
         "⬇️ Download top sellers (CSV)", disp.to_csv(index=False).encode("utf-8"),
         file_name=f"oos_topsellers_{start.date()}_{end.date()}.csv", mime="text/csv")
+
+# ======================================================================
+#  Tab 8 — Keyword erosion (DataDive Rank Radar)
+# ======================================================================
+with tab8:
+    _fp, _stamp = load_keyword_footprint()
+    st.caption(
+        "**The lasting cost of a stock-out.** When a SKU runs out, Amazon demotes "
+        "its listing — organic keywords slide out of the top-10/top-50 and don't "
+        "come back until the listing rebuilds its rank. That erosion is the "
+        "mechanism behind post-restock *recovery drag* (sales staying below λ after "
+        "stock returns). This view flags stocked-out SKUs whose organic keyword "
+        "footprint has collapsed. Source: **DataDive Rank Radar** snapshot"
+        + (f" ({_stamp})." if _stamp else "."))
+    if _fp.empty:
+        st.info("No DataDive rank snapshot in `datadive_ranks/`. Add a "
+                "`keyword_footprint_*.csv` (ASIN, marketplace, keyword counts) to "
+                "enable this view.")
+    else:
+        amap = asin_sku_map(margin_path, m_margin)
+        fp = _fp.copy()
+        fp["SKU"] = fp["ASIN"].map(amap)
+        fp = fp.dropna(subset=["SKU"])
+        if region != "ALL":
+            fp = fp[fp["region"] == region]
+        # OOS context for the selected scope + erosion metrics.
+        _oosdays = agg.set_index("SKU")["oos_days"] if not agg.empty else pd.Series(dtype=float)
+        fp["oos_days"] = fp["SKU"].map(_oosdays).fillna(0).astype(int)
+        fp["Product"] = fp["SKU"].map(prod_short).fillna(fp["SKU"])
+        _kt = fp["keywords_tracked"].where(fp["keywords_tracked"] > 0)
+        fp["erosion"] = (1 - fp["top50_kw"] / _kt).clip(0, 1) * 100
+        fp["front_page"] = np.where(fp["top10_kw"] == 0, "❌ off page 1", "✓ ranking")
+        # A SKU is "eroded" when it stocked out AND its top-10 footprint is gone.
+        fp["eroded"] = (fp["oos_days"] > 0) & (fp["top10_kw"] == 0)
+        oos_fp = fp[fp["oos_days"] > 0].sort_values(
+            ["eroded", "erosion", "oos_days"], ascending=[False, False, False])
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("SKUs with rank data (this region)", fmt_num(fp["SKU"].nunique()))
+        k2.metric("Stocked out & de-ranked", fmt_num(int(fp["eroded"].sum())),
+                  help="SKUs that had a stock-out in the current scope AND now have "
+                       "zero keywords in the organic top-10 — front-page visibility lost.")
+        k3.metric("Top-10 search vol. still held",
+                  fmt_num(int(oos_fp["top10_sv"].sum())) if not oos_fp.empty else "0",
+                  help="Combined monthly search volume of keywords these stocked-out "
+                       "SKUs still rank top-10 for — what's left to lose.")
+
+        if oos_fp.empty:
+            st.info("No stocked-out SKUs in the current scope have rank data. "
+                    "Widen the filters or region.")
+        else:
+            show = oos_fp[["Product", "Country", "oos_days", "keywords_tracked",
+                           "top10_kw", "top50_kw", "top10_sv", "erosion", "front_page"]].rename(
+                columns={"oos_days": "OOS days", "keywords_tracked": "KW tracked",
+                         "top10_kw": "Top-10 now", "top50_kw": "Top-50 now",
+                         "top10_sv": "Top-10 search vol.", "erosion": "Erosion %",
+                         "front_page": "Front page"})
+            show["Erosion %"] = show["Erosion %"].round(0).astype(int)
+            st.dataframe(
+                show, width="stretch", hide_index=True, height=460,
+                column_config={
+                    "Erosion %": st.column_config.ProgressColumn(
+                        "Erosion %", format="%d%%", min_value=0, max_value=100,
+                        help="Share of tracked keywords that have fallen out of the "
+                             "organic top-50."),
+                    "Top-10 search vol.": st.column_config.NumberColumn(format="localized"),
+                    "OOS days": st.column_config.NumberColumn(format="localized")})
+            st.download_button(
+                "⬇️ Download keyword erosion (CSV)", show.to_csv(index=False).encode("utf-8"),
+                file_name=f"oos_keyword_erosion_{region}.csv", mime="text/csv")
+            st.caption(
+                "Erosion % = share of the SKU's tracked keywords no longer in the "
+                "organic top-50. ❌ off page 1 = zero keywords left in the top-10 "
+                "(the listing is organically invisible and running on ads only). "
+                "Rank data is a point-in-time DataDive snapshot per marketplace; it "
+                "covers the ~53 ASINs currently tracked in Rank Radar, not the whole "
+                "catalogue.")
