@@ -83,7 +83,10 @@ falls back to the trailing-zeros safeguard alone.
   throttle or stock-out in that window forgoes the positioned rate, not the
   long-run average.
 - **Lost revenue (€)** = lost units × trailing avg selling price.
-- **Lost CM3 (€)** = lost units × trailing avg contribution margin per unit —
+- **Lost CM3 (€)** = lost units × trailing avg contribution margin per unit,
+  measured on *clean selling days only* (units sold and that day's CM3 loss no
+  larger than its revenue) so lump charges Novadata books as CM3 — write-offs,
+  disposals, storage fees — don't turn a lost unit into a "saving" —
   the true **P&L impact**, the headline number the ranking sorts by.
 
 Thresholds live at the top of `oos_analytics.py`

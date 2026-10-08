@@ -380,7 +380,16 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None,
     roll_units = units_base.rolling(BASELINE_WINDOW, min_periods=1).sum()
     roll_days = units_base.rolling(BASELINE_WINDOW, min_periods=1).count()
     roll_sales = sales.rolling(BASELINE_WINDOW, min_periods=1).sum()
-    roll_cm3 = cm3.rolling(BASELINE_WINDOW, min_periods=1).sum()
+    # CM3 per unit is measured on CLEAN selling days only: units sold AND the
+    # day's CM3 loss no larger than its revenue. Novadata books lump charges
+    # (write-offs, disposals, storage fees) as CM3 on whatever day they land —
+    # often zero-sale days (e.g. -€70k in a month with no sales) or days with a
+    # handful of units (-€291/unit). Folding those into the trailing average
+    # made a lost unit look like a *saving*. Genuine ad-driven negative margins
+    # (loss < revenue per day, e.g. launch-phase SKUs) are kept.
+    clean = (units > 0) & (cm3 >= -sales)
+    roll_cm3 = cm3.where(clean).rolling(BASELINE_WINDOW, min_periods=1).sum()
+    roll_cm3_units = units.where(clean).rolling(BASELINE_WINDOW, min_periods=1).sum()
     # Ad-spend baseline = trailing avg over days that actually had spend; NaN
     # before Novadata began reporting Advertising Costs (so no false ad-cuts).
     roll_ppc = ppc.rolling(BASELINE_WINDOW, min_periods=1).sum()
@@ -398,7 +407,7 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None,
     # don't look like stock-outs.
     expected = (roll_units / roll_days.where(roll_days > 0)).ffill()
     avg_price = (roll_sales / roll_units.where(roll_units > 0)).ffill()
-    avg_cm3_pu = (roll_cm3 / roll_units.where(roll_units > 0)).ffill()
+    avg_cm3_pu = (roll_cm3 / roll_cm3_units.where(roll_cm3_units > 0)).ffill()
 
     # Positioned run-rate: average units on recent days the SKU was actively
     # pushed (price cut and/or ad boost — e.g. Prime Day positioning). Remembered
