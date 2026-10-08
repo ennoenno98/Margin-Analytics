@@ -439,28 +439,40 @@ def compute_oos_long(margin_path: Path, ledger_path: Path | None,
         e = eu.sort_values("Date").copy()
         e["avgship"] = e.groupby(["SKU", "region"])["shipped"].transform(
             lambda s: s.rolling(28, min_periods=5).mean())
-        e["dos"] = e["eu_stock"] / e["avgship"].where(e["avgship"] > 0)
-        long = long.merge(e[["SKU", "region", "Date", "eu_stock", "dos", "receipts"]],
+        long = long.merge(e[["SKU", "region", "Date", "eu_stock", "avgship",
+                             "shipped", "receipts"]],
                           left_on=["SKU", "region", "Period"],
                           right_on=["SKU", "region", "Date"],
                           how="left").drop(columns=["Date"])
     else:
         long["eu_stock"] = np.nan
-        long["dos"] = np.nan
+        long["avgship"] = np.nan
+        long["shipped"] = np.nan
         long["receipts"] = np.nan
 
     # Carry the last known ledger state forward through days the (manually
     # uploaded) ledger doesn't cover yet — otherwise NaN reach silently
     # disables the blocked/reach rules whenever the ledger is stale (the
-    # freshness banner still warns about the staleness itself).
+    # freshness banner still warns about the staleness itself). Daily
+    # `shipped` is NOT carried: beyond coverage it is genuinely unknown.
     long = long.sort_values(["SKU", "region", "Period"]).reset_index(drop=True)
-    long[["eu_stock", "dos"]] = (
-        long.groupby(["SKU", "region"], observed=True)[["eu_stock", "dos"]].ffill())
+    long[["eu_stock", "avgship"]] = (
+        long.groupby(["SKU", "region"], observed=True)[["eu_stock", "avgship"]].ffill())
+    # Reach = days of stock against DEMAND. Dividing by trailing *actual*
+    # shipments alone is wrong during a stock-out: shipments collapse, so a
+    # handful of leftover units divided by ~0 reads as weeks of reach (that
+    # mislabelled real stock-outs as "listing blocked"). Use the larger of
+    # recent shipments and the demand rate λ so suppressed sales can never
+    # inflate reach.
+    _den = np.fmax(long["avgship"].to_numpy(dtype=float),
+                   long["expected"].to_numpy(dtype=float))
+    long["dos"] = long["eu_stock"] / np.where(_den > 0, _den, np.nan)
 
     for col in ("units", "sales", "cm3", "fba", "expected", "expected_promo",
                 "avg_cm3_pu", "avg_price", "ppc", "base_ppc", "price",
-                "eu_stock", "dos", "receipts"):
+                "eu_stock", "dos", "receipts", "shipped"):
         long[col] = long[col].astype("float32")
+    long = long.drop(columns=["avgship"])
     for col in ("SKU", "region"):
         long[col] = long[col].astype("category")
 
@@ -538,12 +550,20 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     )
 
     oos_fba = fba_known & (fba == 0) & had_past
-    demand_gap = (units == 0) & (expected >= min_demand) & had_past & (has_future | recent)
-    # In stock but not selling: zero sales while reach is comfortably high is a
-    # LISTING problem (blocked / suppressed / not buyable offer), not a
-    # stock-out — there's no Seller Central report for suppression, so this
-    # rule is the workaround. Tracked as its own category, excluded from OOS.
-    blocked = demand_gap & ~np.isnan(dos) & (dos > blocked_reach)
+    shipped = long["shipped"].to_numpy()
+    ledger_day = ~np.isnan(shipped)
+    # Sales-data gap: the Amazon ledger shows customer shipments that day but
+    # Novadata reports zero units — the product DID sell, the sales feed is
+    # missing the day. Neither a stock-out nor a blocked listing; book no loss.
+    data_gap = ledger_day & (units == 0) & (shipped >= np.maximum(1.0, 0.3 * expected))
+    demand_gap = ((units == 0) & (expected >= min_demand) & had_past
+                  & (has_future | recent) & ~data_gap)
+    # In stock but not selling: zero sales AND zero ledger shipments while
+    # on-hand stock covers > blocked_reach days of DEMAND is a LISTING problem
+    # (blocked / suppressed / not buyable), not a stock-out. Requires the
+    # ledger to actually cover the day. Tracked separately, excluded from OOS.
+    blocked = (demand_gap & ledger_day & (shipped < 1)
+               & ~np.isnan(dos) & (dos > blocked_reach))
     oos_gap = demand_gap & ~blocked
     # Involuntary OOS excludes days we chose to throttle (those are cooling-down).
     raw_oos = (phys_eu | low_reach | oos_fba | oos_gap) & ~cooldown & ~blocked
@@ -569,7 +589,8 @@ def flag_oos(long: pd.DataFrame, min_demand: float,
     # Only bridge days where sales are still suppressed (the OOS symptom) — so a
     # genuine recovery (sales back near the effective rate) ends the episode
     # even before a Receipt.
-    filled = oos_open & ~np.isnan(dos) & (units < 0.5 * exp_eff) & had_past & ~blocked
+    filled = (oos_open & ~np.isnan(dos) & (units < 0.5 * exp_eff) & had_past
+              & ~blocked & ~data_gap)
     oos = raw_oos | filled
     cooldown = cooldown & ~oos          # a throttle inside an OOS episode is OOS
 

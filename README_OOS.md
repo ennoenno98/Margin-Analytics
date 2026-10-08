@@ -38,11 +38,20 @@ A SKU is **out of stock** on a day when **any** of:
    anomaly (this stops slow movers' normal no-sale days being mistaken for
    stock-outs).
 
+**Reach is measured against demand.** Days of supply = available stock ÷
+max(trailing 28-day shipments, demand rate λ). Using shipments alone was wrong
+during a stock-out: shipments collapse, so a few leftover units divided by ~0
+read as weeks of reach.
+
 **Blocked-listing workaround (no Seller Central suppression report exists):**
-zero sales on a day when reach is comfortably high (> 15 days, tunable) is a
-**listing/offer problem, not a stock-out** — tagged *Listing blocked (in
-stock)*, kept out of the OOS totals, and surfaced as its own header KPI group
-with an unrealized-revenue/CM3 estimate and a per-SKU check-the-listing table.
+a zero-sales day is a **listing/offer problem, not a stock-out** only when the
+Amazon ledger confirms **no shipments that day** *and* on-hand stock covers
+> 15 days of demand (tunable) — tagged *Listing blocked (in stock)*, kept out of
+the OOS totals, and surfaced as its own KPI group with a per-SKU table.
+
+**Sales-data gaps are ignored.** If the ledger shows customer shipments on a day
+Novadata reports zero units, the product did sell and the sales feed is missing
+the day — neither OOS nor blocked, no loss booked.
 
 Cause priority: **Physical (network) > Critically low > Cooling down >
 Demand gap > Listing blocked**.
