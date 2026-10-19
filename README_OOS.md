@@ -92,6 +92,24 @@ falls back to the trailing-zeros safeguard alone.
 Thresholds live at the top of `oos_analytics.py`
 (`DEFAULT_MIN_DEMAND`, `BASELINE_WINDOW`, `LOW_STOCK_DAYS`, …).
 
+## Product clusters (JTL ABCD)
+
+`product_clusters.csv` maps each SKU to its JTL **ABCD-Cluster** (A, B, C, D,
+NPL = new product launch, EOL = end of life). Refresh it from a JTL
+"Eigene Felder Artikel" export:
+
+```bash
+python add_clusters.py ~/Downloads/JTL-Export-Eigene_Felder_Artikel-*.csv
+git add product_clusters.csv && git commit -m "data: refresh clusters" && git push
+```
+
+SKUs without a cluster in JTL (e.g. wowtamins article numbers) show as
+*No cluster*. The **Cluster** filter scopes the whole dashboard; the
+**Clusters** tab shows a 4×4 matrix of ABCD cluster × stock-out severity
+(share of days out of stock: none / <5 % / 5–20 % / >20 %), coloured by € lost,
+plus NPL / EOL / no-cluster below it, a monthly OOS-rate trend per cluster, and
+a drill-down into any cell.
+
 ## The dashboard
 
 A **Country** filter sits next to the Region toggle. Pick a country and the "
