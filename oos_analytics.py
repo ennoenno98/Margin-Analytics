@@ -728,6 +728,25 @@ def load_english_titles(path: Path) -> pd.Series:
     return t.drop_duplicates("SKU").set_index("SKU")["Title"]
 
 
+# ABCD product clusters from JTL (see add_clusters.py). A–D form the 4×4 matrix;
+# NPL / EOL / unassigned are shown alongside it.
+CLUSTERS_ABCD = ["A", "B", "C", "D"]
+CLUSTER_ORDER = CLUSTERS_ABCD + ["NPL", "EOL", "No cluster"]
+CLUSTER_LABEL = {"A": "A", "B": "B", "C": "C", "D": "D",
+                 "NPL": "NPL · new launch", "EOL": "EOL · end of life",
+                 "No cluster": "No cluster"}
+
+
+@st.cache_data(show_spinner=False)
+def load_clusters(path: Path, mtime: float | None = None) -> pd.Series:
+    """SKU -> ABCD cluster from product_clusters.csv (JTL export)."""
+    if not path.exists():
+        return pd.Series(dtype="object")
+    c = pd.read_csv(path, dtype=str).dropna(subset=["SKU", "Cluster"])
+    c["SKU"] = c["SKU"].str.strip()
+    return c.drop_duplicates("SKU", keep="last").set_index("SKU")["Cluster"]
+
+
 def stockout_events(scope: pd.DataFrame) -> pd.DataFrame:
     """Collapse consecutive OOS days into events per SKU (EU level)."""
     d = scope[scope["oos"]].copy()
@@ -840,6 +859,11 @@ if not en_titles.empty:
     prod_map.update(en_titles)             # prefer English where we have it
 prod_short = prod_map.map(short_product)   # readable names for tables
 brand_map = meta.set_index("SKU")["Brand"]
+_cl_path = REPO_ROOT / "product_clusters.csv"
+_clusters = load_clusters(_cl_path, _cl_path.stat().st_mtime if _cl_path.exists() else None)
+cluster_map = pd.Series(
+    [_clusters.get(str(s), "No cluster") for s in meta["SKU"]],
+    index=meta["SKU"].astype(str), dtype="object")
 inv = inventory_status(eu, asof)
 
 # Data-freshness banner: sales (Novadata) refreshes daily via GitHub Actions;
@@ -906,7 +930,7 @@ REGION_LABEL = {"EU": "🇪🇺 EU (Pan-EU)", "GB": "🇬🇧 GB (UK warehouse)"
 _present = [r for r in ["EU", "GB"] if r in set(long_all["region"].unique())]
 # Offer the combined view only when both pools are actually present.
 regions = _present + (["ALL"] if len(_present) > 1 else [])
-c1, cbr, cco, c2, c3, c4, c5 = st.columns([0.85, 0.9, 1.0, 0.72, 0.95, 0.78, 1.0])
+c1, cbr, ccl, cco = st.columns([1.0, 1.0, 1.5, 1.2])
 region = c1.selectbox("Region", regions, index=0,
                       format_func=lambda r: REGION_LABEL.get(r, r),
                       help="EU = the Pan-EU pool (all marketplaces except "
@@ -921,6 +945,14 @@ brand_sel = cbr.selectbox(
     "Brand", [BRAND_ALL] + list(_bcounts.index),
     help="Filter the whole dashboard to one brand — everything below (KPIs, "
          "ranking, tabs) is scoped to that brand's SKUs.")
+# Cluster filter (JTL ABCD clusters). Empty = all clusters.
+_cl_present = [c for c in CLUSTER_ORDER if c in set(cluster_map.values)]
+cluster_sel = ccl.multiselect(
+    "Cluster", _cl_present, default=[], placeholder="All clusters",
+    format_func=lambda c: CLUSTER_LABEL.get(c, c),
+    help="ABCD product clusters from JTL (A–D, NPL = new product launch, "
+         "EOL = end of life). Leave empty for all. 'No cluster' = SKUs with no "
+         "ABCD value in JTL (e.g. wowtamins article numbers).")
 # Country filter: scopes the € impact to one country (availability stays
 # network-level — see the banner). Options ordered by that country's volume.
 _ca = country_alloc(margin_path, m_margin, region)
@@ -934,6 +966,7 @@ country_sel = cco.selectbox(
          "OOS rate, reach and WISR stay network-level (identical across "
          "countries) — only the money is country-specific.")
 pmin, pmax = long_all["Period"].min(), asof
+c2, c3, c4, c5 = st.columns([0.8, 1.3, 1.0, 1.4])
 ptype = c2.selectbox("Period", ["Full range", "Year", "Quarter", "Month", "Week"], index=0)
 sel_periods, sel_freq = None, None
 if ptype == "Year":
@@ -1102,6 +1135,17 @@ if country_sel != COUNTRY_ALL:
         "the calendar and events — is network-level and identical across "
         "countries** (stock-outs hit the whole pool at once).")
 
+# ---------- Cluster filter ----------
+# The Clusters tab always shows every cluster (it IS the cluster comparison),
+# so keep the fully-scoped panel before narrowing it to the selected clusters.
+scope_allc = scope
+if cluster_sel:
+    _keep = scope["SKU"].astype(str).map(cluster_map).fillna("No cluster").isin(cluster_sel).to_numpy()
+    scope = scope[_keep]
+    if scope.empty:
+        st.warning("No data for the selected cluster(s) in the current scope. Widen the filters.")
+        st.stop()
+
 # ---------- Per-SKU aggregation ----------
 oos_rows = scope[scope["oos"]]
 agg = (
@@ -1115,6 +1159,7 @@ agg = agg.merge(active, on="SKU", how="left")
 agg["oos_rate"] = (agg["oos_days"] / agg["active_days"] * 100).round(1)
 agg["Product"] = agg["SKU"].map(prod_short)
 agg["Brand"] = agg["SKU"].map(brand_map)
+agg["Cluster"] = agg["SKU"].astype(str).map(cluster_map).fillna("No cluster")
 agg["cur_stock"] = agg["SKU"].map(inv_stock)
 agg["days_of_supply"] = agg["SKU"].map(inv_dos).round(0)
 agg["Status"] = stock_status(agg["cur_stock"], agg["days_of_supply"], oos_reach)
@@ -1287,8 +1332,8 @@ def asin_sku_map(path: Path, mtime: float | None):
     return d.groupby("Child ASIN")["SKU"].agg(lambda s: s.value_counts().index[0])
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-    ["Most affected SKUs", "Stock-out calendar", "Stock-out events",
+tab1, tabcl, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+    ["Most affected SKUs", "Clusters", "Stock-out calendar", "Stock-out events",
      "Cooling down", "Heating up", "Country overview", "Top sellers",
      "Keyword erosion"]
 )
@@ -1323,7 +1368,7 @@ with tab1:
         width="stretch")
 
     table = agg[[
-        "SKU", "Product", "Brand", "Status", "oos_days", "oos_rate",
+        "SKU", "Product", "Brand", "Cluster", "Status", "oos_days", "oos_rate",
         "lost_units", "lost_rev", "lost_cm3", "cur_stock", "days_of_supply",
     ]].rename(columns={
         "oos_days": "OOS days", "oos_rate": "OOS rate %", "lost_units": "Lost units",
@@ -1707,3 +1752,150 @@ with tab8:
                 "Rank data is a point-in-time DataDive snapshot per marketplace; it "
                 "covers the ~53 ASINs currently tracked in Rank Radar, not the whole "
                 "catalogue.")
+
+# ======================================================================
+#  Tab — Clusters (ABCD × stock-out severity matrix)
+# ======================================================================
+with tabcl:
+    SEV_BANDS = ["No stock-outs", "Minor · <5% of days", "Moderate · 5–20%", "Severe · >20%"]
+
+    def _eur_k(v: float) -> str:
+        """Compact European € label for matrix cells: €950 · €45k · €1,2M."""
+        if not np.isfinite(v) or abs(v) < 0.5:
+            return "€0"
+        if abs(v) >= 1e6:
+            return "€" + f"{v / 1e6:.1f}".replace(".", ",") + "M"
+        if abs(v) >= 1e3:
+            return f"€{v / 1e3:.0f}k"
+        return f"€{v:.0f}"
+
+    cs = scope_allc.assign(SKU=scope_allc["SKU"].astype(str))
+    cs["Cluster"] = cs["SKU"].map(cluster_map).fillna("No cluster")
+    _last = cs["Period"].max()
+    per = cs.groupby("SKU").agg(
+        Cluster=("Cluster", "first"), rows=("Period", "size"), oos_rows=("oos", "sum"),
+        lost_rev=("lost_rev", "sum"), lost_cm3=("lost_cm3", "sum")).reset_index()
+    per["oos_days"] = per["SKU"].map(cs[cs["oos"]].groupby("SKU")["Period"].nunique()).fillna(0).astype(int)
+    per["oos_pct"] = per["oos_rows"] / per["rows"].where(per["rows"] > 0)
+    per["band"] = np.select([per["oos_pct"] <= 0, per["oos_pct"] < 0.05, per["oos_pct"] < 0.20],
+                            [0, 1, 2], 3)
+    per["now"] = per["SKU"].isin(set(cs.loc[(cs["Period"] == _last) & cs["oos"], "SKU"]))
+
+    st.caption(
+        "Stock-outs by **ABCD cluster** (JTL). Each SKU is placed in a severity band by "
+        "the share of its days out of stock in the selected period, region and brand. "
+        "Cell colour = € impact, text = number of SKUs and € lost. This tab always "
+        "shows every cluster (the Cluster filter above is ignored here).")
+
+    # --- Cluster cards (A–D) ---
+    cards = st.columns(4)
+    for col, cl in zip(cards, CLUSTERS_ABCD):
+        p_ = per[per["Cluster"] == cl]
+        rate = p_["oos_rows"].sum() / max(p_["rows"].sum(), 1) * 100
+        col.markdown(
+            f"""<div style="background:#ffffff;border:1px solid {brand.PLUM_GRID};
+            border-top:4px solid {brand.CHART_ORANGE if cl == 'A' else brand.PLUM};
+            border-radius:12px;padding:14px 16px;margin-bottom:6px">
+            <div style="font-family:{brand.SERIF};font-size:28px;font-weight:600;
+            color:{brand.PLUM};line-height:1">Cluster {cl}</div>
+            <div style="color:{brand.PLUM_60};font-size:12px;margin:2px 0 10px">
+            {fmt_num(len(p_))} SKUs · {fmt_num((p_['oos_rows'] > 0).sum())} with stock-outs</div>
+            <div style="display:flex;justify-content:space-between;gap:8px;color:{brand.PLUM}">
+              <div><div style="font-size:11px;color:{brand.PLUM_60}">OOS rate</div>
+                   <div style="font-size:18px;font-weight:600">{fmt_num(rate, 1)} %</div></div>
+              <div><div style="font-size:11px;color:{brand.PLUM_60}">Lost revenue</div>
+                   <div style="font-size:18px;font-weight:600">{eur(p_['lost_rev'].sum())}</div></div>
+              <div><div style="font-size:11px;color:{brand.PLUM_60}">OOS now</div>
+                   <div style="font-size:18px;font-weight:600;color:{brand.BAD if p_['now'].sum() else brand.PLUM}">
+                   {fmt_num(p_['now'].sum())}</div></div>
+            </div></div>""",
+            unsafe_allow_html=True)
+
+    colour_by = st.radio("Colour cells by", ["Lost revenue", "Lost CM3"], horizontal=True,
+                         key="cl_colour")
+    zcol = "lost_rev" if colour_by == "Lost revenue" else "lost_cm3"
+
+    def _matrix(rows: list[str], height: int, title: str):
+        cnt = per.pivot_table(index="Cluster", columns="band", values="SKU", aggfunc="count").reindex(index=rows, columns=range(4)).fillna(0)
+        val = per.pivot_table(index="Cluster", columns="band", values=zcol, aggfunc="sum").reindex(index=rows, columns=range(4)).fillna(0)
+        rev = per.pivot_table(index="Cluster", columns="band", values="lost_rev", aggfunc="sum").reindex(index=rows, columns=range(4)).fillna(0)
+        cm3 = per.pivot_table(index="Cluster", columns="band", values="lost_cm3", aggfunc="sum").reindex(index=rows, columns=range(4)).fillna(0)
+        days = per.pivot_table(index="Cluster", columns="band", values="oos_days", aggfunc="mean").reindex(index=rows, columns=range(4)).fillna(0)
+        ylab = [f"{CLUSTER_LABEL.get(r, r)} · {fmt_num((per['Cluster'] == r).sum())} SKUs" for r in rows]
+        text = [[(f"<b>{int(cnt.iat[i, j])} SKU{'' if cnt.iat[i, j] == 1 else 's'}</b><br>{_eur_k(rev.iat[i, j])}" if cnt.iat[i, j] else "–")
+                 for j in range(4)] for i in range(len(rows))]
+        custom = [[[fmt_num(cnt.iat[i, j]), eur(rev.iat[i, j]), eur(cm3.iat[i, j]), fmt_num(days.iat[i, j])]
+                   for j in range(4)] for i in range(len(rows))]
+        fig = go.Figure(go.Heatmap(
+            z=val.clip(lower=0).to_numpy(), x=SEV_BANDS, y=ylab, text=text,
+            texttemplate="%{text}", textfont=dict(size=14, family=brand.SANS),
+            customdata=custom, zmin=0,
+            # White tiles for €0 so the grid reads as a 4×4 on the beige page.
+            colorscale=[[0.0, "#ffffff"], [0.5, "#f6a482"], [1.0, brand.CHART_ORANGE]],
+            zmax=max(float(per.groupby(["Cluster", "band"])[zcol].sum().clip(lower=0).max()), 1.0),
+            xgap=6, ygap=6, showscale=False,
+            hovertemplate="<b>%{y}</b> · %{x}<br>SKUs: %{customdata[0]}<br>"
+                          "Lost revenue: %{customdata[1]}<br>Lost CM3: %{customdata[2]}<br>"
+                          "Avg OOS days per SKU: %{customdata[3]}<extra></extra>"))
+        fig.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=14, color=brand.PLUM))
+        fig.update_xaxes(side="top", showgrid=False, tickfont=dict(size=13, color=brand.PLUM))
+        fig.update_layout(title=title, plot_bgcolor="rgba(0,0,0,0)")
+        return brand.style(fig, height=height, legend=False)
+
+    st.plotly_chart(_matrix(CLUSTERS_ABCD, 470, "Stock-out matrix — ABCD cluster × severity"),
+                    width="stretch")
+    _other = [c for c in ["NPL", "EOL", "No cluster"] if (per["Cluster"] == c).any()]
+    if _other:
+        st.plotly_chart(_matrix(_other, 160 + 90 * len(_other), "Outside the ABCD matrix"),
+                        width="stretch")
+
+    # --- OOS rate trend per cluster ---
+    cs["Month"] = cs["Period"].dt.to_period("M").dt.to_timestamp()
+    if cs["Month"].nunique() >= 2:
+        tr = (cs[cs["Cluster"].isin(CLUSTERS_ABCD)].groupby(["Month", "Cluster"])["oos"]
+              .mean().mul(100).reset_index())
+        line_col = {"A": brand.CHART_ORANGE, "B": brand.CHART_BLUE, "C": brand.CHART_BERRY,
+                    "D": brand.PLUM_60}
+        figt = go.Figure()
+        for cl in CLUSTERS_ABCD:
+            t = tr[tr["Cluster"] == cl]
+            if t.empty:
+                continue
+            figt.add_trace(go.Scatter(
+                x=t["Month"], y=t["oos"], name=f"Cluster {cl}", mode="lines+markers",
+                line=dict(color=line_col[cl], width=2.5 if cl == "A" else 2),
+                marker=dict(size=7),
+                hovertemplate=f"Cluster {cl} · %{{x|%b %Y}}<br>OOS rate %{{y:,.1f}} %<extra></extra>"))
+        figt.update_layout(title="Monthly OOS rate by cluster (share of SKU-days out of stock)")
+        figt.update_yaxes(ticksuffix=" %", rangemode="tozero", tickformat=",.0f")
+        st.plotly_chart(brand.style(figt, height=340), width="stretch")
+
+    # --- Drill-down into one matrix cell ---
+    st.markdown("**Drill down into a cell**")
+    _clopts = [c for c in CLUSTER_ORDER if (per["Cluster"] == c).any()]
+    d1, d2 = st.columns(2)
+    cl_pick = d1.selectbox("Cluster", _clopts, format_func=lambda c: CLUSTER_LABEL.get(c, c),
+                           key="cl_pick")
+    _have = [b for b in (3, 2, 1, 0) if ((per["Cluster"] == cl_pick) & (per["band"] == b)).any()]
+    band_pick = d2.selectbox("Severity", [3, 2, 1, 0], index=[3, 2, 1, 0].index(_have[0]) if _have else 0,
+                             format_func=lambda b: SEV_BANDS[b], key="cl_band")
+    cell = per[(per["Cluster"] == cl_pick) & (per["band"] == band_pick)].copy()
+    if cell.empty:
+        st.info("No SKUs in this cell.")
+    else:
+        cell["Product"] = cell["SKU"].map(prod_short)
+        cell["Current FBA stock"] = cell["SKU"].map(inv_stock)
+        cell["Status"] = np.where(cell["now"], "🔴 OOS now", "🟢 in stock")
+        cell["% of days OOS"] = (cell["oos_pct"] * 100).round(1)
+        tbl = cell.sort_values(["lost_rev", "oos_days"], ascending=False)[
+            ["SKU", "Product", "Status", "oos_days", "% of days OOS", "lost_rev", "lost_cm3",
+             "Current FBA stock"]].rename(columns={
+                 "oos_days": "OOS days", "lost_rev": "Lost revenue (€)", "lost_cm3": "Lost CM3 (€)"}).round(0)
+        st.dataframe(tbl, width="stretch", hide_index=True, height=min(80 + 35 * len(tbl), 460),
+                     column_config={
+                         "Lost revenue (€)": st.column_config.NumberColumn(format="localized"),
+                         "Lost CM3 (€)": st.column_config.NumberColumn(format="localized"),
+                         "Current FBA stock": st.column_config.NumberColumn(format="localized")})
+        st.download_button("⬇️ Download cell (CSV)", tbl.to_csv(index=False).encode("utf-8"),
+                           file_name=f"oos_cluster_{cl_pick}_{SEV_BANDS[band_pick].split(' ')[0]}.csv",
+                           mime="text/csv")
