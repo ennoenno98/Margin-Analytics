@@ -213,7 +213,20 @@ python amazon_sp_api_ledger.py
 git add amazon_ledger && git commit -m "data: ledger refresh" && git push
 ```
 
-### Manual (fallback)
+### Manual — append a new export (standard)
+
+Seller Central exports cover a short window; append them onto the full-history
+ledger so the dashboard keeps year-long stock coverage:
+
+```bash
+python append_ledger.py ~/Downloads/inventory-ledger.txt   # .csv or .txt
+git add amazon_ledger && git commit -m "data: ledger refresh" && git push
+```
+
+It maps fulfilment centres to EU / GB, checks the overlapping days against the
+existing ledger, and appends only the new days.
+
+### Manual — full-history replacement
 
 1. **Seller Central → Reports → Fulfilment → Inventory Ledger → "Detailed
    View"**, set the date range to the trailing ~12 months, download the CSV.

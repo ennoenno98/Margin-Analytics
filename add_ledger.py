@@ -6,6 +6,9 @@ downloaded ledger CSV (Seller Central → Reports → Fulfilment → Inventory
 Ledger → "Detailed View", date range = trailing 12 months), gzips it and
 date-stamps it by the latest date in the file so the dashboard picks it up.
 
+NOTE: this REPLACES the ledger with the export alone. For the usual short
+Seller Central export, use append_ledger.py instead (keeps full history).
+
 Usage:
     python add_ledger.py /path/to/inventory-ledger.csv
     # then commit:  git add amazon_ledger && git commit -m "data: ledger refresh" && git push
